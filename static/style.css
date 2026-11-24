@@ -36,6 +36,8 @@
  * ============================================================================ */
 
 :root {
+  --ctx-free: #eceef1;     /* /context 卡片用量条：空闲 / 自动压缩预留（斜纹） */
+  --ctx-buf: #9aa0a8;
   --bg: #ffffff;
   --bg-side: #f7f7f8;
   --bg-elev: #ffffff;
@@ -115,6 +117,8 @@
 
 /* 深色：深灰分层（#17–#38），正文浅灰白 ≈ 11.5:1 不刺眼；强调/状态色降饱和，均对 --bg/--bg-elev ≥ 4.5:1（WCAG AA） */
 :root[data-theme="dark"] {
+  --ctx-free: #34363b;
+  --ctx-buf: #6c717a;
   --bg: #1e1f22;
   --bg-side: #1a1b1e;
   --bg-elev: #26282c;
@@ -766,6 +770,56 @@ dialog.modal::backdrop { background: var(--backdrop, rgba(10, 12, 16, .42)); } /
 .k-cmd .cmd-out.solo { margin-left: 0; }
 .k-cmd .cmd-mark { flex: none; color: var(--text-3); }
 .k-cmd.err .cmd-out { color: var(--err); }
+/* 带 ANSI 颜色的命令输出 / /context 卡片（static/ctxcard.js）：不换行折字，宽了横向滚动 */
+.k-cmd .cmd-out.rich { white-space: normal; }
+.k-cmd .cmd-out.rich > :last-child { flex: 1; min-width: 0; }
+.ansi-pre { white-space: pre; overflow-wrap: normal; overflow: auto; color: var(--text); max-height: 420px; }
+.ansi-pre .ansi-b { font-weight: 600; }
+.ansi-pre .ansi-dim, .ansi-pre .ansi-grey { color: var(--text-3); }
+/* 方块网格字符（⛁ ⛀ ⛶ ⛝）在等宽字体里常常回退到更宽的符号字体：固定 1ch 宽、居中，保证网格与右列对齐 */
+.ansi-pre .ansi-g { display: inline-flex; justify-content: center; width: 1ch; overflow: visible; }
+/* 卡片本身紧凑；展开原文时放宽（CLI 的右列在第 40 多列之后，窄了要横向滚动） */
+.ctx-card:has(> .ctx-raw[open]) { max-width: none; }
+.ctx-card { max-width: 560px; padding: 10px 12px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--text); font-size: 12.5px; line-height: 1.5; }
+.ctx-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; }
+.ctx-title { font-weight: 600; }
+.ctx-model { color: var(--text-2); }
+.ctx-model-id { color: var(--text-3); font-size: 11.5px; }
+.ctx-total { display: flex; align-items: baseline; gap: 8px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.ctx-total-num { font-family: var(--mono); font-size: 12px; }
+.ctx-total-pct { color: var(--text-2); }
+.ctx-bar { display: flex; height: 8px; margin: 8px 0 6px; border-radius: 4px; overflow: hidden; background: var(--ctx-free); }
+.ctx-seg { flex: none; min-width: 2px; height: 100%; }
+.ctx-seg + .ctx-seg { box-shadow: inset 1px 0 0 var(--bg-elev); }
+.ctx-free { flex: 1 1 auto; min-width: 0; }
+.ctx-buf { background: repeating-linear-gradient(135deg, var(--ctx-buf) 0 2px, transparent 2px 4px); box-shadow: inset 1px 0 0 var(--bg-elev); }
+.ctx-cats { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: max-content max-content max-content; column-gap: 12px; font-variant-numeric: tabular-nums; }
+.ctx-cat { display: contents; }
+.ctx-cat > * { padding: 1px 0; }
+.ctx-cat-name { display: flex; align-items: center; gap: 7px; }
+.ctx-cat-tok { text-align: right; font-family: var(--mono); font-size: 11.5px; }
+.ctx-cat-pct { text-align: right; color: var(--text-3); }
+.ctx-cat.free .ctx-cat-name, .ctx-cat.buffer .ctx-cat-name { color: var(--text-2); }
+.ctx-dot { flex: none; width: 8px; height: 8px; border-radius: 2px; background: var(--text-3); }
+.ctx-dot.free { background: var(--ctx-free); box-shadow: inset 0 0 0 1px var(--border-strong); }
+.ctx-dot.buffer { background: repeating-linear-gradient(135deg, var(--ctx-buf) 0 2px, transparent 2px 4px); box-shadow: inset 0 0 0 1px var(--border-strong); }
+.ctx-meta { display: flex; gap: 8px; margin-top: 6px; color: var(--text-2); }
+.ctx-meta-k { color: var(--text-3); }
+.ctx-secs { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
+.ctx-sec { color: var(--text-2); }
+.ctx-sec, .ctx-sec > summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0 8px; }
+details.ctx-sec { display: block; }
+.ctx-sec > summary { cursor: pointer; list-style-position: outside; }
+.ctx-sec-title { color: var(--text); }
+.ctx-sec-note { color: var(--text-3); font-size: 11.5px; }
+.ctx-sec-val { margin-left: auto; font-variant-numeric: tabular-nums; }
+.ctx-sec-body { padding: 2px 0 4px 14px; }
+.ctx-sec-group { color: var(--text-3); margin-top: 2px; }
+.ctx-sec-item { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+.ctx-raw { margin-top: 6px; }
+.ctx-raw > summary { cursor: pointer; color: var(--text-3); width: max-content; }
+.ctx-raw > summary:hover { color: var(--text); }
+.ctx-raw .ansi-pre { margin-top: 6px; }
 .k-text.api-error { color: var(--err); }
 
 /* 实时草稿（逐字回显） */

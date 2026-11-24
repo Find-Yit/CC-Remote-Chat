@@ -412,6 +412,29 @@ def _raw_line(text: Optional[str], stripped: str) -> Optional[str]:
     return None
 
 
+def _busy_hidden_by_input(st: dict, status: Optional[str]) -> bool:
+    """屏幕解析说"不忙"，但其实只是输入框里有文字把 "esc to interrupt" 挡掉了？
+
+    真机（v2.1.331 实测）：输入框里有文字时，模式行不显示 "esc to interrupt"（此时 Esc 是清空输入框），即使正在生成。
+    忙时发消息要先粘贴、确认后再回车，这几帧只看模式行就成了"空闲"→ 前端占位文字 / 中断按钮 / 实时草稿 / 侧栏状态
+    每发一条就闪一下（用户报告的"排队发消息时输入框一直抖"）。此时改用别的证据：排队提示、后台提示只在一轮进行中出现；
+    claude 自己的 session 状态（~/.claude/sessions/<pid>.json 的 status）是 busy 且画面上没有本轮的结束行；
+    读不到 session 状态时退回看 spinner。"""
+    if st.get("busy") or st.get("dialog"):
+        return False
+    inp = st.get("input") or {}
+    if not inp.get("visible") or not (inp.get("text") or "").strip():
+        return False
+    hn = st.get("hints") or {}
+    if hn.get("queued") or hn.get("send_now") or hn.get("background"):
+        return True
+    if st.get("turn_done"):
+        return False
+    if status:
+        return status == "busy"
+    return bool(st.get("spinner"))
+
+
 def _input_matches(itext: str, text: str) -> bool:
     """粘贴后输入框里的文字是否就是刚粘贴的内容（忽略空白/折行；大段粘贴会被折叠成 [Pasted text #1 …]）。"""
     a = re.sub(r"\s+", "", itext or "")
@@ -1164,6 +1187,8 @@ class SessionManager:
     def _apply_screen(self, s: _Session, text: str) -> dict:
         st = tui_parse.parse_screen(text)
         with s.lock:
+            if _busy_hidden_by_input(st, s.status):
+                st["busy"] = True   # 见 _busy_hidden_by_input：前端（占位文字、中断按钮、草稿）与统计都读这个字段
             s.screen_text = text
             s.screen_state = st
             s.screen_ts = time.time()

@@ -1,0 +1,50 @@
+                                               ⛝ Autocompact buffer: 33k
+     tokens (3%)
+
+     Auto-compact window:  1m tokens
+
+     Custom agents · .claude/agents/
+     └ 1 agent · 73 tokens
+
+     Memory files · /memory
+     └ 1 file · 130 tokens
+
+     Skills · /skills
+     └ 18 skills · 2.6k tokens
+
+     /context all to expand
+
+❯ /context
+  ⎿  Context usage
+     ⛀ ⛀ ⛀ ⛀ ⛀   Haiku 5.5
+     ⛀ ⛶ ⛶ ⛶ ⛶   claude-haiku-5-5
+     ⛶ ⛶ ⛶ ⛶ ⛶   16.6k/1m tokens (2%)
+     ⛶ ⛶ ⛶ ⛶ ⛶
+     ⛶ ⛶ ⛶ ⛶ ⛶   Estimated usage by category
+     ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 3.1k tokens (0.3%)
+     ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 10.1k tokens (1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Custom agents: 73 tokens (<0.1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Memory files: 130 tokens (<0.1%)
+     ⛶ ⛶ ⛶ ⛝ ⛝   ⛁ Skills: 2.6k tokens (0.3%)
+                 ⛁ Messages: 619 tokens (0.1%)
+                 ⛶ Free space: 950.4k tokens (95%)
+                 ⛝ Autocompact buffer: 33k tokens (3%)
+
+     Auto-compact window:  1m tokens
+
+     Custom agents · .claude/agents/
+     └ 1 agent · 73 tokens
+
+     Memory files · /memory
+     └ 1 file · 130 tokens
+
+     Skills · /skills
+     └ 18 skills · 2.6k tokens
+
+     /context all to expand
+
+────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: ?% | ⚙ — tok/s | 💰 $0 | 5h: 1.2M tok…
+  ⏵⏵ auto mode on (shift+tab to cycle)

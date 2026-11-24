@@ -451,5 +451,38 @@ class InputTests(Base):
         self.assertEqual([x.strip() for x in lines], ["Sonnet 5.5 · Efficient for routine tasks ·", "$2/$10 per Mtok"])
 
 
+
+class ContextCmdTests(Base):
+    """/context：屏幕内联输出 + transcript 的 ANSI stdout 与 isMeta Markdown（版式同 fixtures/context_cmd/ 真机样本）。"""
+
+    def test_context_screen_and_transcript(self):
+        from ccr import stats, tui_parse
+        a = self.app()
+        a.fixed_size = (120, 40)
+        self.submit(a, "/context")
+        self.assertIsNone(a.dialog)
+        self.assertIsNone(a.turn)
+        st = tui_parse.parse_screen("\n".join(self.frame(a)))
+        self.assertIsNone(st["dialog"])
+        self.assertTrue(st["input"]["visible"])
+        self.assertEqual(st["context_usage"], {"used": 14400, "limit": 1000000, "pct": 1.4,
+                                               "model": "claude-haiku-5-5", "display": "Haiku 5.5"})
+        tr = self.transcript(a)
+        cmd, out, md = tr[-3:]
+        self.assertIn("<command-name>/context</command-name>", cmd["content"])
+        self.assertTrue(out["content"].startswith("<local-command-stdout> \x1b[1mContext usage"))
+        self.assertTrue(md["isMeta"])
+        for c in (out["content"], md["message"]["content"]):
+            self.assertEqual(tui_parse.parse_context_usage(c)["limit"], 1000000)
+        # 窗口可改：200k → 统计条按 /context 的窗口
+        b = self.app(CCR_FAKE_CTX_WINDOW="200000")
+        self.submit(b, "/context")
+        t = stats.StatsTracker()
+        t.on_transcript(self.transcript(b) + [{"type": "assistant", "message": {
+            "model": "claude-haiku-5-5", "usage": {"input_tokens": 1, "cache_read_input_tokens": 49999}}}])
+        s = t.snapshot()
+        self.assertEqual((s["context_limit"], s["context_limit_source"], s["context_pct"]), (200000, "context_cmd", 25.0))
+
+
 if __name__ == "__main__":
     unittest.main()

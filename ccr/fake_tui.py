@@ -19,7 +19,9 @@ fixtures/tui_screens_*.ndjson（真实 Claude Code v2.1.330 的画面）。
          <transcript 目录>/<sessionId>/subagents/agent-<id>.meta.json 与逐步写入的 agent-<id>.jsonl
          （几次工具调用，夹杂 api-request*/attachment 行），结束时 meta.finished=true 并写 <task-notification>；
          屏幕上显示与真实 CLI 相同的子代理列表行（Esc 中断 → 子代理以 killed 结束）
-整条输入为以下命令时：/model 模型面板、/effort effort 面板、/clear 新会话、/exit 退出。
+整条输入为以下命令时：/model 模型面板、/effort effort 面板、/clear 新会话、/exit 退出、
+  /context 上下文用量（仿 CLI 2.1.331：屏幕上内联画方块网格 + 右列，transcript 写带 ANSI 的 <local-command-stdout>
+  与 isMeta 的 Markdown 版；窗口默认 1,000,000，CCR_FAKE_CTX_WINDOW 可改）。
 Shift+Tab 循环权限模式；忙时 Esc / Ctrl-C 中断。
 --settings <文件>：读取其中 env.ANTHROPIC_AUTH_TOKEN，在启动横幅下显示 key 的掩码（验证 API key 选择生效）。
 
@@ -94,6 +96,7 @@ COMMANDS = [
     ("/auto-mode-setup", "Teach auto mode about your environment"),
     ("/code-review", "Review the current diff or a PR for bugs"),
     ("/effort", "Set the model's effort level"),
+    ("/context", "Show what fills the context"),
     ("/clear", "Clear conversation history and free up context"),
     ("/exit", "Exit the CLI"),
 ]
@@ -811,8 +814,10 @@ class FakeClaude(object):
                 for i, line in enumerate(shown.split("\n")):
                     inp += wrap(line, W, "❯" + NB if i == 0 else "  ", "  ")
                 shells = self.shells()
+                # 真机（v2.1.331 实测）：输入框里有文字时模式行不显示 "esc to interrupt"（此时 Esc 是清空输入框），
+                # 即使正在生成——只看模式行会把"忙时往输入框粘贴、还没按回车"的那几帧误当成空闲
                 mode = "  " + MODE_TEXT.get(self.mode, self.mode) + (" · %d shell" % shells if shells else "") + \
-                    (" · esc to interrupt" if self.turn else "")
+                    (" · esc to interrupt" if self.turn and not self.input else "")
                 agents = []
                 if self.agents or shells:
                     mode += " · ↓ to manage"
@@ -1324,6 +1329,9 @@ class FakeClaude(object):
             self.dialog = Dialog("effort", level=self.effort, ultracode=False)
             self.dirty = True
             return
+        if cmd == "/context":
+            self.context_usage()
+            return
         self.add_block("❯ ", "  ", text)
         self.write_user_text(text, prompt=True)
         if "/tool" in text:
@@ -1455,6 +1463,50 @@ class FakeClaude(object):
         for dd in self.stream(["截图已保存到 %s" % rel]):
             yield dd
         self.finish(text)
+
+    def context_usage(self):
+        """/context：版式照抄 CLI 2.1.331 实测（fixtures/context_cmd/、transcript_context_*.jsonl），数字按假的上下文 tokens 算。"""
+        try:
+            window = int(self.env.get("CCR_FAKE_CTX_WINDOW") or 1000000)
+        except ValueError:
+            window = 1000000
+        fmt = lambda n: ("%gm" % round(n / 1e6, 1)) if n >= 1e6 else ("%gk" % round(n / 1e3, 1)) if n >= 1000 else str(n)
+        cats = [("System prompt", 3100, 245), ("System tools", 10100, 241), ("Messages", 1202 + self.ctx_tokens, 127)]
+        used = sum(c[1] for c in cats)
+        buf = 33000
+        pct = lambda n: "<0.1%" if n * 1000 < window else "%g%%" % round(n * 100.0 / window, 1 if n * 100 < window * 10 else 0)
+        right = [self.model_display(), self.model_id(), "%s/%s tokens (%s)" % (fmt(used), fmt(window), pct(used)), "",
+                 "Estimated usage by category"]
+        right += ["⛁ %s: %s tokens (%s)" % (n, fmt(t), pct(t)) for n, t, _c in cats]
+        right += ["⛶ Free space: %s tokens (%s)" % (fmt(window - used - buf), pct(window - used - buf)),
+                  "⛝ Autocompact buffer: %s tokens (%s)" % (fmt(buf), pct(buf))]
+        cells = ["⛁"] * max(1, min(100, used * 100 // window)) + ["⛶"] * 100
+        cells = (cells[:100 - 3] + ["⛝"] * 3)
+        rows = [" ".join(cells[r * 10:(r + 1) * 10]) for r in range(10)]
+        screen = ["Context usage"] + [(rows[k] if k < 10 else " " * 19) + ("   " + right[k] if k < len(right) and right[k] else "")
+                                      for k in range(max(10, len(right)))]
+        screen += ["", "Auto-compact window:  %s tokens" % fmt(window), "", "/context all to expand"]
+        self.add_block("❯ ", "  ", "/context")
+        for i, line in enumerate(screen):
+            self.add(RES if i == 0 else "     ", "     ", line.rstrip())
+        # transcript：带 ANSI 的 stdout（与真机同一套颜色码）+ isMeta 的 Markdown 版
+        g = lambda line: line.replace("⛁", "\x1b[38;5;245m⛁\x1b[39m").replace("⛶", "\x1b[38;5;241m⛶\x1b[39m")
+        ansi = [" \x1b[1mContext usage\x1b[22m"]
+        for k in range(max(10, len(right))):
+            r = right[k] if k < len(right) else ""
+            if r and r[0] in "⛁⛶⛝":
+                color = {"⛁": next((c for n, _t, c in cats if r[2:].startswith(n)), 245), "⛶": 241, "⛝": 241}[r[0]]
+                r = "\x1b[38;5;%dm%s\x1b[39m%s" % (color, r[0], r[1:])
+            elif r and k > 0:
+                r = "\x1b[38;5;241m%s\x1b[39m" % r
+            ansi.append((g(rows[k]) + " " if k < 10 else " " * 20) + ("  " + r if r else ""))
+        ansi += ["", "\x1b[1mAuto-compact window:\x1b[22m  %s tokens" % fmt(window), "",
+                 "\x1b[38;5;241m/context all to expand\x1b[39m"]
+        self.write_local_command("context", "\n".join(ansi))
+        md = "## Context Usage\n\n**Model:** %s  \n**Tokens:** %s / %s (%s)\n" % (
+            self.model_id(), fmt(used), fmt(window), pct(used))
+        e = self.write_entry("user", {"role": "user", "content": md}, {"isMeta": True})
+        return e
 
     def local_result(self, cmd, text):
         self.add_block("❯ ", "  ", cmd)

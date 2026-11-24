@@ -536,6 +536,9 @@ async function autoTest() {
   log('== 14c. dmg 版自动更新提示条与设置项（update.js：各状态、只在点击时请求、更新说明、下载页链接、浅色 / 深色对比度）');
   await updateChecks();
 
+  log('== 14d. /context 卡片与命令输出的 ANSI 颜色（ctxcard.js：真机 transcript、用量条、分类、小节、原文上色与网格对齐、浅色 / 深色）');
+  await contextChecks();
+
   log('== 15. 红线 / 控制台');
   check(calls.every((c) => c.gesture), '所有请求都发生在用户点击中（共 ' + calls.length + ' 个）');
   check(errors === 0, '控制台零错误');
@@ -1041,6 +1044,33 @@ async function statsChecks() {
   await raf();
   check(vis(part('ctx').querySelector('.st-approx')) && txt('ctx').includes('14%') && /约 14% · 28.3k \/ 200k/.test(part('ctx').title), '后备：约 14%（tooltip：约 14% · 28.3k / 200k）');
   check(/transcript/.test(part('ctx').title) && /200,000/.test(part('ctx').title), '后备 tooltip：transcript usage + 上限推断');
+  // 窗口来源（ccr/stats.py 的 context_limit_source）：用户日志里的 214,632 tokens（Opus 5.5 原生 1M）→ 约 21%，不是 107%
+  pushMeta({ stats: { context_used: 214632, context_limit: 1000000, context_pct: 21.5, context_source: 'transcript', context_approx: true,
+    context_limit_source: 'model', context_model: 'Opus 5.5', cost_usd: null, cost_text: null, cost_source: null } });
+  await raf();
+  check(txt('ctx').includes('21%') && !part('ctx').classList.contains('warn') && Math.abs(ringOffset() - RING_C * (1 - 0.214632)) < 0.01
+    && part('ctx').title.split('\n')[2] === '窗口 1M：按模型 Opus 5.5 推断（Claude Code 2.1.331 内置模型目录）',
+    'Opus 5.5 的 214,632 tokens：约 21%（tooltip 第 3 行写出窗口来源：按模型推断）');
+  for (const [src, model, re] of [['context_cmd', 'Haiku 5.5', /窗口 1M：来自 \/context（Haiku 5\.5）/], ['hint', null, /窗口 1M：模型名 \/ 状态栏/],
+    ['observed', 'gw-model', /窗口 1M：本会话 gw-model 的上下文曾超过 200k/]]) {
+    pushMeta({ stats: { ...s.meta.stats, context_limit_source: src, context_model: model } });
+    await raf();
+    check(re.test(part('ctx').title), '窗口来源 ' + src + '：' + part('ctx').title.split('\n')[2]);
+  }
+  // 不在 CLI 模型目录里的模型（第三方网关的叫法）：与 CLI 一致按 1M
+  pushMeta({ stats: { ...s.meta.stats, context_used: 214632, context_limit: 1000000, context_pct: 21.5, context_limit_source: 'unknown_model', context_model: 'gw-opus' } });
+  await raf();
+  check(txt('ctx').includes('21%') && part('ctx').title.split('\n')[2] === '窗口 1M：模型 gw-opus 不在 Claude Code 2.1.331 内置模型目录里，按 Claude Code 的默认 1M 计；运行一次 /context 可得到准确值',
+    '不在模型目录里的模型：约 21%（tooltip：按 Claude Code 的默认 1M 计）');
+  pushMeta({ stats: { ...s.meta.stats, context_used: 50000, context_limit: 200000, context_pct: 25, context_limit_source: 'default', context_model: null } });
+  await raf();
+  check(txt('ctx').includes('25%') && /窗口 200k：默认估算；运行一次 \/context 可得到准确值/.test(part('ctx').title), '默认 200k（还不知道模型）：tooltip 提示可运行 /context');
+  pushMeta({ stats: { ...s.meta.stats, context_used: 1200000, context_limit: 1000000, context_pct: 100, context_limit_source: 'observed' } });
+  await raf();
+  check(part('ctx').querySelector('.st-pct').textContent === '100%' && part('ctx').classList.contains('crit') && ringOffset() < 0.01, '推断的分母：百分比封顶 100%');
+  pushMeta({ stats: { context_used: 28303, context_limit: 200000, context_pct: 14.2, context_source: 'transcript', context_approx: true,
+    cost_usd: null, cost_text: null, cost_source: null, tok_s_live: null, tok_s_last: null } });
+  await raf();
   check(txt('cost').includes('—') && part('cost').classList.contains('empty') && /不自行/.test(part('cost').title), '没有状态栏花费：显示 —（不估价）');
   check(!vis(part('rate')), '没有任何速率时不显示 tok/s');
   // 只有百分比
@@ -1701,6 +1731,133 @@ async function changesChecks() {
     localStorage.removeItem(FX_CHG_KEY);
   }
   check(calls.length === nCalls && vizStatCalls === nStat && fetches === 0, '改动栏没有发出任何请求（按键 / stat / fetch 都是 0）');
+}
+
+// ---------- /context 卡片（ctxcard.js） ----------
+// 真机 transcript（CLI 2.1.331，fixtures/transcript_context_*.jsonl）：<local-command-stdout> 带 ANSI 颜色码与 ⛁ ⛀ ⛶ ⛝ 网格。
+async function contextChecks() {
+  const nCalls = calls.length;
+  let full = [], classic = [];
+  try {
+    const load = async (name) => (await fetchText('/fixtures/' + name)).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    full = await load('transcript_context_fullscreen.jsonl');
+    classic = await load('transcript_context_classic.jsonl');
+  } catch (e) { log(String(e.message || e), 'bad'); }
+  pushTranscript(full, true);
+  await raf(); flushNow(s);
+  const cmds = qa('.k-cmd');
+  const cards = qa('.ctx-card');
+  check(cmds.length === 2 && cards.length === 2 && cmds.every((c) => c.querySelector('.cmd-line').textContent.trim() === '/context'),
+    '两次 /context：每次一条命令 + 一张卡片（isMeta 的 Markdown 版不显示）');
+  check(!cmds.some((c) => /\x1b|\[\d+(;\d+)*m/.test(c.textContent)), '不再露出 ANSI 颜色码（"[38;5;245m" 之类）');
+  check(!qa('.k-user').length && !qa('.k-hint').length, '没有多出用户消息 / 系统行');
+  const card = cards[0];
+  const t = (sel) => (card.querySelector(sel) || {}).textContent || '';
+  check(t('.ctx-title') === '上下文用量' && t('.ctx-model') === 'Haiku 5.5' && t('.ctx-model-id') === 'claude-haiku-5-5',
+    '卡片标题：上下文用量 · Haiku 5.5 · claude-haiku-5-5');
+  check(t('.ctx-total-num') === '16k / 1m tokens' && t('.ctx-total-pct') === '2%' && cards[1].querySelector('.ctx-total-num').textContent === '16.6k / 1m tokens',
+    '总量：16k / 1m tokens · 2%（第二次 16.6k）');
+  const rows = [...card.querySelectorAll('.ctx-cat')].map((r) => [r.querySelector('.ctx-cat-name').textContent, r.querySelector('.ctx-cat-tok').textContent, r.querySelector('.ctx-cat-pct').textContent]);
+  check(JSON.stringify(rows) === JSON.stringify([['System prompt', '3.1k', '0.3%'], ['System tools', '10.1k', '1%'], ['Custom agents', '73', '<0.1%'],
+    ['Memory files', '130', '<0.1%'], ['Skills', '2.6k', '0.3%'], ['Messages', '10', '<0.1%'], ['Free space', '951k', '95%'], ['Autocompact buffer', '33k', '3%']]),
+  '分类列表 8 行（名称 / tokens / 百分比与 CLI 一致）');
+  // 三列对齐：每列的左/右边缘一致
+  const colX = (sel, side) => [...card.querySelectorAll(sel)].map((e) => Math.round(e.getBoundingClientRect()[side]));
+  const same = (a) => a.every((x) => Math.abs(x - a[0]) <= 1);
+  check(same(colX('.ctx-cat-name', 'left')) && same(colX('.ctx-cat-tok', 'right')) && same(colX('.ctx-cat-pct', 'right')), '分类表：名称左对齐、数字右对齐');
+  const dots = [...card.querySelectorAll('.ctx-dot')].map((d) => getComputedStyle(d).backgroundColor);
+  check(dots[0] === 'rgb(138, 138, 138)' && dots[2] === 'rgb(95, 135, 255)' && dots[5] === 'rgb(175, 0, 175)', '分类圆点用 CLI 的颜色（245 / 69 / 127 号色）');
+  const bar = card.querySelector('.ctx-bar');
+  const segs = [...bar.querySelectorAll('.ctx-seg')];
+  const bw = bar.getBoundingClientRect().width;
+  const segW = (i) => segs[i].getBoundingClientRect().width / bw * 100;
+  check(segs.length === 7 && segs.at(-1).classList.contains('ctx-buf') && Math.abs(segW(1) - 1.01) < 0.3 && Math.abs(segW(6) - 3.3) < 0.3
+    && segs[1].style.background && bar.lastElementChild === segs.at(-1),
+    '用量条：6 段已用（宽度按 tokens / 窗口，System tools ≈ 1%）+ 最右自动压缩预留 3.3%（' + segW(1).toFixed(2) + '% / ' + segW(6).toFixed(2) + '%）');
+  check(/2%/.test(bar.getAttribute('aria-label')) && bar.getAttribute('role') === 'img', '用量条有 aria-label（已用 2%）');
+  check(t('.ctx-meta') === '自动压缩窗口1m tokens', '自动压缩窗口：1m tokens');
+  const secs = [...card.querySelectorAll('.ctx-sec')];
+  check(secs.length === 3 && secs.every((x) => x.tagName === 'DIV') && secs[0].textContent === 'Custom agents.claude/agents/1 agent · 73 tokens',
+    '小节（Custom agents / Memory files / Skills）各一行');
+  // 原文：默认收起；展开后上色、网格对齐
+  const raw = card.querySelector('.ctx-raw');
+  check(raw && !raw.open && /\/context all to expand/.test(raw.querySelector('summary').textContent), '原文默认收起（摘要带 "/context all to expand"）');
+  raw.open = true;
+  await raf();
+  const pre = raw.querySelector('pre.ansi-pre');
+  const glyphs = [...pre.querySelectorAll('.ansi-g')];
+  const gw = glyphs.map((g) => g.getBoundingClientRect().width);
+  const probe = h('span', null, '0000000000');
+  pre.appendChild(probe);
+  const ch = probe.getBoundingClientRect().width / 10;
+  probe.remove();
+  check(glyphs.length === 10 * 20 + 8 && gw.every((w) => Math.abs(w - ch) < 0.05), '原文：' + glyphs.length + ' 个方块都固定 1ch 宽（' + ch.toFixed(2) + 'px）');
+  const leftOf = (needle) => {
+    const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const i = n.data.indexOf(needle);
+      if (i >= 0) { const r = document.createRange(); r.setStart(n, i); r.setEnd(n, i + 1); return r.getBoundingClientRect().left; }
+    }
+    return NaN;
+  };
+  // 右列（第 42 列起）与分类名（第 44 列起：图例方块 + 空格之后）；网格下方的 Messages / Free space / Autocompact 行也要对上
+  const xs = ['Haiku 5.5', 'claude-haiku-5-5', '16k/1m', 'Estimated usage'].map(leftOf);
+  const xm = ['System prompt', 'Skills:', 'Messages', 'Free space', 'Autocompact buffer'].map(leftOf);
+  check(same(xs) && same(xm) && Math.abs(xm[0] - xs[0] - 2 * ch) < 1, '原文：右列与网格下方的分类行对齐（右列 ' + xs.map(Math.round).join('/') + '，分类 ' + xm.map(Math.round).join('/') + '）');
+  const g0 = glyphs[0], g7 = glyphs[7];
+  check(getComputedStyle(g0).color === 'rgb(138, 138, 138)' && getComputedStyle(g7).color === 'rgb(98, 98, 98)', '原文：方块保留 CLI 颜色');
+  const boldHead = [...pre.querySelectorAll('.ansi-b')].map((e) => e.textContent);
+  check(boldHead.includes('Context usage') && boldHead.includes('Auto-compact window:'), '原文：粗体标题');
+  check(getComputedStyle(pre).whiteSpace === 'pre', '原文不折行（宽了横向滚动）');
+  raw.open = false;
+  // 经典渲染器 / 展开版：小节有分组，可展开
+  pushTranscript(classic, true);
+  await raf(); flushNow(s);
+  const c2 = q('.ctx-card');
+  const skills = c2 && [...c2.querySelectorAll('.ctx-sec')].find((x) => x.textContent.startsWith('Skills'));
+  check(!!skills && skills.tagName === 'DETAILS' && !skills.open && /18 项/.test(skills.querySelector('summary').textContent), '展开版：Skills 小节可展开（18 项）');
+  skills.open = true;
+  await raf();
+  const groups = [...skills.querySelectorAll('.ctx-sec-group')].map((x) => x.textContent);
+  check(JSON.stringify(groups) === JSON.stringify(['User', 'Plugin (claude-hud)', 'Built-in']) && skills.querySelectorAll('.ctx-sec-item').length === 18, '展开版：分组 User / Plugin / Built-in，共 18 项');
+  // 其它带 ANSI 的本地命令输出：上色的等宽原文；不带 ANSI 的照旧
+  pushTranscript([
+    { type: 'system', subtype: 'local_command', uuid: 'fx-ansi-1', content: '<command-name>/status</command-name>\n<command-args></command-args>' },
+    { type: 'system', subtype: 'local_command', uuid: 'fx-ansi-2', content: '<local-command-stdout>\x1b[1mVersion:\x1b[22m 2.1.331\n\x1b[31mError\x1b[39m: none \x1b[38;5;241mdim\x1b[39m</local-command-stdout>' },
+    { type: 'system', subtype: 'local_command', uuid: 'fx-ansi-3', content: '<command-name>/model</command-name>\n<command-args></command-args>' },
+    { type: 'system', subtype: 'local_command', uuid: 'fx-ansi-4', content: '<local-command-stdout>Kept model as Haiku 5.5</local-command-stdout>' },
+  ], false);
+  await raf(); flushNow(s);
+  const st = qa('.k-cmd').find((c) => c.textContent.includes('/status'));
+  const stPre = st && st.querySelector('pre.ansi-pre.cmd-ansi');
+  check(!!stPre && stPre.textContent === 'Version: 2.1.331\nError: none dim' && !st.querySelector('.ctx-card'), '其它带 ANSI 的命令输出：去掉颜色码的等宽原文');
+  const red = stPre && [...stPre.children].find((x) => x.textContent === 'Error');
+  const dim = stPre && [...stPre.children].find((x) => x.textContent === 'dim');
+  check(!!red && getComputedStyle(red).color === 'rgb(205, 49, 49)' && dim.classList.contains('ansi-grey'), '红色照 ANSI 上色；灰色（CLI 的 dim）改用主题弱化色');
+  const md = qa('.k-cmd').find((c) => c.textContent.includes('/model'));
+  check(!!md && md.querySelector('.cmd-out-text') && !md.querySelector('pre'), '不带 ANSI 的输出照旧（/model）');
+  // 浅色 / 深色：卡片文字对比度
+  pushTranscript(full, true);
+  await raf(); flushNow(s);
+  const th = window.ccrTheme;
+  const prevPref = th ? th.pref() : 'system';
+  const res = [];
+  for (const tname of ['light', 'dark']) {
+    if (th) th.set(tname, { persist: false });
+    await raf();
+    const cd = q('.ctx-card');
+    const bg = rgbaOf(getComputedStyle(cd).backgroundColor);
+    const ratio = (sel) => contrast(rgbaOf(getComputedStyle(cd.querySelector(sel)).color), bg);
+    res.push([tname, ratio('.ctx-title'), ratio('.ctx-cat-pct'), ratio('.ctx-model-id'), ratio('.ctx-sec-note'),
+      getComputedStyle(document.documentElement).getPropertyValue('--ctx-free').trim(), getComputedStyle(cd.querySelector('.ctx-bar')).backgroundColor]);
+  }
+  if (th) th.set(prevPref, { persist: false });
+  await raf();
+  check(res.every((r) => r.slice(1, 5).every((v) => v >= 4.5)) && res[0][5] && res[1][5] && res[0][6] !== res[1][6],
+    '浅色 / 深色：卡片文字对比度 ≥ 4.5，用量条底色随主题（' + res.map((r) => r[0] + ' ' + r.slice(1, 5).map((v) => v.toFixed(1)).join('/')).join('；') + '）');
+  check(calls.length === nCalls, '/context 卡片不发任何请求、不按任何键');
+  pushTranscript(transcriptEntries(), true);
+  await raf(); flushNow(s);
 }
 
 // ---------- dmg 版自动更新（update.js） ----------

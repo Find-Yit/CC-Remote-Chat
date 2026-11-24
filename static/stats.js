@@ -1,5 +1,7 @@
 // 会话统计条：上下文 / 会话总花费 / token/s。数据只来自后端 meta.stats（docs/SPEC_V2_TUI.md §4.2）：
-//   上下文 = Claude Code 状态栏（用户的 statusline）里的 "25k/1M · 3%"，没有时用 transcript 最近一条回复的 usage（标"约"）；
+//   上下文 = Claude Code 状态栏（用户的 statusline）里的 "25k/1M · 3%"，没有时用 transcript 最近一条回复的 usage（标"约"；
+//            分母 = /context 给出的窗口 > 按模型（不在目录里的模型按 CLI 的默认 1M）/ [1m]/1M 提示 > 曾超过 200k → 1M
+//            > 默认 200k，来源写在 tooltip 里）；
 //   花费   = 状态栏里的 "$x"（Claude Code 自己算的），没有就显示 "—"，本程序不估价；
 //   tok/s  = spinner 的 token 计数（生成中 = 最近约 4 秒的增长速度；空闲 = 上一轮平均）。
 // 纯展示：没有任何按钮、不发任何请求。只建一次元素、挂在输入框底栏右侧的固定槽位里，之后原地更新（不随任何重建移动或闪烁）。
@@ -35,13 +37,29 @@ export function fmtRate(v) {
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 const group = (n) => Math.round(n).toLocaleString('en-US');
 
+/** transcript 后备时上下文窗口（分母）的来源说明（后端 meta.stats.context_limit_source，见 ccr/stats.py） */
+export function windowSourceText(limit, src, model) {
+  const w = '窗口 ' + fmtTokens(limit) + '：';
+  const m = typeof model === 'string' && model ? model : '';
+  switch (src) {
+    case 'context_cmd': return w + '来自 /context' + (m ? '（' + m + '）' : '') + '，Claude Code 自己给出的窗口';
+    case 'model': return w + '按模型' + (m ? ' ' + m : '') + ' 推断（Claude Code 2.1.331 内置模型目录）';
+    case 'hint': return w + '模型名 / 状态栏 / /model 面板里有 [1m] 或 1M';
+    case 'observed': return w + '本会话' + (m ? ' ' + m + ' ' : '该模型') + '的上下文曾超过 200k，按 1M 计';
+    case 'unknown_model': return w + '模型' + (m ? ' ' + m + ' ' : '') + '不在 Claude Code 2.1.331 内置模型目录里，按 Claude Code 的默认 1M 计；运行一次 /context 可得到准确值';
+    case 'default': return w + '默认估算' + (m ? '（' + m + '）' : '') + '；运行一次 /context 可得到准确值';
+    default: return w + '按模型推断';
+  }
+}
+
 /** meta.stats → 要显示的内容（纯函数，回放页也用它做断言） */
 export function describeStats(st, opts = {}) {
   if (!st || typeof st !== 'object') return null;
   const busy = !!opts.busy && !opts.dead;
   const used = num(st.context_used), limit = num(st.context_limit);
   let pct = num(st.context_pct);
-  if (pct == null && used != null && limit) pct = (used * 100) / limit;
+  // transcript 后备：后端的百分比已四舍五入到 0.1，按原始值再算一次（214,632 / 1M = 21.46% 显示 21%，与 CLI 一致，不会二次进位成 22%）
+  if ((pct == null || st.context_source === 'transcript') && used != null && limit) pct = Math.min(100, (used * 100) / limit);
   const approx = !!st.context_approx;
   const out = { ctx: null, cost: null, rate: null };
 
@@ -53,9 +71,9 @@ export function describeStats(st, opts = {}) {
     let tip;
     if (st.context_source === 'transcript') {
       tip = '上下文（约）：' + (used != null ? group(used) + ' tokens' : '—') +
-        (limit ? '，上限按模型推断为 ' + group(limit) : '') + (pct != null ? '（' + fmtPct(pct) + '）' : '') +
-        '\n来自 transcript 最近一条回复的 usage（input + cache_creation + cache_read）；状态栏里没有上下文信息' +
-        '\n上限：模型名 / 状态栏 / /model 面板描述含 1M 或 [1m] 记为 1,000,000，否则 200,000';
+        (limit ? ' / ' + group(limit) : '') + (pct != null ? '（' + fmtPct(pct) + '）' : '') +
+        (limit ? '\n' + windowSourceText(limit, st.context_limit_source, st.context_model) : '') +
+        '\n已用来自 transcript 最近一条回复的 usage（input + cache_creation + cache_read）；状态栏里没有上下文信息';
     } else {
       tip = '上下文：' + (used != null ? group(used) + (limit ? ' / ' + group(limit) : '') + ' tokens' : '') +
         (pct != null ? (used != null ? '（' + fmtPct(pct) + '）' : fmtPct(pct)) : '') +

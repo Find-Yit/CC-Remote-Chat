@@ -17,6 +17,7 @@ import { fileChip, bashPaths, textPaths, localhostUrls, urlPreviewButton, markdo
 import { collectTurn, renderTurnSummary } from './turnfiles.js';
 import { groupSummary, noteToolAdded } from './toolgroups.js';
 import { exitNoticeText } from './exitnotice.js';
+import { hasAnsi, stripAnsi, ansiPre, isContextCommand, parseContextOutput, contextCard } from './ctxcard.js';
 
 const INITIAL_WINDOW = 300;   // 首次挂载时最多渲染的条目数
 const MORE_STEP = 200;
@@ -430,9 +431,10 @@ function addCommand(s, c, ts, level) {
 }
 
 function noteCommandOutput(s, out) {
-  const m = String(out).match(SET_MODEL_RE);
+  out = stripAnsi(out);
+  const m = out.match(SET_MODEL_RE);
   if (m) setModelInfo(s, 'model', m[1].trim(), 'command');
-  const e = String(out).match(SET_EFFORT_RE);
+  const e = out.match(SET_EFFORT_RE);
   if (e && /^(low|medium|high|xhigh|max)$/i.test(e[1])) setModelInfo(s, 'effort', e[1].toLowerCase(), 'command');
 }
 
@@ -1386,7 +1388,14 @@ function renderCmd(item, el, cls) {
   const nodes = [];
   if (item.command) nodes.push(h('div', { class: 'cmd-line' }, icon('terminal'), h('span', { class: 'mono' }, item.command)));
   if (item.output != null && item.output !== '') {
-    nodes.push(h('div', { class: 'cmd-out' + (item.command ? '' : ' solo') }, h('span', { class: 'cmd-mark' }, '⎿'), h('span', { class: 'cmd-out-text' }, truncate(item.output.replace(/`/g, ''), 4000))));
+    // /context：卡片（总量 + 用量条 + 分类，原文可展开）；其它带 ANSI 颜色码的输出：上色的等宽原文（不再露出 "[38;5;245m"）
+    const ctx = (isContextCommand(item.command) || !item.command) && !item.isError ? parseContextOutput(item.output) : null;
+    let body;
+    if (ctx) body = contextCard(item.output, ctx);
+    else if (hasAnsi(item.output)) body = ansiPre(truncate(item.output, 20000), 'cmd-ansi');
+    else body = h('span', { class: 'cmd-out-text' }, truncate(item.output.replace(/`/g, ''), 4000));
+    nodes.push(h('div', { class: 'cmd-out' + (item.command ? '' : ' solo') + (ctx || hasAnsi(item.output) ? ' rich' : '') },
+      h('span', { class: 'cmd-mark' }, '⎿'), body));
   }
   el.replaceChildren(...nodes);
 }

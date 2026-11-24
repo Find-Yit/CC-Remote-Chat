@@ -1,0 +1,50 @@
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 10.1k tokens (1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Custom agents: 73 tokens (<0.1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Memory files: 130 tokens (<0.1%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝   ⛁ Skills: 2.6k tokens (0.3%)
+                                               ⛁ Messages: 10 tokens (<0.1%)
+                                               ⛶ Free space: 951k tokens (95%)
+                                               ⛝ Autocompact buffer: 33k tokens (3%)
+
+     Auto-compact window:  1m tokens
+
+     Custom agents · .claude/agents/
+
+     Plugin
+     └ code-simplifier:code-simplifier: 73 tokens
+
+     Memory files · /memory
+     └ ~/.claude/CLAUDE.md: 130 tokens
+
+     Skills · /skills
+
+     User
+     ├ my-skill-a: ~180 tokens
+     ├ my-skill-b: ~170 tokens
+     └ my-skill-c: ~120 tokens
+
+     Plugin (claude-hud)
+     ├ claude-hud:configure: ~40 tokens
+     └ claude-hud:setup: ~20 tokens
+
+     Built-in
+     ├ dataviz: ~480 tokens
+     ├ claude-api: ~390 tokens
+     ├ code-review: ~280 tokens
+     ├ update-config: ~240 tokens
+     ├ run: ~120 tokens
+     ├ loop: ~120 tokens
+     ├ plugin-authoring: ~90 tokens
+     ├ workflow-authoring: ~80 tokens
+     ├ keybindings-help: ~80 tokens
+     ├ fewer-permission-prompts: ~60 tokens
+     ├ simplify: ~60 tokens
+     ├ security-review: ~30 tokens
+     └ init: ~20 tokens
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: ?% | ⚙ ... tok/s | 💰 $0 | 5h: 1.2M tok, $1.23 | 7d: 9.8M tok, $9.87 | 19:32
+  ⏵⏵ auto mode on (shift+tab to cycle)
+

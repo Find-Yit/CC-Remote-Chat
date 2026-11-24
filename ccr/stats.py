@@ -5,8 +5,19 @@
 
 数据来源与口径
 - 上下文：优先状态栏（用户自己的 statusline 里的 "25k/1M"、"3%"）；
-  后备 = 最近一条主链 assistant 的 input_tokens + cache_creation_input_tokens + cache_read_input_tokens，
-  上限按模型推断（状态栏 / 模型名 / /model 面板描述里有 1M 或 [1m] → 1,000,000，否则 200,000），标 approx。
+  后备 = 最近一条主链 assistant 的 input_tokens + cache_creation_input_tokens + cache_read_input_tokens，标 approx；
+  窗口（分母）按优先级取（context_limit_source）：
+    1. context_cmd：CLI 自己输出的 /context（transcript 的 <local-command-stdout> / isMeta Markdown，或屏幕上的 /context）
+       里的 "已用/窗口 tokens"，按该会话、该模型记下（最权威，覆盖下面的推断）；
+    2. model：transcript 最新主链 assistant 的 message.model 查 MODEL_CONTEXT（CLI 2.1.331 内置模型目录）；
+       hint：模型名 / 状态栏 / /model 面板描述 / 启动参数里有 [1m] 或大写 1M → 1,000,000；
+       unknown_model：模型名不在表里（第三方网关的叫法、比 2.1.331 新的模型）→ 1,000,000，与 CLI 一致
+       （CLI 2.1.331 对不认识的模型默认 1M，见 MODEL_CONTEXT 上方的注释）；
+    3. observed：同一会话同一模型观测到的上下文 tokens 曾经超过推断的窗口 → 至少 1,000,000（只升不降；换模型重新判断）；
+    4. default：200,000（还没有任何主链 assistant 条目、不知道模型时；此时也没有已用值，实际不显示）。
+  已知限制：CLI 的 CLAUDE_CODE_DISABLE_1M_CONTEXT（一律 200k）/ CLAUDE_CODE_MAX_CONTEXT_TOKENS（指定窗口）等环境变量
+  我们不读（红线：不碰 claude 的环境），只能靠 /context 的输出纠正。
+  推断出来的分母不会让百分比超过 100%（超过时封顶 100）。
 - 总花费：只用状态栏里的 "$x"（Claude Code 自己算好交给 statusline 的会话花费）；没有就是 None，绝不自己估价。
 - token/s：spinner "(5s · ↓ 175 tokens …)"。
   * 生成中（tok_s_live）：相邻帧 tokens 增量 ÷ 本地收到帧的时间差，在最近 LIVE_WINDOW 秒的单调段上平滑；
@@ -18,17 +29,91 @@ from __future__ import annotations
 
 import collections
 import math
-from typing import Dict, Iterable, Optional
+import re
+from typing import Dict, Iterable, Optional, Tuple
 
 from . import tui_parse
 
 CTX_DEFAULT_LIMIT = 200_000
 CTX_1M_LIMIT = 1_000_000
 
+# 上下文窗口表：来自 Claude Code CLI 2.1.331 打包程序里的内置模型目录（bin/claude.exe 的
+# "Hand-maintained baked-in model catalog"，models[].context）。id → (显示名, 默认窗口)。
+# 默认窗口 = context.window；没有 context 字段的老模型 CLI 按 200k 算。
+# 原生 1M（context.native_1m:true，window:1e6）：Haiku 5.5、Sonnet 5 / 5.5、Opus 4.7 / 4.8 / 5 / 5.5、Fable 5.x、Mythos 5.x。
+# 其余是 200k；它们在 CLI 里变成 1M 的条件（同版本 nG()/XLr()）：模型串带 "[1m]" 后缀（/model 选 "… (1M context)"、
+# --model x[1m]、ANTHROPIC_DEFAULT_*_MODEL=x[1m]），或请求带 context-1m beta 头且模型 supports_1m_beta
+# （Sonnet 4 / 4.5 / 4.6、Opus 4.6）；CLAUDE_CODE_DISABLE_1M_CONTEXT=1 时一律 200k。transcript 里的 message.model
+# 是 API 返回的 id、不带 [1m]，所以这些情况只能靠 [1m]/1M 提示、/context 或观测值（> 200k）来判断。
+# 不在目录里的模型（同版本 ik()，偏移约 308,059,578："if(!ak(e))return aOt;let y=s.CLAUDE_CODE_MAX_CONTEXT_TOKENS;
+# if(y!==void 0&&y>0)return y;return KF()?aOt:QB"，aOt=200000、QB=1e6、KF()=CLAUDE_CODE_DISABLE_1M_CONTEXT）：
+# ak(e)（约 308,057,567）= 别名/覆盖解析后仍不是已知模型；h6()（约 308,043,122）= 目录 id 或 qv() 的
+# claude-3-opus / claude-3-sonnet / claude-3-haiku。已知但目录没给窗口的 → 200k；不认识的 → 1M（/context 里写作
+# "… tokens (default for an unrecognized model)"）。
+MODEL_CONTEXT: Dict[str, Tuple[str, int]] = {
+    "claude-3-opus": ("Opus 3", 200_000),
+    "claude-3-sonnet": ("Sonnet 3", 200_000),
+    "claude-3-haiku": ("Haiku 3", 200_000),
+    "claude-3-5-haiku": ("Haiku 3.5", 200_000),
+    "claude-haiku-4-5": ("Haiku 4.5", 200_000),
+    "claude-haiku-5-5": ("Haiku 5.5", 1_000_000),
+    "claude-3-5-sonnet": ("Sonnet 3.5", 200_000),
+    "claude-3-7-sonnet": ("Sonnet 3.7", 200_000),
+    "claude-sonnet-4-0": ("Sonnet 4", 200_000),
+    "claude-sonnet-4-5": ("Sonnet 4.5", 200_000),
+    "claude-sonnet-4-6": ("Sonnet 4.6", 200_000),
+    "claude-sonnet-5": ("Sonnet 5", 1_000_000),
+    "claude-sonnet-5-5": ("Sonnet 5.5", 1_000_000),
+    "claude-opus-4-0": ("Opus 4", 200_000),
+    "claude-opus-4-1": ("Opus 4.1", 200_000),
+    "claude-opus-4-5": ("Opus 4.5", 200_000),
+    "claude-opus-4-6": ("Opus 4.6", 200_000),
+    "claude-opus-4-7": ("Opus 4.7", 1_000_000),
+    "claude-opus-4-8": ("Opus 4.8", 1_000_000),
+    "claude-opus-5": ("Opus 5", 1_000_000),
+    "claude-opus-5-5": ("Opus 5.5", 1_000_000),
+    "claude-fable-5": ("Fable 5", 1_000_000),
+    "claude-fable-5-1": ("Fable 5.1", 1_000_000),
+    "claude-fable-5-2": ("Fable 5.2", 1_000_000),
+    "claude-mythos-5": ("Mythos 5", 1_000_000),
+    "claude-mythos-5-1": ("Mythos 5.1", 1_000_000),
+    "claude-mythos-5-2": ("Mythos 5.2", 1_000_000),
+}
+# 目录里 first_party id 与目录 id 不同的老模型（去掉日期后）
+_MODEL_ALIASES = {"claude-opus-4": "claude-opus-4-0", "claude-sonnet-4": "claude-sonnet-4-0"}
+LIMIT_SOURCES = ("context_cmd", "model", "hint", "unknown_model", "observed", "default")
+_MODEL_LABEL_RE = re.compile(r"^[\w .:@/\[\]()-]{1,64}$")
+
+
+def norm_model(model) -> Optional[str]:
+    """模型串 → 归一化 id（小写，去掉 [1m]、Bedrock/Vertex 前后缀与日期）：
+    'us.anthropic.claude-haiku-4-5-20251001-v1:0' → 'claude-haiku-4-5'、'claude-opus-5-5[1m]' → 'claude-opus-5-5'。"""
+    if not isinstance(model, str):
+        return None
+    m = model.strip().lower()
+    if not m or len(m) > 200:
+        return None
+    m = re.sub(r"\[\d+m\]$", "", m)
+    m = re.sub(r"^(?:[a-z]{2,6}\.)?anthropic\.", "", m)
+    m = re.sub(r"@\d{8}$", "", m)
+    m = re.sub(r"-v\d+(?::\d+)?$", "", m)
+    m = re.sub(r"-\d{8}$", "", m)
+    return _MODEL_ALIASES.get(m, m) or None
+
+
+def model_context(model) -> Optional[Tuple[str, int]]:
+    """模型串 → (显示名, 默认窗口)；不在表里返回 None。"""
+    return MODEL_CONTEXT.get(norm_model(model) or "")
+
+
+def _label(v) -> Optional[str]:
+    return v if isinstance(v, str) and _MODEL_LABEL_RE.match(v) else None
+
 # meta.stats 的字段（持久化/恢复时按此校验）
 NUM_FIELDS = ("context_used", "context_limit", "context_pct", "cost_usd", "tok_s_live", "tok_s_last",
               "last_turn_tokens", "last_turn_elapsed_s", "updated_at")
-STR_FIELDS = {"context_source": ("status", "transcript"), "cost_source": ("status",)}
+STR_FIELDS = {"context_source": ("status", "transcript"), "cost_source": ("status",),
+              "context_limit_source": LIMIT_SOURCES}
 
 
 def _num(v) -> Optional[float]:
@@ -58,6 +143,23 @@ def _usage_context(entry) -> Optional[int]:
     return total or None
 
 
+def _context_output(entry) -> Optional[Dict]:
+    """主链里 /context 的输出条目（system local_command 的 <local-command-stdout>，或 isMeta user 的 Markdown 版）
+    → tui_parse.parse_context_usage 的结果。"""
+    if not isinstance(entry, dict) or entry.get("isSidechain") or entry.get("type") not in ("system", "user"):
+        return None
+    c = entry.get("content")
+    if c is None and isinstance(entry.get("message"), dict):
+        c = entry["message"].get("content")
+    if isinstance(c, list):
+        c = "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and isinstance(b.get("text"), str))
+    if not isinstance(c, str) or len(c) > 200_000 or "ontext" not in c[:400]:
+        return None
+    if not ("<local-command-stdout>" in c or c.lstrip().startswith("## Context Usage")):
+        return None
+    return tui_parse.parse_context_usage(c)
+
+
 def sanitize(d) -> Optional[Dict]:
     """持久化的 meta.stats → 只保留合法字段（app 重启后恢复最后已知值；生成中速率不恢复）。"""
     if not isinstance(d, dict):
@@ -71,6 +173,7 @@ def sanitize(d) -> Optional[Dict]:
         out[k] = v if v in allowed else None
     ct = d.get("cost_text")
     out["cost_text"] = ct if isinstance(ct, str) and len(ct) <= 32 and ct.startswith("$") else None
+    out["context_model"] = _label(d.get("context_model"))
     out["context_approx"] = bool(d.get("context_approx"))
     out["tok_s_live"] = None
     for k in ("context_used", "context_limit", "last_turn_tokens"):
@@ -97,6 +200,11 @@ class StatsTracker:
         # transcript：最近一条主链 assistant 的上下文
         self.tr_used: Optional[int] = None
         self.tr_model: Optional[str] = None
+        # 上下文窗口的依据（同一个 claude 进程里不随 /clear 变化，transcript reset 时保留）
+        self.ctx_windows: Dict[str, Tuple[int, Optional[str]]] = {}   # 归一化模型 → (/context 给出的窗口, 显示名)
+        self.ctx_last: Optional[Tuple[int, Optional[str], Optional[str]]] = None  # 最近一次 /context：(窗口, 显示名, 当时的 tr 模型)
+        self.peaks: Dict[str, int] = {}          # 归一化模型 → 观测到的最大上下文 tokens（只升不降）
+        self.rs_limit: Optional[Tuple[int, str, Optional[str]]] = None   # 持久化恢复的 (窗口, 来源, 模型名)，transcript 到达前用
         # 本轮（busy 期间）的 spinner 采样
         self.in_turn = False
         self.segs: list = []          # 每段 [tokens, elapsed_s]（该段最后一次看到的值）
@@ -121,6 +229,8 @@ class StatsTracker:
             self.st_pct = d.get("context_pct")
         elif d.get("context_source") == "transcript":
             self.tr_used = d.get("context_used")
+            if d.get("context_limit") and d.get("context_limit_source"):
+                self.rs_limit = (d["context_limit"], d["context_limit_source"], d.get("context_model"))
         if d.get("cost_source") == "status" and d.get("cost_usd") is not None:
             self.st_cost = d.get("cost_usd")
             self.st_cost_text = d.get("cost_text")
@@ -136,13 +246,38 @@ class StatsTracker:
             c = _usage_context(e)
             if c is not None:
                 self.tr_used = c
+                self.rs_limit = None
                 m = (e.get("message") or {}).get("model")
                 self.tr_model = m if isinstance(m, str) and len(m) < 200 else None
+                k = norm_model(self.tr_model) or ""
+                if c > self.peaks.get(k, 0):
+                    self.peaks[k] = c
+                continue
+            cu = _context_output(e)
+            if cu is not None:
+                self._note_context(cu)
+
+    def _note_context(self, cu: Dict) -> None:
+        """CLI 的 /context 输出 → 记下该模型的窗口（按 /context 里的模型 id；也按当时 transcript 的模型，
+        因为第三方网关返回的 message.model 可能和 CLI 自己的模型名不一样）。"""
+        limit = cu.get("limit")
+        if not isinstance(limit, int) or limit < 1000:
+            return
+        k = norm_model(cu.get("model"))
+        known = MODEL_CONTEXT.get(k or "")
+        label = (_label(cu.get("display")) or (known[0] if known else None)
+                 or (self.ctx_windows.get(k or "") or (0, None))[1] or _label(cu.get("model")))
+        if k:
+            self.ctx_windows[k] = (limit, label)
+        self.ctx_last = (limit, label, norm_model(self.tr_model))
 
     def on_screen(self, st: Optional[Dict], t: float) -> None:
         """一帧屏幕的解析结果。t = 本地单调时钟（秒）。"""
         if not isinstance(st, dict):
             return
+        cu = st.get("context_usage")
+        if isinstance(cu, dict):
+            self._note_context(cu)
         ss = st.get("status_stats")
         if isinstance(ss, dict):
             if ss.get("context_pct") is not None or ss.get("context_used") is not None:
@@ -231,27 +366,52 @@ class StatsTracker:
         self.stop()
 
     # ------------------------------------------------------------ 输出
-    def _infer_limit(self, hints: Iterable) -> int:
-        texts = [self.status_text, self.tr_model] + list(hints or ())
-        return CTX_1M_LIMIT if any(tui_parse.has_1m_hint(x) for x in texts if isinstance(x, str)) \
-            else CTX_DEFAULT_LIMIT
+    def _infer_limit(self, hints: Iterable) -> Tuple[int, str, Optional[str]]:
+        """transcript 后备的上下文窗口 → (窗口, 来源 LIMIT_SOURCES 之一, 模型显示名或 None)。"""
+        if self.tr_model is None and self.rs_limit is not None:
+            return self.rs_limit
+        k = norm_model(self.tr_model)
+        known = MODEL_CONTEXT.get(k or "")
+        label = known[0] if known else _label(self.tr_model)
+        limit = src = None
+        if k and k in self.ctx_windows:
+            limit, lb = self.ctx_windows[k]
+            src, label = "context_cmd", lb or label
+        elif self.ctx_last is not None and self.ctx_last[2] == k and known is None:
+            # transcript 的模型名不在表里（第三方网关的叫法）而 /context 用的是 CLI 自己的模型名：按"当时的模型"对上
+            limit, lb, _ = self.ctx_last
+            src, label = "context_cmd", lb or label
+        if limit is None:
+            texts = [self.status_text, self.tr_model] + list(hints or ())
+            if any(tui_parse.has_1m_hint(x) for x in texts if isinstance(x, str)):
+                limit, src = CTX_1M_LIMIT, "hint"
+            if known and (limit is None or known[1] >= limit):
+                limit, src = known[1], "model"
+            if limit is None:
+                # 不在表里的模型：CLI 2.1.331 默认 1M（见 MODEL_CONTEXT 上方注释）；连模型名都没有时才用 200k
+                limit, src = (CTX_1M_LIMIT, "unknown_model") if k else (CTX_DEFAULT_LIMIT, "default")
+        peak = self.peaks.get(k or "", 0)
+        if peak > limit:
+            limit, src = max(CTX_1M_LIMIT, limit), "observed"
+        return limit, src, label
 
     def snapshot(self, hints: Iterable = ()) -> Optional[Dict]:
         """meta.stats（不含 updated_at；什么都不知道时返回 None）。hints = 推断上下文上限用的模型名/描述文本。"""
         used = limit = pct = None
-        src = None
+        src = lsrc = model = None
         approx = False
         if self.st_pct is not None or self.st_used is not None:
             used, limit, pct, src = self.st_used, self.st_limit, self.st_pct, "status"
         elif self.tr_used is not None:
             used, src, approx = self.tr_used, "transcript", True
-            limit = self._infer_limit(hints)
-            pct = round(used * 100.0 / limit, 1)
+            limit, lsrc, model = self._infer_limit(hints)
+            pct = min(100.0, round(used * 100.0 / limit, 1))   # 推断的分母不让百分比超过 100%
         live = self.live if self.in_turn else None
         out = {
             "context_used": used, "context_limit": limit,
             "context_pct": round(pct, 1) if pct is not None else None,
             "context_source": src, "context_approx": approx,
+            "context_limit_source": lsrc, "context_model": model,
             "cost_usd": self.st_cost, "cost_text": self.st_cost_text if self.st_cost is not None else None,
             "cost_source": "status" if self.st_cost is not None else None,
             "tok_s_live": round(live, 1) if live is not None else None,

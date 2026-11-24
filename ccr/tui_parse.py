@@ -545,6 +545,17 @@ def _parse_dialog(region: List[str]) -> Dict:
 
 
 # --------------------------------------------------------------------------- 内容区
+def _turn_boundary_above(content: List[str], j: int) -> bool:
+    """content[j]（排队块往上第一行非 ❯ 块的内容）是不是"上一轮已经结束"的标志：结束行（✻ Baked for 9s · done …）、
+    "⎿  Interrupted …"、或启动横幅（/clear 之后同样）。到了屏幕顶端（j < 0，可能是滚出去了）不算。"""
+    if j < 0:
+        return False
+    line = content[j]
+    if _DONE_RE.match(line) or _INTERRUPTED_RE.search(line):
+        return True
+    return j < 8 and any("Claude Code v" in l for l in content[max(0, j - 4):j + 1])
+
+
 def _queued_blocks(content: List[str]) -> List[Tuple[int, int, str]]:
     """排队的消息 → [(块起始行号, 所属 Queued 行号, 文字)]，按屏幕顺序。
 
@@ -576,6 +587,10 @@ def _queued_blocks(content: List[str]) -> List[Tuple[int, int, str]]:
             else:
                 break
             j -= 1
+        if len(blocks) >= 2 and _turn_boundary_above(content, j):
+            # 本轮还没有任何输出（还在 thinking）时，真正发出去的那条消息紧挨在排队块上方、再往上就是上一轮的结束行 /
+            # Interrupted / 启动横幅：最上面那块是已发送的消息（当回显），不是排队消息（真机 v2.1.331 实测）
+            blocks.pop()
         for start, text in reversed(blocks):
             taken.update(range(start, qi + 1))
             out.append((start, qi, text))
@@ -819,6 +834,67 @@ def has_1m_hint(text: Optional[str]) -> bool:
     return isinstance(text, str) and bool(_ONE_M_RE.search(text))
 
 
+# ---------------------------------------------------------------- /context 的输出
+# CLI 2.1.331 实测：屏幕 fixtures/context_cmd/，transcript fixtures/transcript_context_*.jsonl。
+# 交互式（屏幕 / transcript 的 <local-command-stdout>，后者带 ANSI 颜色）：
+#   "Context usage" 标题，下面左边是 ⛁ ⛀ ⛶ ⛝ 方块网格，右边一列依次是 显示名 / 模型 id / "16k/1m tokens (2%)"；
+#   窄终端时右列整体折到网格下方。数字是 CLI 的紧凑写法（16k、950.4k、1m = 1,000,000）。
+# Markdown（同一次 /context 另写进 transcript 的 isMeta user 条目，也是 -p 模式的输出）：
+#   "## Context Usage" / "**Model:** claude-haiku-5-5" / "**Tokens:** 16k / 1m (2%)"
+_ANSI_RE = re.compile(r"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_CTX_HEAD_RE = re.compile(r"^(?:##\s*)?Context usage\s*$", re.I)
+_CTX_TOKENS_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*([kKmM])?\s*/\s*(\d+(?:\.\d+)?)\s*([kKmM])?"
+                            r"(?:\s+tokens)?\s*\(\s*<?\s*(\d+(?:\.\d+)?)\s*%\s*\)")
+_CTX_MD_MODEL_RE = re.compile(r"^\*\*Model:\*\*\s*(\S+)")
+_CTX_GRID_PREFIX_RE = re.compile(r"^[\s⎿⛀⛁⛶⛝]*")
+_CTX_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][\w.:@/\[\]-]{0,99}$")
+CTX_SCAN_LINES = 14     # 标题之后最多往下找这么多行（窄终端右列折到网格下方时 "x/y tokens" 在第 12 行左右）
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text) if isinstance(text, str) else ""
+
+
+def parse_context_usage(text: Optional[str]) -> Optional[Dict]:
+    """/context 的输出（屏幕、transcript 的 ANSI 文本或 Markdown 版）→ {used, limit, pct, model, display}；
+    有多份时取最后一份；找不到 "Context usage" 标题与其后的 "已用/窗口 tokens (p%)" 时返回 None（绝不抛异常）。"""
+    if not isinstance(text, str) or "ontext" not in text:
+        return None
+    text = re.sub(r"</?local-command-(?:stdout|stderr)>", "\n", strip_ansi(text))
+    lines = text.replace("\u00a0", " ").split("\n")
+    for i in range(len(lines) - 1, -1, -1):
+        head = _CTX_GRID_PREFIX_RE.sub("", lines[i]).strip()
+        if not _CTX_HEAD_RE.match(head):
+            continue
+        model = display = None
+        for j in range(i + 1, min(len(lines), i + 1 + CTX_SCAN_LINES)):
+            body = _CTX_GRID_PREFIX_RE.sub("", lines[j]).strip()
+            mm = _CTX_MD_MODEL_RE.match(body)
+            if mm:
+                model = mm.group(1)
+                continue
+            m = _CTX_TOKENS_RE.search(body)
+            if not m or (m.start() > 2 and not body.startswith("**Tokens:**")):
+                continue
+            used = _si_number(m.group(1), m.group(2))
+            limit = _si_number(m.group(3), m.group(4))
+            if used is None or limit is None or limit < 1000 or used < 0:
+                break
+            if model is None:
+                # 交互式：tokens 行上面两行是 模型 id / 显示名（右列，去掉左边的网格）
+                prev = [_CTX_GRID_PREFIX_RE.sub("", lines[k]).strip() for k in range(max(i + 1, j - 2), j)]
+                if prev and _CTX_MODEL_ID_RE.match(prev[-1]):
+                    model = prev[-1]
+                    if len(prev) > 1 and prev[0] and len(prev[0]) <= 64:
+                        display = prev[0]
+            if model is not None and not _CTX_MODEL_ID_RE.match(model):
+                model = None
+            return {"used": int(used), "limit": int(limit), "pct": float(m.group(5)),
+                    "model": model, "display": display}
+        # 这一份不完整（例如画面上只露出了标题）：继续往前找上一份
+    return None
+
+
 def _turn_done_seconds(done: Optional[str]) -> Optional[float]:
     """'Baked for 9s · done 7:50 PM' → 9.0；'Cogitated for 1m 5s' → 65.0。"""
     if not done:
@@ -928,6 +1004,8 @@ def parse_screen(text: str) -> Dict:
     res["spinner_info"] = parse_spinner(res["spinner"])
     res["turn_done_s"] = _turn_done_seconds(res["turn_done"])
     res["status_stats"] = parse_status_stats(res["status_line"])
+    # 屏幕上的 /context 输出（fullscreen 渲染器下一直留在画面里；只读，用来知道 CLI 自己认定的上下文窗口）
+    res["context_usage"] = parse_context_usage("\n".join(lines)) if "ontext usage" in text else None
     return res
 
 

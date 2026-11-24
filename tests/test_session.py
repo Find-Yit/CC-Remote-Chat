@@ -1848,10 +1848,15 @@ def _stream_frames():
     raise AssertionError("no stream_frames")
 
 
-def _fixture_transcript():
+def _fixture_transcript(model=None):
+    """真机 transcript（claude-haiku-5-5）；给了 model 时把 assistant 的 message.model 换掉（测上下文窗口推断）。"""
     with open(FIX / "transcript_interactive_59dd443a.jsonl", encoding="utf-8") as f:
-        return [e for e in (json.loads(l) for l in f if l.strip())
-                if e.get("type") in ("user", "assistant", "system") and not e.get("isSidechain")]
+        out = [e for e in (json.loads(l) for l in f if l.strip())
+               if e.get("type") in ("user", "assistant", "system") and not e.get("isSidechain")]
+    if model:
+        out = [dict(e, message=dict(e["message"], model=model)) if e.get("type") == "assistant"
+               and isinstance(e.get("message"), dict) and e["message"].get("model") != "<synthetic>" else e for e in out]
+    return out
 
 
 class TestStats(Base):
@@ -1928,15 +1933,25 @@ class TestStats(Base):
                                        "entries": _fixture_transcript(), "reset": True})
             self.assertTrue(wait_until(lambda: m.get_meta(sid)["stats"] is not None, 2))
             st = m.get_meta(sid)["stats"]
-            self.assertEqual((st["context_used"], st["context_limit"], st["context_source"], st["context_approx"]),
-                             (26050, 200000, "transcript", True))
+            # claude-haiku-5-5 在 CLI 2.1.331 的模型目录里原生 1M
+            self.assertEqual((st["context_used"], st["context_limit"], st["context_source"], st["context_approx"],
+                              st["context_limit_source"], st["context_model"]),
+                             (26050, 1000000, "transcript", True, "model", "Haiku 5.5"))
             self.assertIsNone(st["cost_usd"])
-            # 1M 模型（启动参数里有 [1m]）→ 上限 1,000,000
-            sid2 = self.start(m, model="claude-fable-5-1[1m]")
+            # 200k 的模型（Sonnet 4.6），启动参数里有 [1m] → 上限 1,000,000（来源：提示）
+            sid2 = self.start(m, model="claude-sonnet-4-6[1m]")
             m._on_link_event("12345", {"ev": "transcript", "sid": sid2, "session_id": UUID2,
-                                       "entries": _fixture_transcript(), "reset": True})
-            self.assertTrue(wait_until(lambda: (m.get_meta(sid2)["stats"] or {}).get("context_limit") == 1000000, 2),
+                                       "entries": _fixture_transcript("claude-sonnet-4-6"), "reset": True})
+            self.assertTrue(wait_until(lambda: (m.get_meta(sid2)["stats"] or {}).get("context_limit_source") == "hint", 2),
                             m.get_meta(sid2)["stats"])
+            self.assertEqual(m.get_meta(sid2)["stats"]["context_limit"], 1000000)
+            # 同样的模型、没有 [1m] → 200k（来源：按模型）
+            sid3 = self.start(m)
+            m._on_link_event("12345", {"ev": "transcript", "sid": sid3, "session_id": "3f1c2b4a-1111-4222-8333-944455556666",
+                                       "entries": _fixture_transcript("claude-sonnet-4-6"), "reset": True})
+            self.assertTrue(wait_until(lambda: (m.get_meta(sid3)["stats"] or {}).get("context_limit") == 200000, 2),
+                            m.get_meta(sid3)["stats"])
+            self.assertEqual(m.get_meta(sid3)["stats"]["context_pct"], 13.0)
             # 关闭后 app 重启：已退出会话保留最后已知统计（sessions.json 里也有）
             m.close(sid)
             before = m.get_meta(sid)["stats"]
@@ -2115,9 +2130,28 @@ class TestFakeEndToEnd(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.stats(m, sid).get("context_source") == "transcript", 15, 0.1),
                         (self.stats(m, sid), m.get_screen(sid)["text"]))
         st = self.stats(m, sid)
-        self.assertEqual((st["context_used"], st["context_limit"], st["context_approx"]), (1202, 200000, True))
+        # fake 的默认模型是 haiku = claude-haiku-5-5：CLI 2.1.331 模型目录里原生 1M
+        self.assertEqual((st["context_used"], st["context_limit"], st["context_approx"], st["context_limit_source"]),
+                         (1202, 1000000, True, "model"))
         self.assertIsNone(st["cost_usd"])
         self.assertIsNone(st["cost_source"])
+
+    def test_stats_window_from_context_cmd(self):
+        """/context 给出的窗口（这里假装是 200k）覆盖按模型推断的 1M；只读 transcript / 屏幕，不多按任何键。"""
+        self.cfg["fake_env"] = {"CCR_FAKE_STATUSLINE": "0", "CCR_FAKE_DELAY": "0.05", "CCR_FAKE_CTX_WINDOW": "200000"}
+        m = self.mgr()
+        sid = self._ready(m)
+        m.send_message(sid, "你好")
+        self.assertTrue(wait_until(lambda: self.stats(m, sid).get("context_limit_source") == "model", 15, 0.1),
+                        self.stats(m, sid))
+        self.wait_state(m, sid, ("idle",))
+        m.send_message(sid, "/context")
+        self.assertTrue(wait_until(lambda: self.stats(m, sid).get("context_limit_source") == "context_cmd", 15, 0.1),
+                        (self.stats(m, sid), m.get_screen(sid)["text"]))
+        st = self.stats(m, sid)
+        self.assertEqual((st["context_used"], st["context_limit"], st["context_pct"], st["context_model"]),
+                         (1202, 200000, 0.6, "Haiku 5.5"))
+        self.assertIsNone(m.get_screen(sid)["state"]["dialog"])
 
     def test_restart_cycles_and_effort_max(self):
         """中 2：同一 sid 在同一作业上反复重启，迟到的 exited 不会 kill 新会话、不会卡在 starting；

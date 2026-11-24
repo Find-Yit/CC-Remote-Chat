@@ -820,3 +820,83 @@ class TestDiffPanel(unittest.TestCase):
                 self.assertIsNone(r["side_panel"])
         finally:
             tui_parse._split_side_panel = orig
+
+
+# ============================================================================ /context 的输出（CLI 2.1.331）
+CTX_DIR = FIX / "context_cmd"
+
+
+def C(name):
+    return (CTX_DIR / name).read_text(encoding="utf-8")
+
+
+def _ctx_entries(name):
+    return [json.loads(l) for l in (FIX / name).read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+class TestContextCmd(unittest.TestCase):
+    """/context：fullscreen 下输出画在消息区（不是需要 Esc 的面板），经典渲染器下同样内联、往上滚；
+    transcript 里是带 ANSI 的 <local-command-stdout> + isMeta 的 Markdown 版。fixtures/context_cmd/ 为真机画面、
+    fixtures/transcript_context_*.jsonl 为同一次的 transcript（都已脱敏）。"""
+
+    def test_fullscreen_screen_is_not_a_dialog(self):
+        for name, used in (("screen_fullscreen_200.txt", 16000), ("screen_fullscreen_72.txt", 16600)):
+            st = parse_screen(C(name))
+            self.assertIsNone(st["dialog"], name)
+            self.assertFalse(st["busy"], name)
+            self.assertTrue(st["input"]["visible"], name)
+            self.assertEqual(st["input"]["text"], "", name)
+            self.assertEqual(st["echo"], "/context", name)
+            self.assertIsNone(st["popup"], name)
+            self.assertIn("Context usage", st["live"], name)          # 空闲时的 live 不会显示成草稿（只有 busy 才显示）
+            self.assertEqual(st["context_usage"], {"used": used, "limit": 1000000, "pct": 2.0,
+                                                   "model": "claude-haiku-5-5", "display": "Haiku 5.5"}, name)
+            self.assertIsNone(st["status_stats"]["context_used"], name)
+
+    def test_classic_screen_header_scrolled_off(self):
+        st = parse_screen(C("screen_classic_120.txt"))
+        self.assertIsNone(st["dialog"])
+        self.assertTrue(st["input"]["visible"])
+        self.assertIsNone(st["context_usage"])     # 标题与总量行已滚出屏幕：不瞎猜
+
+    def test_transcript_outputs(self):
+        from ccr import tui_parse as t
+        got = []
+        for name in ("transcript_context_fullscreen.jsonl", "transcript_context_classic.jsonl"):
+            for e in _ctx_entries(name):
+                c = e.get("content") if e["type"] == "system" else e["message"]["content"]
+                if isinstance(c, str):
+                    r = t.parse_context_usage(c)
+                    if r:
+                        got.append((name[19:23], e["type"], r["used"], r["limit"], r["model"], r["display"]))
+        self.assertEqual(got, [
+            ("full", "system", 16000, 1000000, "claude-haiku-5-5", "Haiku 5.5"),
+            ("full", "user", 16000, 1000000, "claude-haiku-5-5", None),
+            ("full", "system", 16600, 1000000, "claude-haiku-5-5", "Haiku 5.5"),
+            ("full", "user", 16600, 1000000, "claude-haiku-5-5", None),
+            ("clas", "system", 16000, 1000000, "claude-haiku-5-5", "Haiku 5.5"),
+            ("clas", "user", 16000, 1000000, "claude-haiku-5-5", None),
+        ])
+
+    def test_parse_variants_and_garbage(self):
+        from ccr import tui_parse as t
+        md = "## Context Usage\n\n**Model:** claude-opus-5-5  \n**Tokens:** 46.8k / 1m (5%)\n"
+        self.assertEqual(t.parse_context_usage(md), {"used": 46800, "limit": 1000000, "pct": 5.0,
+                                                     "model": "claude-opus-5-5", "display": None})
+        txt = ("Context usage\n⛁ ⛁ ⛶ ⛶   Sonnet 4.6\n⛶ ⛶ ⛶ ⛶   claude-sonnet-4-6\n⛶ ⛶ ⛶ ⛶   150.2k/200k tokens (75%)\n")
+        self.assertEqual(t.parse_context_usage(txt)["limit"], 200000)
+        self.assertEqual(t.parse_context_usage(txt)["used"], 150200)
+        # 只有模型 id（未知模型没有显示名）
+        r = t.parse_context_usage("Context usage\n⛁ ⛶   my-gateway-model\n⛶ ⛶   12k/1m tokens (1%)")
+        self.assertEqual((r["model"], r["display"]), ("my-gateway-model", None))
+        # 多份时取最后一份
+        self.assertEqual(t.parse_context_usage(txt + "\n" + md)["model"], "claude-opus-5-5")
+        for bad in (None, 5, "", "Context usage", "context usage\nno numbers here", "16k/1m tokens (2%)",
+                    "Context usage\n" + "\n" * 30 + "16k/1m tokens (2%)", "Context usage\n0/0 tokens (0%)",
+                    "\x1b[1mContext usage\x1b[22m\n\x1b[38;5;241m⛶ ⛶"):
+            self.assertIsNone(t.parse_context_usage(bad), repr(bad))
+        self.assertEqual(t.strip_ansi("\x1b[1mA\x1b[22m\x1b[38;5;245mB\x1b[39m\x1b]0;t\x07C"), "ABC")
+
+    def test_old_fixtures_have_no_context_usage(self):
+        for text in _old_frames():
+            self.assertIsNone(parse_screen(text)["context_usage"])

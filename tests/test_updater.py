@@ -13,11 +13,13 @@
 import hashlib
 import http.server
 import json
+import logging
 import os
 import pathlib
 import plistlib
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -35,6 +37,7 @@ OPENSSL = "/usr/bin/openssl"
 HAVE_TOOLS = all(os.path.exists(p) for p in (OPENSSL, "/usr/bin/codesign", "/usr/bin/hdiutil", "/usr/bin/ditto",
                                               "/usr/bin/security"))
 TMP = None
+DIRECT = lambda: {"mode": "direct"}   # noqa: E731  测试默认：假装没有系统代理（不受跑测试这台 Mac 的代理设置影响）
 KEYS = {}        # "a" / "b" → {"dir", "sha1", "sha256"}
 SERVER_CERT = None
 
@@ -66,7 +69,7 @@ def setUpModule():
     cert, key = TMP / "srv.pem", TMP / "srv.key"
     subprocess.run([OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "2", "-nodes",
                     "-keyout", str(key), "-out", str(cert), "-subj", "/CN=127.0.0.1",
-                    "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True, timeout=60)
+                    "-addext", "subjectAltName=IP:127.0.0.1,DNS:ccr-gh.test,DNS:ccr-assets.test,DNS:evil.test"], check=True, capture_output=True, timeout=60)
     SERVER_CERT = (str(cert), str(key))
 
 
@@ -276,6 +279,7 @@ class TestCheck(unittest.TestCase):
         self.mpath = "/Owner/CC-Remote-Chat/releases/latest/download/update.json"
 
     def upd(self, **kw):
+        kw.setdefault("proxy_probe", DIRECT)
         u = U.Updater(self.tmp / "data", self.tmp / "app", source(base=self.srv.base), "2.12", "2.12 t h",
                       first_delay=kw.pop("first_delay", 3600), **kw)
         self.addCleanup(u.stop)
@@ -338,9 +342,9 @@ class TestCheck(unittest.TestCase):
     def test_untrusted_tls_rejected(self):
         src = U.Source("Owner/CC-Remote-Chat", KEYS["a"]["sha1"], KEYS["a"]["sha256"], base=self.srv.base,
                        allowed_hosts={"127.0.0.1"}, cafile=None)   # 系统 CA 不认测试证书
-        u = U.Updater(self.tmp / "d2", self.tmp / "app", src, "2.12", "2.12", first_delay=3600)
+        u = U.Updater(self.tmp / "d2", self.tmp / "app", src, "2.12", "2.12", first_delay=3600, proxy_probe=DIRECT)
         self.assertEqual(u.check(), "error")
-        self.assertIn("网络错误", u.status()["last_check"]["error"])
+        self.assertEqual(u.status()["last_check"]["error"], "无法连接 127.0.0.1：证书校验失败（连接可能被拦截）（未设置系统代理）")
 
     def test_auto_check_loop_and_switch(self):
         self.srv.routes[self.mpath] = (200, {}, json.dumps(manifest("2.13", "b", b"x")).encode())
@@ -405,6 +409,7 @@ class TestInstall(unittest.TestCase):
         return m
 
     def upd(self, current="2.12-test", **kw):
+        kw.setdefault("proxy_probe", DIRECT)
         u = U.Updater(self.tmp / "data", self.cur / "Contents" / "Resources" / "app", source(base=self.srv.base),
                       current, current + " t1 aaaa", launcher=self.launched.append, first_delay=3600,
                       shell_exit_timeout=5, busy_poll=0.05, **kw)
@@ -556,6 +561,313 @@ class TestInstall(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.launched, 5))
         self.assertIsNone(other.poll())
         self.assertEqual(self.launched, [["/usr/bin/open", str(self.cur)]])
+
+
+# ============================================================================ 系统代理（CONNECT 隧道；绝不直连）
+_REAL_CREATE_CONNECTION = socket.create_connection
+
+
+class ConnectProxy:
+    """最小的 HTTP CONNECT 代理：routes["host:port"] = (ip, port) 或 "407" / "hang"；记录每个 CONNECT 目标。"""
+
+    def __init__(self, routes):
+        import socketserver
+        self.routes = routes
+        self.tunnels = []
+        outer = self
+
+        class H(socketserver.BaseRequestHandler):
+            def handle(self):
+                c = self.request
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    d = c.recv(4096)
+                    if not d:
+                        return
+                    buf += d
+                line = buf.split(b"\r\n", 1)[0].decode("latin-1")
+                parts = line.split()
+                if len(parts) < 2 or parts[0] != "CONNECT":
+                    c.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                    return
+                outer.tunnels.append(parts[1])
+                r = outer.routes.get(parts[1])
+                if r == "407":
+                    c.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+                    return
+                if r == "hang":
+                    time.sleep(5)
+                    return
+                if r is None:
+                    c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    return
+                up = _REAL_CREATE_CONNECTION(r, timeout=10)   # 不经 _ConnRecorder（那只记客户端的连接）
+                c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+                def pump(a, b):
+                    try:
+                        while True:
+                            d = a.recv(65536)
+                            if not d:
+                                break
+                            b.sendall(d)
+                    except OSError:
+                        pass
+                    for x in (a, b):
+                        try:
+                            x.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                t = threading.Thread(target=pump, args=(up, c), daemon=True)
+                t.start()
+                pump(c, up)
+                t.join(10)
+                up.close()
+
+        class S(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+        self.srv = S(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        self.hostport = "127.0.0.1:%d" % self.port
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def _free_port():
+    s_ = socket.socket()
+    s_.bind(("127.0.0.1", 0))
+    p_ = s_.getsockname()[1]
+    s_.close()
+    return p_
+
+
+class _ConnRecorder:
+    """记录 http.client 发起的每一个 TCP 连接的目标（验证：有代理时只连代理）。"""
+
+    def __init__(self):
+        self.addrs = []
+        self.real = _REAL_CREATE_CONNECTION
+
+    def __call__(self, address, *a, **k):
+        self.addrs.append("%s:%s" % (address[0], address[1]))
+        return self.real(address, *a, **k)
+
+
+@unittest.skipUnless(HAVE_TOOLS, "需要 openssl / codesign / hdiutil / security")
+class TestSystemProxy(unittest.TestCase):
+    """更新源主机用 ccr-gh.test / ccr-assets.test（.test 永远解析不到：要访问只能经代理）。"""
+    MPATH = "/Owner/CC-Remote-Chat/releases/latest/download/update.json"
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="ccr-updp.", dir=str(TMP)))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.srv = Https({})
+        self.addCleanup(self.srv.close)
+        self.proxy = ConnectProxy({"ccr-gh.test:443": ("127.0.0.1", self.srv.port),
+                                   "ccr-assets.test:443": ("127.0.0.1", self.srv.port)})
+        self.addCleanup(self.proxy.close)
+        self.rec = _ConnRecorder()
+        patcher = mock.patch("socket.create_connection", self.rec)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.logs = []
+        h = logging.Handler()
+        h.emit = lambda r: self.logs.append(r.getMessage())
+        lg = logging.getLogger("ccr.updater")
+        lg.addHandler(h)
+        lg.setLevel(logging.DEBUG)
+        self.addCleanup(lg.removeHandler, h)
+
+    def src(self, key="a"):
+        k = KEYS[key]
+        return U.Source("Owner/CC-Remote-Chat", k["sha1"], k["sha256"], base="https://ccr-gh.test",
+                        allowed_hosts={"ccr-gh.test", "ccr-assets.test"}, cafile=SERVER_CERT[0])
+
+    def upd(self, probe, app_root=None, **kw):
+        u = U.Updater(self.tmp / "data", app_root or (self.tmp / "app"), self.src(), kw.pop("current", "2.12"),
+                      "2.12 t h", first_delay=3600, proxy_probe=probe, **kw)
+        self.addCleanup(u.stop)
+        return u
+
+    def via(self, hp=None):
+        return lambda: {"mode": "proxy", "proxy": hp or self.proxy.hostport}
+
+    def only_proxy(self, hp=None):
+        hp = hp or self.proxy.hostport
+        self.assertTrue(self.rec.addrs, "没有发起任何连接")
+        self.assertEqual(set(self.rec.addrs), {hp}, "有代理时只能连代理：%r" % self.rec.addrs)
+
+    def test_system_proxy_detection(self):
+        fake = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"_scproxy": fake}), mock.patch.object(U, "_scutil_flags", return_value={}):
+            fake._get_proxies.return_value = {"https": "http://127.0.0.1:7890", "http": "http://127.0.0.1:7891"}
+            self.assertEqual(U.system_proxy(), {"mode": "proxy", "proxy": "127.0.0.1:7890"})
+            fake._get_proxies.return_value = {"http": "proxy.example:8080"}
+            self.assertEqual(U.system_proxy(), {"mode": "proxy", "proxy": "proxy.example:8080"})
+            fake._get_proxies.return_value = {}
+            self.assertEqual(U.system_proxy(), {"mode": "direct"})
+        with mock.patch.dict(sys.modules, {"_scproxy": fake}), \
+                mock.patch.object(U, "_scutil_flags", return_value={"pac": True, "socks": True}):
+            fake._get_proxies.return_value = {}
+            self.assertEqual(U.system_proxy(), {"mode": "unsupported", "why": "PAC 自动代理、SOCKS 代理"})
+        import _scproxy  # noqa: F401  当前解释器（与 dmg 里的 python-build-standalone 一样）有这个内置模块
+        self.assertIn(U.system_proxy()["mode"], ("proxy", "direct", "unsupported"))
+
+    def test_check_goes_only_through_proxy(self):
+        self.srv.routes[self.MPATH] = (200, {}, json.dumps(manifest("2.13", "b", b"x")).encode())
+        u = self.upd(self.via())
+        self.assertEqual(u.check(), "available")
+        self.only_proxy()
+        self.assertEqual(self.proxy.tunnels, ["ccr-gh.test:443"])
+        st = u.status()
+        self.assertEqual(st["network"], {"mode": "proxy", "proxy": self.proxy.hostport})
+        self.assertEqual(st["hosts"]["check"], "ccr-gh.test")
+        self.assertTrue(any("经系统代理 " + self.proxy.hostport in m for m in self.logs), self.logs)
+
+    def test_redirects_stay_on_proxy_and_allowlist(self):
+        self.srv.routes["/x"] = (200, {}, json.dumps(manifest("2.13", "b", b"x")).encode())
+        self.srv.routes[self.MPATH] = (302, {"Location": "https://ccr-assets.test/x?X-Amz-Signature=SECRETSIG"}, b"")
+        u = self.upd(self.via())
+        self.srv.routes["/x?X-Amz-Signature=SECRETSIG"] = self.srv.routes["/x"]
+        self.assertEqual(u.check(), "available")
+        self.assertEqual(self.proxy.tunnels, ["ccr-gh.test:443", "ccr-assets.test:443"])
+        self.only_proxy()
+        self.srv.routes[self.MPATH] = (302, {"Location": "https://evil.test/x"}, b"")
+        self.assertEqual(u.check(), "error")
+        self.assertIn("不在允许范围", u.status()["last_check"]["error"])
+        self.assertNotIn("evil.test:443", self.proxy.tunnels)   # 白名单在连接之前拦下
+        self.assertFalse(any("SECRETSIG" in m for m in self.logs))
+
+    def test_proxy_unreachable_reports_and_never_goes_direct(self):
+        dead = "127.0.0.1:%d" % _free_port()
+        u = self.upd(self.via(dead))
+        self.assertEqual(u.check(), "error")
+        err = u.status()["last_check"]["error"]
+        self.assertEqual(err, "无法连接 ccr-gh.test：连不上代理（连接被拒绝）（经系统代理 %s）" % dead)
+        self.only_proxy(dead)
+        self.assertEqual(self.srv.hits, [])
+
+    def test_proxy_auth_and_bad_gateway_and_timeout(self):
+        self.proxy.routes["ccr-gh.test:443"] = "407"
+        u = self.upd(self.via())
+        u.check()
+        self.assertIn("代理需要认证（暂不支持）（经系统代理", u.status()["last_check"]["error"])
+        self.proxy.routes["ccr-gh.test:443"] = None
+        u.check()
+        self.assertEqual(u.status()["last_check"]["error"], "无法连接 ccr-gh.test：代理连接失败（HTTP 502）（经系统代理 %s）" % self.proxy.hostport)
+        self.proxy.routes["ccr-gh.test:443"] = "hang"
+        with mock.patch.object(U, "HTTP_TIMEOUT", 1):
+            u.check()
+        self.assertEqual(u.status()["last_check"]["error"], "无法连接 ccr-gh.test：超时（经系统代理 %s）" % self.proxy.hostport)
+        self.only_proxy()
+
+    def test_pac_or_socks_only_makes_no_connection(self):
+        self.srv.routes[self.MPATH] = (200, {}, json.dumps(manifest("2.13", "b", b"x")).encode())
+        u = self.upd(lambda: {"mode": "unsupported", "why": "PAC 自动代理"})
+        self.assertEqual(u.check(), "error")
+        self.assertEqual(u.status()["last_check"]["error"], "系统代理是 PAC 自动代理，暂不支持，未连接 GitHub")
+        self.assertEqual(u.status()["network"]["mode"], "unsupported")
+        self.assertEqual(self.rec.addrs, [])
+        self.assertEqual(self.proxy.tunnels, [])
+        self.assertEqual(self.srv.hits, [])
+        self.assertTrue(any("暂不支持" in m for m in self.logs))
+        # 下载同样不连
+        u.available = U.validate_manifest(manifest("2.13", "b", b"x"), "2.12")
+        with self.assertRaises(U.UpdateError):
+            u._download(u.available)
+        self.assertEqual(self.rec.addrs, [])
+
+    def test_manual_check_clears_snooze_auto_does_not(self):
+        self.srv.routes[self.MPATH] = (200, {}, json.dumps(manifest("2.13", "b", b"x")).encode())
+        u = self.upd(self.via())
+        u.check()
+        u.snooze("2.13")
+        self.assertTrue(u.status()["available"]["snoozed"])
+        self.assertIsNotNone(u.status()["available"]["snoozed_until"])
+        u.check()                       # 自动检查：保持「24 小时后再提醒」
+        self.assertTrue(u.status()["available"]["snoozed"])
+        u.check(manual=True)            # 用户点「立即检查」：清除，提示条重新出现
+        self.assertFalse(u.status()["available"]["snoozed"])
+        u.snooze("2.13")
+        u.check_now()
+        self.assertTrue(wait_until(lambda: not u.status()["checking"] and not u.status()["available"]["snoozed"], 10))
+
+    def _install_env(self):
+        apps = self.tmp / "Apps With Space"
+        apps.mkdir()
+        cur = make_bundle(apps, "2.12-test", "2.12-test t1 aaaa", sign="a")
+        return cur
+
+    def _publish(self, srv, sign, name_tag):
+        bdir = self.tmp / ("b-" + name_tag)
+        bdir.mkdir()
+        app = make_bundle(bdir, "2.12.1-test", "2.12.1-test t2 bbbb", sign=sign)
+        data = make_dmg(app, self.tmp / (name_tag + ".dmg"))
+        return data
+
+    def test_install_through_proxy_then_tampered_content_rejected(self):
+        cur = self._install_env()
+        good = self._publish(self.srv, "a", "good")
+        m = manifest("2.12.1-test", "2.12.1-test t2 bbbb", good)
+        dpath = "/Owner/CC-Remote-Chat/releases/download/v2.12.1-test/" + m["dmg"]["name"]
+        self.srv.routes[self.MPATH] = (200, {}, json.dumps(m).encode())
+        self.srv.routes[dpath] = (302, {"Location": "https://ccr-assets.test/blob?X-Amz-Signature=SECRETSIG"}, b"")
+        launched = []
+        # (1) 恶意代理（能伪造 TLS）把 dmg 换成别的内容 → sha256 不符被拒
+        evil = Https({})
+        self.addCleanup(evil.close)
+        bad = self._publish(evil, "adhoc", "bad")
+        evil.routes["/blob?X-Amz-Signature=SECRETSIG"] = (200, {}, bad[:len(good)].ljust(len(good), b"\0"))
+        self.proxy.routes["ccr-assets.test:443"] = ("127.0.0.1", evil.port)
+        u = self.upd(self.via(), app_root=cur / "Contents/Resources/app", current="2.12-test", launcher=launched.append,
+                     busy_poll=0.05)
+        self.assertEqual(u.check(), "available")
+        u.install()
+        self.assertTrue(wait_until(lambda: u.status()["phase"] in ("failed", "manual", "relaunching"), 120))
+        self.assertEqual(u.status()["phase"], "failed")
+        self.assertIn("sha256", u.status()["error"])
+        # (2) 连清单也换掉（sha 对得上），但 app 不是发布证书签的 → 签名钉死拒绝
+        mb = manifest("2.12.1-test", "2.12.1-test t2 bbbb", bad)
+        evil.routes["/blob?X-Amz-Signature=SECRETSIG"] = (200, {}, bad)
+        self.srv.routes[self.MPATH] = (200, {}, json.dumps(mb).encode())
+        u.dismiss()
+        self.assertEqual(u.check(), "available")
+        u.install()
+        self.assertTrue(wait_until(lambda: u.status()["phase"] in ("failed", "manual", "relaunching"), 120))
+        self.assertEqual(u.status()["phase"], "failed")
+        self.assertIn("签名", u.status()["error"])
+        self.assertEqual(plistlib.loads((cur / "Contents/Info.plist").read_bytes())["CCRVersion"], "2.12-test")
+        # (3) 正常内容经代理：装上
+        self.srv.routes[self.MPATH] = (200, {}, json.dumps(m).encode())
+        self.proxy.routes["ccr-assets.test:443"] = ("127.0.0.1", self.srv.port)
+        self.srv.routes["/blob?X-Amz-Signature=SECRETSIG"] = (200, {}, good)
+        u.dismiss()
+        self.assertEqual(u.check(), "available")
+        u.install()
+        self.assertTrue(wait_until(lambda: u.status()["phase"] in ("failed", "manual", "relaunching"), 120), u.status())
+        self.assertEqual(u.status()["phase"], "relaunching", u.status())
+        self.assertEqual(plistlib.loads((cur / "Contents/Info.plist").read_bytes())["CCRVersion"], "2.12.1-test")
+        self.only_proxy()
+        self.assertIn("ccr-assets.test:443", self.proxy.tunnels)
+        self.assertFalse(any("SECRETSIG" in m_ for m_ in self.logs), "日志里不能有带签名参数的下载 URL")
+        self.assertNotIn("SECRETSIG", json.dumps(u.status(), ensure_ascii=False))
+
+    def test_download_error_names_host_not_url(self):
+        self.srv.routes[self.MPATH] = (200, {}, json.dumps(manifest("2.13", "b", b"x" * 10)).encode())
+        self.srv.routes["/Owner/CC-Remote-Chat/releases/download/v2.13/CC-Remote-Chat-2.13.dmg"] = (
+            302, {"Location": "https://ccr-assets.test/blob?X-Amz-Signature=SECRETSIG"}, b"")
+        self.proxy.routes["ccr-assets.test:443"] = "hang"
+        u = self.upd(self.via())
+        u.check()
+        with mock.patch.object(U, "HTTP_TIMEOUT", 1), self.assertRaises(U.UpdateError) as cm:
+            u._download(u.available)
+        self.assertEqual(str(cm.exception), "无法连接 ccr-assets.test：超时（经系统代理 %s）" % self.proxy.hostport)
+        self.assertNotIn("SECRETSIG", str(cm.exception))
+        self.only_proxy()
 
 
 # ============================================================================ 服务器
@@ -763,7 +1075,8 @@ class TestEndToEnd(unittest.TestCase):
         self.launch_log = self.tmp / "launch.log"
         self.cfg = self.tmp / "update-test.json"
         self.cfg.write_text(json.dumps({"base": srv.base, "cafile": SERVER_CERT[0], "allowed_hosts": ["127.0.0.1"],
-                                        "launch_log": str(self.launch_log), "first_delay": 3600}))
+                                        "launch_log": str(self.launch_log), "first_delay": 3600,
+                                        "network": {"mode": "direct"}}))
         # 1) A 起后台（像原生壳一样先写 window_request），建 fake 会话并收发
         shell_exe = cur / "Contents" / "MacOS" / "CC Remote Chat"
         self.shell = subprocess.Popen([str(shell_exe), "600"])   # 假的原生壳

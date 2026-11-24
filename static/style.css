@@ -1506,3 +1506,14 @@ details.ctx-sec { display: block; }
 .upd-notes pre { margin: 0 0 4px; max-height: 180px; overflow: auto; white-space: pre-wrap; font: inherit; color: var(--text-2); }
 .upd-notes a { color: var(--accent); }
 @media (prefers-reduced-motion: reduce) { .upd-bar > span { transition: none; } }
+/* 设置弹窗「更新」一节里的状态框（与提示条同一个渲染函数 UpdateBox） */
+.upd-set-box { margin: 8px 0 4px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text); font-size: 13px; }
+.upd-set-box.is-ok { background: var(--ok-soft); }
+.upd-set-box.is-warn { background: var(--warn-soft); }
+.upd-set-box.is-error { background: var(--err-soft); }
+.upd-set-box .upd-row > .ic { color: var(--accent); }
+.upd-set-box.is-ok .upd-row > .ic { color: var(--ok); }
+.upd-set-box.is-warn .upd-row > .ic { color: var(--warn); }
+.upd-set-box.is-error .upd-row > .ic { color: var(--err); }
+.upd-set-box .upd-notes { margin-left: 22px; }
+.upd-set-box .upd-text { flex: 1 1 220px; }

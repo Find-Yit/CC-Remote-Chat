@@ -7,6 +7,12 @@
   https://github.com/<repo>/releases/latest/download/update.json（不用 API，没有 60 次/小时的限制）。
   显式 SSL 上下文（优先 /etc/ssl/cert.pem、校验主机名、TLS ≥ 1.2）；每一跳（含重定向）都必须是 https 且主机在白名单；
   大小上限、超时；只发标准请求头（UA = CC-Remote-Chat/<版本>），不带任何用户信息；仓库没有 Release（404）安静处理。
+- 网络（system_proxy / Http）：跟随 macOS 系统代理（_scproxy，python-build-standalone 里是内置模块；不看环境变量）。
+  设置了 HTTP / HTTPS 代理 → 每个请求（含重定向后的每一跳）都经该代理的 CONNECT 隧道，绝不直连、也不因代理失败
+  改走直连（系统的「忽略这些主机」例外也不适用）；只有 PAC 自动代理 / 自动发现 / SOCKS → 不支持，**不发任何请求**，
+  在状态里写明；完全没设代理 → 直接访问（与浏览器一致）。经代理时 TLS 仍校验 github.com 的证书，白名单、大小上限、
+  sha256 与签名钉死都不变。错误给出「无法连接 <主机>：<原因>（经系统代理 <主机:端口> / 未设置系统代理）」；
+  日志里只写主机名，不写带临时签名的下载 URL。
 - 清单 update.json：{version, build, dmg: {name, sha256, size}, notes, min_macos}；dmg 地址由 repo + tag(v<version>) + name
   拼出，不信任清单里的任何 URL；版本必须严格大于当前版本。
 - 一键更新（用户点击后才开始；有会话在忙时先等它们空闲）：下载到 <数据目录>/updates/<版本>/（0700）→ 校验 size + sha256 →
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -35,6 +42,7 @@ import plistlib
 import re
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import tempfile
@@ -198,6 +206,119 @@ def validate_manifest(obj, current: str, macos: Optional[str] = None) -> dict:
 
 
 # ============================================================================ HTTP（只 https、白名单主机）
+# ============================================================================ 系统代理
+def _scutil_flags() -> dict:
+    """`scutil --proxy`（只读）里 PAC / 自动发现 / SOCKS 是否开启。读不到 → {}。"""
+    try:
+        r = subprocess.run(["/usr/sbin/scutil", "--proxy"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    flags = {}
+    for line in (r.stdout or "").splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            flags[k.strip()] = v.strip()
+    return {"pac": flags.get("ProxyAutoConfigEnable") == "1", "wpad": flags.get("ProxyAutoDiscoveryEnable") == "1",
+            "socks": flags.get("SOCKSEnable") == "1"}
+
+
+def system_proxy() -> dict:
+    """macOS 系统代理（与浏览器同一份设置）：
+    {"mode": "proxy", "proxy": "主机:端口"}：设置了 HTTPS（优先）或 HTTP 代理；
+    {"mode": "unsupported", "why": "PAC 自动代理" …}：只有 PAC / 自动发现 / SOCKS —— 不支持，也不直连；
+    {"mode": "direct"}：没有设置系统代理。"""
+    proxies = {}
+    try:
+        import _scproxy   # python-build-standalone 与 python.org 的 macOS 版都内置
+        proxies = _scproxy._get_proxies() or {}
+    except Exception:  # noqa
+        proxies = {}
+    for key in ("https", "http"):
+        hp = _proxy_hostport(proxies.get(key))
+        if hp:
+            return {"mode": "proxy", "proxy": hp}
+    f = _scutil_flags()
+    why = [n for k, n in (("pac", "PAC 自动代理"), ("wpad", "自动发现代理（WPAD）"), ("socks", "SOCKS 代理")) if f.get(k)]
+    if why:
+        return {"mode": "unsupported", "why": "、".join(why)}
+    return {"mode": "direct"}
+
+
+def _proxy_hostport(v) -> Optional[str]:
+    if not isinstance(v, str) or not v.strip():
+        return None
+    v = v.strip()
+    if "://" not in v:
+        v = "http://" + v
+    u = urllib.parse.urlsplit(v)
+    try:
+        port = u.port or 80
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https") or not u.hostname or not re.match(r"^[A-Za-z0-9.:\[\]-]{1,255}\Z", u.hostname):
+        return None
+    host = "[%s]" % u.hostname if ":" in u.hostname else u.hostname
+    return "%s:%d" % (host, port)
+
+
+def net_text(net: dict) -> str:
+    """状态与错误里的「经哪个代理」"""
+    if not net:
+        return ""
+    if net.get("mode") == "proxy":
+        return "经系统代理 %s" % net.get("proxy")
+    if net.get("mode") == "unsupported":
+        return "系统代理是 %s" % net.get("why")
+    return "未设置系统代理"
+
+
+class _ViaProxy(urllib.request.BaseHandler):
+    """每个 https 请求（包括重定向后的新请求）都改成经代理的 CONNECT 隧道；不做 proxy_bypass（绝不直连）。"""
+    handler_order = 100   # 在 HTTPSHandler 之前
+
+    def __init__(self, hostport: str):
+        self.hostport = hostport
+
+    def https_open(self, req):
+        req.set_proxy(self.hostport, "http")   # https 请求：_tunnel_host = 目标主机，连接改连代理
+        return None
+
+
+class ProxyUnsupported(UpdateError):
+    pass
+
+
+def describe_net_error(e, host: str, net: dict) -> str:
+    """网络异常 → 一句给用户看的话（不含 URL，不甩整段异常）。"""
+    r = getattr(e, "reason", None)
+    r = r if isinstance(r, BaseException) else e
+    msg = str(r)
+    via = net_text(net)
+    proxied = net.get("mode") == "proxy"
+    if isinstance(r, (TimeoutError, socket.timeout)) or "timed out" in msg:
+        why = "超时"
+    elif "Tunnel connection failed" in msg:
+        code = re.search(r"failed: (\d{3})", msg)
+        c = code.group(1) if code else "?"
+        why = "代理需要认证（暂不支持）" if c == "407" else "代理连接失败（HTTP %s）" % c
+    elif isinstance(r, ConnectionRefusedError):
+        why = "连不上代理（连接被拒绝）" if proxied else "连接被拒绝"
+    elif isinstance(r, socket.gaierror):
+        why = "无法解析代理地址" if proxied else "无法解析域名"
+    elif isinstance(r, ssl.SSLCertVerificationError):
+        why = "证书校验失败（连接可能被拦截）"
+    elif isinstance(r, ssl.SSLError):
+        why = "TLS 握手失败"
+    elif isinstance(r, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        why = "连接被重置"
+    elif isinstance(r, OSError) and getattr(r, "errno", None) in (50, 51, 65):
+        why = "网络不可达"
+    else:
+        why = "网络错误（%s）" % type(r).__name__
+    return "无法连接 %s：%s（%s）" % (host or "?", why, via) if via else "无法连接 %s：%s" % (host or "?", why)
+
+
 class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
     def __init__(self, check):
         super().__init__()
@@ -209,25 +330,52 @@ class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Http:
-    def __init__(self, source: Source, user_agent: str):
+    """每次 refresh() 按当前系统代理建 opener：有代理 → 只经代理（_ViaProxy）；不支持的代理 → 拒绝发请求；
+    没有代理 → 直接访问。ProxyHandler({}) 关掉 urllib 读环境变量 / 系统代理的默认行为，由这里明确决定。"""
+
+    def __init__(self, source: Source, user_agent: str, proxy_probe: Callable[[], dict] = None):
         self.source = source
         self.ua = user_agent
+        self.proxy_probe = proxy_probe or system_proxy
         cafile = source.cafile or (CA_FILE if os.path.isfile(CA_FILE) else None)
         ctx = ssl.create_default_context(cafile=cafile)
         ctx.check_hostname = True
         ctx.verify_mode = ssl.CERT_REQUIRED
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
-                                                  urllib.request.HTTPSHandler(context=ctx),
-                                                  _CheckedRedirect(self.check_url))
+        self.ctx = ctx
+        self.net: dict = {}
+        self.opener = None
+        self.last_host = ""
+
+    def refresh(self) -> dict:
+        try:
+            net = dict(self.proxy_probe() or {})
+        except Exception:  # noqa
+            net = {"mode": "unsupported", "why": "读取失败"}
+        if net.get("mode") not in ("proxy", "direct", "unsupported") or \
+                (net.get("mode") == "proxy" and not _proxy_hostport(net.get("proxy"))):
+            net = {"mode": "unsupported", "why": "格式不对"}
+        handlers = [urllib.request.ProxyHandler({})]
+        if net["mode"] == "proxy":
+            net["proxy"] = _proxy_hostport(net["proxy"])
+            handlers.append(_ViaProxy(net["proxy"]))
+        handlers += [urllib.request.HTTPSHandler(context=self.ctx), _CheckedRedirect(self.check_url)]
+        self.opener = urllib.request.build_opener(*handlers)
         self.opener.addheaders = []
+        self.net = net
+        return net
 
     def check_url(self, url: str) -> None:
         u = urllib.parse.urlsplit(url)
         if u.scheme != "https" or (u.hostname or "") not in self.source.allowed_hosts or u.username or u.password:
             raise UpdateError("更新地址不在允许范围内（%s）" % (u.hostname or u.scheme or "?"))
+        self.last_host = u.hostname or ""
 
     def open(self, url: str):
+        if self.opener is None:
+            self.refresh()
+        if self.net.get("mode") == "unsupported":
+            raise ProxyUnsupported("%s，暂不支持，未连接 GitHub" % net_text(self.net))
         self.check_url(url)
         req = urllib.request.Request(url, headers={"User-Agent": self.ua, "Accept": "*/*"})
         return self.opener.open(req, timeout=HTTP_TIMEOUT)
@@ -411,7 +559,8 @@ class Updater:
                  busy_fn: Optional[Callable[[], List[str]]] = None, launcher: Optional[Callable] = None,
                  first_delay: float = FIRST_CHECK_DELAY, interval: float = CHECK_INTERVAL,
                  shell_exit_timeout: float = SHELL_EXIT_TIMEOUT, busy_poll: float = BUSY_POLL,
-                 now: Callable[[], float] = time.time, macos: Optional[str] = None):
+                 now: Callable[[], float] = time.time, macos: Optional[str] = None,
+                 proxy_probe: Optional[Callable[[], dict]] = None):
         self.data_dir = pathlib.Path(data_dir)
         self.dir = self.data_dir / STATE_DIR
         self.app_root = pathlib.Path(app_root)
@@ -425,7 +574,7 @@ class Updater:
         self.shell_exit_timeout, self.busy_poll = shell_exit_timeout, busy_poll
         self.now = now
         self.macos = macos
-        self.http = Http(source, "CC-Remote-Chat/%s" % current)
+        self.http = Http(source, "CC-Remote-Chat/%s" % current, proxy_probe=proxy_probe)
         self.on_change: Optional[Callable[[], None]] = None
         self.lock = threading.RLock()
         self.stop_ev = threading.Event()
@@ -500,18 +649,23 @@ class Updater:
             av = None
             if self.available:
                 sn = self.state.get("snooze") or {}
+                snoozed = sn.get("version") == self.available["version"] and float(sn.get("until") or 0) > self.now()
                 av = {"version": self.available["version"], "notes": self.available["notes"],
                       "page": self.source.page_url(self.available["version"]),
-                      "size": self.available["dmg"]["size"],
-                      "snoozed": sn.get("version") == self.available["version"]
-                      and float(sn.get("until") or 0) > self.now()}
+                      "size": self.available["dmg"]["size"], "snoozed": snoozed,
+                      "snoozed_until": float(sn.get("until")) if snoozed else None}
             lc = self.state.get("last_check")
             return {"enabled": True, "current": self.current, "auto_check": self.auto_check,
                     "checking": self.checking, "last_check": lc if isinstance(lc, dict) else None,
                     "available": av, "phase": self.phase, "progress": self.progress, "error": self.error,
                     "busy": list(self.busy), "manual": self.manual_dmg is not None,
                     "page": self.source.page_url(self.available["version"] if self.available else None),
-                    "just_updated": self.just_updated}
+                    "just_updated": self.just_updated,
+                    # 网络：经哪个系统代理 / 未设置 / 不支持（只有检查或下载过才有）；会访问的主机
+                    "network": dict(self.http.net) if self.http.net else None,
+                    "hosts": {"check": urllib.parse.urlsplit(self.source.base).hostname or "",
+                              "download": [urllib.parse.urlsplit(self.source.base).hostname or "",
+                                           "release-assets.githubusercontent.com"]}}
 
     def _changed(self) -> None:
         cb = self.on_change
@@ -583,7 +737,7 @@ class Updater:
 
     def _check_thread(self):
         try:
-            self.check()
+            self.check(manual=True)
         finally:
             with self.lock:
                 self.checking = False
@@ -641,10 +795,19 @@ class Updater:
                 self.checking = False
             self._changed()
 
-    def check(self) -> str:
-        """检查一次：返回 "available" / "uptodate" / "none"（仓库还没有 Release）/ "error"。不抛异常。"""
+    def check(self, manual: bool = False) -> str:
+        """检查一次：返回 "available" / "uptodate" / "none"（仓库还没有 Release）/ "error"。不抛异常。
+        manual=True（用户点「立即检查」）：清除「稍后」，有新版本时提示条重新出现；自动检查不清除。"""
         result, err = "error", None
+        if manual:
+            with self.lock:
+                if self.state.pop("snooze", None) is not None:
+                    try:
+                        self._save_state()
+                    except OSError:
+                        pass
         try:
+            self.http.refresh()
             data = self.http.get_small(self.source.manifest_url(), MANIFEST_MAX)
             try:
                 obj = json.loads(data.decode("utf-8"))
@@ -667,12 +830,12 @@ class Updater:
                 err = "服务器返回 HTTP %d" % e.code
         except UpdateError as e:
             err = str(e)
-        except (urllib.error.URLError, OSError, ssl.SSLError) as e:
+        except (urllib.error.URLError, OSError, ssl.SSLError, http.client.HTTPException) as e:
             reason = getattr(e, "reason", None) or e
             if isinstance(reason, UpdateError):
                 err = str(reason)
             else:
-                err = "网络错误：%s" % (reason if isinstance(reason, str) else type(reason).__name__)
+                err = describe_net_error(e, self.http.last_host, self.http.net)
         except Exception as e:  # noqa
             log.exception("检查更新出错")
             err = "检查更新出错：%s" % type(e).__name__
@@ -682,7 +845,8 @@ class Updater:
                 self._save_state()
             except OSError:
                 pass
-        log.info("检查更新：%s%s", result, "（%s）" % err if err else "")
+        log.info("检查更新（%s，%s）：%s%s", "手动" if manual else "自动", net_text(self.http.net) or "?", result,
+                 "（%s）" % err if err else "")
         self._changed()
         return result
 
@@ -793,6 +957,7 @@ class Updater:
             self._set(progress={"done": size, "total": size})
             return str(dst)
         part = d / (m["dmg"]["name"] + ".part")
+        self.http.refresh()   # 下载时重新读一次系统代理（同样：有代理只经代理，不支持就不连）
         h = hashlib.sha256()
         done = 0
         last = 0.0
@@ -825,9 +990,12 @@ class Updater:
             os.replace(part, dst)
         except urllib.error.HTTPError as e:
             raise UpdateError("下载失败：HTTP %d" % e.code) from None
-        except (urllib.error.URLError, ssl.SSLError) as e:
+        except (urllib.error.URLError, ssl.SSLError, ConnectionError, TimeoutError, socket.timeout,
+                http.client.HTTPException) as e:
             reason = getattr(e, "reason", None)
-            raise UpdateError(str(reason) if isinstance(reason, UpdateError) else "下载失败：网络错误") from None
+            if isinstance(reason, UpdateError):
+                raise UpdateError(str(reason)) from None
+            raise UpdateError(describe_net_error(e, self.http.last_host, self.http.net)) from None
         finally:
             if part.exists():
                 try:
@@ -910,6 +1078,9 @@ def create(data_dir, app_root, build: Optional[str], fake: bool = False, test_cf
         for k in ("first_delay", "interval", "shell_exit_timeout", "busy_poll"):
             if k in t:
                 kw[k] = float(t[k])
+        if isinstance(t.get("network"), dict):   # 测试：假装的系统代理设置
+            net = dict(t["network"])
+            kw["proxy_probe"] = lambda _n=net: dict(_n)
     elif test_cfg:
         log.warning("--update-test 只在 --fake 下生效，已忽略")
     return Updater(data_dir, app_root, src, current, build, busy_fn=busy_fn, **kw)

@@ -18,7 +18,7 @@ import { PromptNav, promptsFromItems, mergePending, historyDir, recallInto } fro
 import { sessionStatus, rowClass, isUnread, docTitle, titleCount, unreadCount, APP_TITLE } from '/static/sessrow.js';
 import { PromptMinimap, topPercent, MM_TARGET_OFFSET } from '/static/minimap.js';
 import { ChangesButton, trackerOf, NOTE_TEXT, EAGER_LINES } from '/static/changes.js';
-import { bannerModel, checkText, pctOf, UpdateStore, UpdateBanner, updateAction, updateSettingsField } from '/static/update.js';
+import { bannerModel, settingsModel, snoozeText, netText, hostsText, checkText, pctOf, UpdateStore, UpdateBanner, updateAction, updateSettingsField } from '/static/update.js';
 
 const $ = (id) => document.getElementById(id);
 const SID = 'sfixture00001';
@@ -1907,7 +1907,8 @@ async function updateChecks() {
   const pre = el.querySelector('.upd-notes pre');
   const ghLink = el.querySelector('.upd-notes a');
   check(!!pre && pre.textContent.includes('修复：若干问题') && ghLink && ghLink.target === '_blank' && ghLink.href === av.page && calls.length === nCalls, '更新说明：展开纯文本 + 「在 GitHub 上查看」新窗口链接，不发请求');
-  await click(el.querySelector('[data-act="later"]'), '稍后');
+  check(el.querySelector('[data-act="later"]')?.textContent === '24 小时后再提醒', '「稍后」按钮文案：24 小时后再提醒');
+  await click(el.querySelector('[data-act="later"]'), '24 小时后再提醒');
   check(calls.at(-1)?.op === 'update /api/update/snooze' && calls.at(-1).body.version === '2.13', '「稍后」→ POST /api/update/snooze {version}');
   await click(el.querySelector('[data-act="install"]'), '立即更新');
   check(calls.at(-1)?.op === 'update /api/update/install', '「立即更新」→ POST /api/update/install');
@@ -1952,6 +1953,60 @@ async function updateChecks() {
   check(calls.at(-1)?.op === 'update /api/update/settings' && calls.at(-1).body.auto_check === false, '关掉开关 → POST /api/update/settings {auto_check:false}');
   await click(fld.el.querySelector('[data-act="check"]'), '立即检查');
   check(calls.at(-1)?.op === 'update /api/update/check', '「立即检查」→ POST /api/update/check');
+  // 设置：有新版本时始终可以装（提示条点过「24 小时后再提醒」也一样）
+  const snAv = { ...av, snoozed: true, snoozed_until: now + 3600 };
+  const sm = settingsModel(st({ available: snAv }));
+  check(bannerModel(st({ available: snAv })) === null && sm && sm.text === '发现新版本 2.13' && sm.actions.map((a) => a.id).join() === 'install,page' && sm.notes.includes('自动更新'),
+    '设置：提示条被暂时隐藏时仍显示「发现新版本」+ 立即更新 + 打开下载页 + 更新说明');
+  check(snoozeText(st({ available: snAv })).startsWith('已暂时隐藏窗口上方的提醒') && snoozeText(st({ available: av })) === '', '设置：「已暂时隐藏提醒」只在点过之后显示');
+  check(netText(st({ network: { mode: 'proxy', proxy: '127.0.0.1:7890' } })).includes('经系统代理 127.0.0.1:7890')
+    && netText(st({ network: { mode: 'direct' } })).includes('未设置系统代理')
+    && netText(st({ network: { mode: 'unsupported', why: 'PAC 自动代理' } })).includes('PAC 自动代理，暂不支持，未检查更新')
+    && hostsText(st({})).includes('github.com') && hostsText(st({})).includes('release-assets.githubusercontent.com'), '设置：经哪个系统代理 / 未设置 / 不支持；会访问的域名');
+  for (const ph of ['downloading', 'failed', 'manual', 'waiting', 'verifying']) {
+    const a = bannerModel(st({ available: av, phase: ph, error: 'x', progress: { done: 1, total: 2 } }));
+    const b = settingsModel(st({ available: av, phase: ph, error: 'x', progress: { done: 1, total: 2 } }));
+    if (!(a && b && a.text === b.text && a.actions.map((x) => x.id).join() === b.actions.map((x) => x.id).join())) { check(false, '设置与提示条状态一致：' + ph); }
+  }
+  check(true, '设置与提示条在下载 / 失败 / 手动 / 等待 / 校验时状态一致');
+  store.set(st({ available: snAv, network: { mode: 'proxy', proxy: '127.0.0.1:7890' }, last_check: { at: now, result: 'available' } }));
+  await raf();
+  const sbox = fld.el.querySelector('.upd-set-box');
+  check(el.hidden && !!sbox && !sbox.hidden && sbox.textContent.includes('发现新版本 2.13') && !!sbox.querySelector('[data-act="install"]')
+    && sbox.querySelector('a[data-act="page"]')?.target === '_blank', '设置 DOM：提示条隐藏时，设置里仍有「立即更新」与「打开下载页」');
+  check(!fld.el.querySelector('.upd-snooze-line').hidden && fld.el.querySelector('.upd-net-line').textContent.includes('经系统代理 127.0.0.1:7890')
+    && fld.el.querySelector('.upd-hosts-line').textContent.includes('release-assets.githubusercontent.com'), '设置 DOM：已暂时隐藏提醒 / 网络 / 域名三行');
+  await click(sbox.querySelector('.upd-link'), '设置里的更新说明');
+  check(!!sbox.querySelector('.upd-notes pre') && sbox.querySelector('.upd-notes pre').textContent.includes('修复'), '设置里「更新说明」可展开');
+  await click(sbox.querySelector('[data-act="install"]'), '设置里的立即更新');
+  check(calls.at(-1)?.op === 'update /api/update/install', '设置里「立即更新」→ POST /api/update/install');
+  store.set(st({ available: av, phase: 'downloading', progress: { done: 30e6, total: 40e6 } }));
+  await raf();
+  check(sbox.classList.contains('is-progress') && sbox.querySelector('.upd-bar > span')?.style.width === '75%' && !el.hidden && el.querySelector('.upd-bar > span')?.style.width === '75%',
+    '下载中：设置与提示条同时显示 75%');
+  await click(sbox.querySelector('[data-act="cancel"]'), '设置里的取消');
+  check(calls.at(-1)?.op === 'update /api/update/cancel', '设置里「取消」→ POST /api/update/cancel');
+  store.set(st({ available: av, phase: 'failed', error: '无法连接 github.com：超时（经系统代理 127.0.0.1:7890）' }));
+  await raf();
+  check(sbox.classList.contains('is-error') && sbox.textContent.includes('超时（经系统代理 127.0.0.1:7890）') && !!sbox.querySelector('[data-act="retry"]'), '失败：设置里显示原因 + 重试');
+  await click(sbox.querySelector('[data-act="retry"]'), '设置里的重试');
+  check(calls.at(-1)?.op === 'update /api/update/install', '设置里「重试」→ POST /api/update/install');
+  store.set(st({ network: { mode: 'unsupported', why: 'PAC 自动代理' }, last_check: { at: now, result: 'error', error: '系统代理是 PAC 自动代理，暂不支持，未连接 GitHub' } }));
+  await raf();
+  check(sbox.hidden && fld.el.querySelector('.upd-check-line').textContent.includes('暂不支持') && fld.el.querySelector('.upd-net-line').textContent.includes('不会绕过代理直连'), 'PAC：设置里写明未检查、不直连');
+  // 设置状态框对比度（浅色 / 深色）
+  const th2 = window.ccrTheme, prev2 = th2.pref(), res2 = [];
+  const bodyBg2 = () => rgbaOf(getComputedStyle(document.body).backgroundColor);
+  for (const t of ['light', 'dark']) {
+    th2.set(t, { persist: false });
+    for (const s2 of [st({ available: av }), st({ available: av, phase: 'downloading', progress: { done: 1, total: 2 } }), st({ available: av, phase: 'failed', error: 'x' }), st({ available: av, phase: 'manual', error: 'x' })]) {
+      store.set(s2); await raf();
+      const bg = over(rgbaOf(getComputedStyle(sbox).backgroundColor), bodyBg2().a ? bodyBg2() : { r: 255, g: 255, b: 255, a: 1 });
+      res2.push(contrast(rgbaOf(getComputedStyle(sbox.querySelector('.upd-text')).color), bg));
+    }
+  }
+  th2.set(prev2, { persist: false }); await raf();
+  check(res2.every((c) => c >= 4.5), '设置状态框：浅色 / 深色文字对比度 ≥ 4.5（最低 ' + Math.min(...res2).toFixed(1) + '）');
   fld.dispose(); fld.el.remove();
   store.set(st({}));
   check(el.hidden, '状态回到无新版本：提示条隐藏');

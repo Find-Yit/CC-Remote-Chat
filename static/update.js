@@ -2,9 +2,11 @@
 // 只有后端开启了自动更新（内置模式 + .app 里有更新源）时 bootstrap 才带 `update`，否则本模块什么都不挂（私有版不变）。
 // - 主区域上方一条提示：新版本可用（立即更新 / 稍后 / 更新说明）、等会话空闲、下载 % / 校验 / 安装 / 即将重新打开窗口、
 //   失败（原因 + 重试 + 打开下载页）、无法自动替换（打开已下载的安装包 + 打开下载页）、更新完成后「已更新到 X」一次。
-// - 设置弹窗里的「自动检查更新」开关 + 「立即检查」+ 上次检查结果。
+// - 设置弹窗的「更新」一节：自动检查开关、立即检查（会清除「稍后」）、上次检查结果；有新版本时**始终**显示
+//   「发现新版本 X」+ 立即更新 + 更新说明 + 打开下载页（提示条点过「24 小时后再提醒」也能在这里装），下载 / 校验 / 安装 /
+//   等待空闲 / 失败 / 需要手动安装同步显示（与提示条同一个 store、同一个渲染函数）；写明会访问的域名与经哪个系统代理。
 // 所有请求都只在用户点击时发出；「打开下载页」/「在 GitHub 上查看」是 target=_blank 的普通链接（原生壳交给默认浏览器）。
-// 纯函数（bannerModel / checkText / pctOf）供回放自测页直接验证。
+// 纯函数（bannerModel / settingsModel / checkText / netText / snoozeText / pctOf）供回放自测页直接验证。
 import { h, icon, spinner, fmtSize, fmtRelTime } from './dom.js';
 
 const BUSY_PHASES = new Set(['waiting', 'downloading', 'verifying', 'installing', 'relaunching']);
@@ -27,6 +29,15 @@ function busyText(list) {
  * actions 的 id：install / later / cancel / ack / retry / dismiss / open_dmg / page（page 是链接）。
  */
 export function bannerModel(st) {
+  return updateModel(st, false);
+}
+
+/** 设置里「更新」一节的状态框：与提示条相同，但有新版本时不管点没点过「稍后」都显示（没有「稍后」按钮，多「打开下载页」） */
+export function settingsModel(st) {
+  return updateModel(st, true);
+}
+
+function updateModel(st, inSettings) {
   if (!st || st.enabled !== true) return null;
   const av = st.available || null;
   const ver = av ? av.version : '';
@@ -61,11 +72,41 @@ export function bannerModel(st) {
     default:
       break;
   }
+  if (av && inSettings) {
+    return { kind: 'info', text: `发现新版本 ${ver}`, page: av.page || page, notes: av.notes || '',
+      actions: [{ id: 'install', label: '立即更新', primary: true }, { id: 'page', label: '打开下载页' }] };
+  }
   if (av && !av.snoozed) {
     return { kind: 'info', text: `新版本 ${ver} 可用`, page: av.page || page, notes: av.notes || '',
-      actions: [{ id: 'install', label: '立即更新', primary: true }, { id: 'later', label: '稍后' }] };
+      actions: [{ id: 'install', label: '立即更新', primary: true }, { id: 'later', label: '24 小时后再提醒' }] };
   }
   return null;
+}
+
+/** 设置里：窗口上方的提醒是否被「24 小时后再提醒」暂时隐藏（纯函数） */
+export function snoozeText(st) {
+  const av = st && st.available;
+  if (!av || !av.snoozed) return '';
+  const t = av.snoozed_until ? new Date(av.snoozed_until * 1000) : null;
+  const when = t && !isNaN(t) ? t.toLocaleString('zh-CN', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+  return '已暂时隐藏窗口上方的提醒' + (when ? `（${when} 后再提醒）` : '') + '；点「立即检查」会重新显示';
+}
+
+/** 设置里：经哪个系统代理（纯函数） */
+export function netText(st) {
+  const n = st && st.network;
+  if (!n) return '网络：检查时按系统代理设置连接（还没有连接过）';
+  if (n.mode === 'proxy') return `网络：经系统代理 ${n.proxy}（不会绕过代理直连）`;
+  if (n.mode === 'unsupported') return `网络：系统代理是 ${n.why || 'PAC / SOCKS'}，暂不支持，未检查更新（不会绕过代理直连）`;
+  return '网络：未设置系统代理（直接访问 GitHub）';
+}
+
+/** 设置里：会访问的域名（纯函数） */
+export function hostsText(st) {
+  const hs = (st && st.hosts) || {};
+  const check = hs.check || 'github.com';
+  const dl = Array.isArray(hs.download) && hs.download.length ? hs.download : ['github.com', 'release-assets.githubusercontent.com'];
+  return `只访问 GitHub：检查更新 ${check}；下载新版本 ${dl.join(' → ')}（GitHub 的 Release 下载服务器）`;
 }
 
 /** 设置里「上次检查」一行（纯函数） */
@@ -115,18 +156,35 @@ export class UpdateBanner {
       this.el = h('div', { class: 'upd-banner', role: 'status', 'aria-live': 'polite' });
       this.mount(this.el);
     }
-    const key = JSON.stringify(m);
-    if (key === this.key && !this.el.hidden) return;
-    if (this.key && JSON.parse(this.key).text.split(' ')[0] !== m.text.split(' ')[0]) this.notesOpen = false;
-    this.key = key;
+    if (!this.box) this.box = new UpdateBox(this.el, 'upd-banner', (id) => this.act(id, this.store.st));
     this.el.hidden = false;
-    this.el.className = 'upd-banner is-' + m.kind;
+    this.box.show(m);
+  }
+}
+
+/** 渲染一个状态框（提示条与设置里的「更新」一节共用）：图标 / spinner、文字、更新说明（可展开）、进度条、按钮。
+ *  按钮只在用户点击时调用 act(id)；「打开下载页」「在 GitHub 上查看」是 target=_blank 链接。 */
+export class UpdateBox {
+  constructor(el, base, act) { this.el = el; this.base = base; this.act = act; this.notesOpen = false; this.key = ''; this.m = null; }
+
+  show(m) {
+    const key = JSON.stringify(m);
+    if (key === this.key) return;
+    if (this.m && this.m.text.split(' ')[0] !== m.text.split(' ')[0]) this.notesOpen = false;
+    this.key = key;
+    this.m = m;
+    this.draw();
+  }
+
+  draw() {
+    const m = this.m;
+    this.el.className = this.base + ' is-' + m.kind;
     this.el.dataset.kind = m.kind;
     const lead = m.kind === 'progress' ? spinner() : icon({ ok: 'check', info: 'download', warn: 'shield', error: 'x' }[m.kind] || 'download', 'upd-ic');
     const parts = [lead, h('span', { class: 'upd-text' }, m.text)];
     if (m.notes) {
       parts.push(h('button', { class: 'upd-link', type: 'button', 'aria-expanded': String(this.notesOpen),
-        onclick: () => { this.notesOpen = !this.notesOpen; this.key = ''; this.render(); } }, '更新说明'));
+        onclick: () => { this.notesOpen = !this.notesOpen; this.draw(); } }, '更新说明'));
     } else if (m.kind === 'ok' && m.page) {
       parts.push(h('a', { class: 'upd-link', href: m.page, target: '_blank', rel: 'noopener noreferrer' }, '更新说明'));
     }
@@ -140,13 +198,12 @@ export class UpdateBanner {
       const b = h('button', { class: 'btn small' + (a.primary ? ' primary' : ' ghost'), type: 'button', 'data-act': a.id }, a.label);
       b.addEventListener('click', async () => {
         b.disabled = true;
-        try { await this.act(a.id, this.store.st); } finally { b.disabled = false; }
+        try { await this.act(a.id); } finally { b.disabled = false; }
       });
       acts.appendChild(b);
     }
     parts.push(acts);
-    const row = h('div', { class: 'upd-row' }, parts);
-    const kids = [row];
+    const kids = [h('div', { class: 'upd-row' }, parts)];
     if (m.notes && this.notesOpen) {
       kids.push(h('div', { class: 'upd-notes' }, h('pre', null, m.notes),
         m.page ? h('a', { href: m.page, target: '_blank', rel: 'noopener noreferrer' }, '在 GitHub 上查看') : null));
@@ -169,7 +226,7 @@ export async function updateAction(api, store, id) {
   return r;
 }
 
-/** 设置弹窗里的一节：自动检查开关 + 立即检查 + 状态行 */
+/** 设置弹窗里的一节：自动检查开关 + 立即检查 + 状态行 + 新版本 / 进度状态框（含「立即更新」）+ 域名与网络说明 */
 export function updateSettingsField(api, store, { onError } = {}) {
   const box = h('input', { type: 'checkbox', name: 'update_auto_check', checked: !!(store.st && store.st.auto_check) });
   const row = h('label', { class: 'check settings-check' }, box,
@@ -177,6 +234,13 @@ export function updateSettingsField(api, store, { onError } = {}) {
   const now = h('button', { class: 'btn ghost', type: 'button', 'data-act': 'check' }, '立即检查');
   const line = h('div', { class: 'field-hint upd-check-line' });
   const ver = h('span', { class: 'muted small-text' });
+  const stEl = h('div', { class: 'upd-set-box', role: 'status', 'aria-live': 'polite', hidden: true });
+  const stBox = new UpdateBox(stEl, 'upd-set-box', async (id) => {
+    try { await updateAction(api, store, id); } catch (e) { if (onError) onError(e); }
+  });
+  const snz = h('div', { class: 'field-hint upd-snooze-line', hidden: true });
+  const hosts = h('div', { class: 'field-hint upd-hosts-line' });
+  const net = h('div', { class: 'field-hint upd-net-line' });
   const sync = () => {
     const st = store.st;
     if (!st) return;
@@ -184,6 +248,14 @@ export function updateSettingsField(api, store, { onError } = {}) {
     line.textContent = checkText(st);
     ver.textContent = '当前版本 ' + (st.current || '?');
     now.disabled = !!st.checking;
+    const m = settingsModel(st);
+    stEl.hidden = !m;
+    if (m) stBox.show(m);
+    const sn = snoozeText(st);
+    snz.hidden = !sn;
+    snz.textContent = sn;
+    hosts.textContent = hostsText(st);
+    net.textContent = netText(st);
   };
   box.addEventListener('change', async () => {
     try { const r = await api.post('/api/update/settings', { auto_check: box.checked }); if (r) store.set(r); } catch (e) { if (onError) onError(e); sync(); }
@@ -196,6 +268,6 @@ export function updateSettingsField(api, store, { onError } = {}) {
   const unsub = store.subscribe(sync);
   sync();
   const el = h('div', { class: 'field upd-settings' }, h('label', { class: 'field-label' }, '更新'), row,
-    h('div', { class: 'row' }, now, ver), line);
+    h('div', { class: 'row' }, now, ver), line, stEl, snz, hosts, net);
   return { el, dispose: unsub };
 }

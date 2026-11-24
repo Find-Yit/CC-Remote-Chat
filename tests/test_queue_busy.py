@@ -195,7 +195,9 @@ class SendWhileBusyTests(Base):
             self.assertTrue(typed, seen)   # 确实抓到了"文字在输入框里、还没回车"的帧
             self.assertTrue(all(b for b, _i, _st in seen), seen)
             self.assertTrue(all(st == "busy" for _b, _i, st in seen), seen)
-        self.assertEqual(m.get_screen(sid)["state"]["hints"]["queued"], ["Q1", "Q2", "Q3"])
+        # 第 3 条的 Enter 刚按下时，最近一次屏幕快照可能还没轮到（忙时 0.25s 抓一次屏）：等下一帧再核对
+        self.assertTrue(wait_until(lambda: m.get_screen(sid)["state"]["hints"]["queued"] == ["Q1", "Q2", "Q3"]),
+                        m.get_screen(sid)["state"]["hints"])
 
 
 if __name__ == "__main__":

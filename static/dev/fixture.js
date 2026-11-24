@@ -1,0 +1,1834 @@
+// TUI 回放自测：把 fixtures 的真实交互式 Claude Code 屏幕帧（含 stream_frames 29 帧）与 transcript
+// 回放进与正式界面同一套渲染器（render.js / tui.js）。屏幕解析用 tui_sim.js（后端解析器的简化 JS 版）。
+// 所有“请求”都由模拟 actions 记录到日志，并按 fixtures 切换到对应的后续画面；任何未经点击触发的请求都会被判为失败。
+import { h, icon } from '/static/dom.js';
+import {
+  createState, ensureSession, applyEnvelope, mountSession, flushNow, currentDialog, draftVisible, setModelList, revealItem,
+} from '/static/render.js';
+import { openModelModal, openEffortModal, TermPanel, modeText } from '/static/tui.js';
+import { loadToken, TOKEN_HEADER } from '/static/api.js';
+import { parseScreen } from '/static/dev/tui_sim.js';
+import { StatsBar, RING_C } from '/static/stats.js';
+import { ComposerControls } from '/static/composerbar.js';
+import { cycleOf, closeModeMenu } from '/static/modes.js';
+import { initViz, _setBlobLoader, statPath, limitBlob, STAT_BATCH, BLOB_CONCURRENCY } from '/static/viz.js';
+import { PreviewPanel } from '/static/preview.js';
+import { AutoSize } from '/static/autosize.js';
+import { PromptNav, promptsFromItems, mergePending, historyDir, recallInto } from '/static/prompthist.js';
+import { sessionStatus, rowClass, isUnread, docTitle, titleCount, unreadCount, APP_TITLE } from '/static/sessrow.js';
+import { PromptMinimap, topPercent, MM_TARGET_OFFSET } from '/static/minimap.js';
+import { ChangesButton, trackerOf, NOTE_TEXT, EAGER_LINES } from '/static/changes.js';
+import { bannerModel, checkText, pctOf, UpdateStore, UpdateBanner, updateAction, updateSettingsField } from '/static/update.js';
+
+const $ = (id) => document.getElementById(id);
+const SID = 'sfixture00001';
+const FILES = {
+  stream: '/fixtures/tui_screens_stream.ndjson',
+  dialogs: '/fixtures/tui_screens_dialogs.ndjson',
+  transcript: '/fixtures/transcript_interactive_59dd443a.jsonl',
+};
+
+let errors = 0;
+let checksOk = 0;
+let checksBad = 0;
+const calls = [];
+let gesture = 0; // >0 = 当前处于（模拟的）用户点击中
+let gseq = 0;
+const screens = new Map(); // 'stream:ready' -> 原文
+let streamFrames = [];
+let transcriptLines = [];
+let state, s, modelCtrl = null, term, termOpen = false;
+let curScene = '';
+const statsBar = new StatsBar();   // 与 app.js 同一个组件（数据 = meta.stats）；只挂一次到底栏的固定槽位
+$('fx-stats').appendChild(statsBar.el);
+// 底栏左侧控件组：与 app.js 同一个组件，按 id 找按钮
+const ctl = new ComposerControls($('fx-ctl'), { ids: { model: 'fx-model-btn', effort: 'fx-effort-btn', mode: 'fx-mode', cycle: 'fx-cycle' } });
+$('fx-stop').prepend(icon('stop'));
+// 左侧 prompt 小格子：与 app.js 同一个组件，在 #fx-host 里只挂一个，setup() 里跟随回放会话
+const fxMinimap = new PromptMinimap($('fx-host'), { reveal: revealItem });
+// 右侧「代码改动」栏的会话头开关：与 app.js 同一个组件；回放页的开关状态用自己的 localStorage 键，不影响正式界面
+const FX_CHG_KEY = 'ccr.fx.chg';
+try { localStorage.removeItem(FX_CHG_KEY); } catch (_) { /* 忽略 */ }
+const fxChgBtn = new ChangesButton({ onClick: () => { ensureVizPanel().toggleChanges(s); } });
+fxChgBtn.el.id = 'fx-chg-btn';
+function fxChgSync() { fxChgBtn.update(vizPanel && s ? vizPanel.changeCount(s) : 0, !!vizPanel && vizPanel.isShowingChanges()); }
+
+function log(text, cls = 'info') {
+  const el = h('div', { class: cls }, text);
+  $('fx-log').appendChild(el);
+  el.scrollIntoView({ block: 'end' });
+}
+function check(cond, text) {
+  if (cond) { checksOk++; log('✔ ' + text, 'ok'); } else { checksBad++; log('✘ ' + text, 'bad'); }
+  $('fx-progress').textContent = `通过 ${checksOk} · 失败 ${checksBad} · 控制台错误 ${errors}`;
+  return cond;
+}
+
+const origError = console.error.bind(console);
+console.error = (...a) => { errors++; log('console.error：' + a.map(String).join(' '), 'bad'); origError(...a); };
+window.addEventListener('error', (e) => { errors++; log('页面错误：' + e.message, 'bad'); });
+window.addEventListener('unhandledrejection', (e) => { errors++; log('未处理的 Promise 拒绝：' + ((e.reason && e.reason.message) || e.reason), 'bad'); });
+
+// ---------- 取 fixture ----------
+async function fetchText(url) {
+  const token = loadToken();
+  const res = await fetch(url, { headers: token ? { [TOKEN_HEADER]: token } : {}, credentials: 'omit', cache: 'no-store' });
+  if (!res.ok) throw new Error(url + '：HTTP ' + res.status + '（需要 app.py --dev 并在已登录的标签页打开，或用“本地文件”选择 fixtures）');
+  return res.text();
+}
+
+function ingest(name, text) {
+  if (/transcript/.test(name)) {
+    transcriptLines = text.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean);
+    log(`载入 ${name}：${transcriptLines.length} 行`);
+    return;
+  }
+  const prefix = /dialogs/.test(name) ? 'dialogs' : 'stream';
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let d; try { d = JSON.parse(line); } catch (_) { continue; }
+    if (typeof d.plain === 'string') screens.set(prefix + ':' + d.name, d.plain);
+    if (Array.isArray(d.frames)) streamFrames = d.frames;
+  }
+  log(`载入 ${name}：累计 ${screens.size} 个画面，流式帧 ${streamFrames.length}`);
+}
+
+async function loadFixtures() {
+  for (const [k, url] of Object.entries(FILES)) {
+    try { ingest(k, await fetchText(url)); } catch (e) { log(String(e.message || e), 'bad'); }
+  }
+  fillScenes();
+}
+
+function fillScenes() {
+  $('fx-scene').replaceChildren(...[...screens.keys()].map((k) => h('option', { value: k }, k)));
+}
+
+// ---------- 信封 ----------
+function env(kind, data) { return { gseq: ++gseq, sid: SID, ts: Date.now() / 1000, kind, data }; }
+function pushScreen(text, name) {
+  curScene = name || '';
+  applyEnvelope(state, env('screen', { type: 'screen', state: parseScreen(text), text }));
+}
+function pushTranscript(entries, reset) {
+  applyEnvelope(state, env('transcript', { type: 'transcript', entries, reset: !!reset, session_id: '59dd443a-c637-4148-bf1c-fd720f2e5b1f' }));
+}
+function pushMeta(meta) { applyEnvelope(state, env('app', { type: 'meta', meta })); }
+function show(name) {
+  const t = screens.get(name);
+  if (t == null) { log('没有画面 ' + name, 'bad'); return; }
+  pushScreen(t, name);
+}
+
+// ---------- 模拟 actions（记录 + 按 fixtures 切换后续画面） ----------
+const FULL_MODELS = {
+  rows: [
+    { index: 0, n: 1, name: 'Default (recommended)', desc: 'Opus 5.5 · Most capable for complex work', current: false },
+    { index: 1, n: 2, name: 'Opus 5.5', desc: 'Opus 5.5 · Most capable', current: false },
+    { index: 2, n: 3, name: 'Fable 5.1', desc: 'Custom Fable model (claude-fable-5-1[1m])', current: false },
+    { index: 3, n: 4, name: 'Sonnet', desc: 'Sonnet 5.5 · Efficient for routine tasks · $2/$10 per Mtok', current: false },
+    { index: 4, n: 5, name: 'Haiku', desc: 'Haiku 5.5 · Fastest for quick answers · $0.10/$0.50 per Mtok', current: true },
+    { index: 5, n: 6, name: 'Fable 5.2 (1M)', desc: 'claude-fable-5-2，1M 上下文', current: false },
+  ],
+  cursor: 4,
+  effort: { level: 'low', label: 'Low effort', is_default: false },
+};
+
+const AFTER = {
+  'stream:trust': 'stream:ready', 'stream:trust_down': 'stream:ready',
+  'dialogs:perm': 'dialogs:perm_after_esc', 'dialogs:perm_write': 'dialogs:perm_write_after_3',
+  'stream:model_down': 'stream:model_after_esc',
+  'dialogs:model': 'dialogs:model_after_esc', 'dialogs:model_right': 'dialogs:model_after_esc', 'dialogs:model_down': 'dialogs:model_after_esc',
+  'dialogs:effort': 'dialogs:effort_after_esc', 'sim:generic': 'dialogs:final',
+};
+const later = (fn, ms = 120) => setTimeout(fn, ms);
+
+function record(op, body) {
+  const ok = gesture > 0;
+  calls.push({ op, body, gesture: ok });
+  log(`${ok ? '→' : '⚠ 未经点击'} POST ${op} ${body ? JSON.stringify(body) : ''}`, ok ? 'info' : 'bad');
+  if (!ok) checksBad++;
+}
+
+function keyTransition(k) {
+  const sc = curScene;
+  if (sc.startsWith('dialogs:model')) {
+    if (k === 'Down') return 'dialogs:model_down';
+    if (k === 'Up') return 'dialogs:model';
+    if (k === 'Right') return 'dialogs:model_right';
+    if (k === 'Left') return 'dialogs:model';
+  }
+  if (sc.startsWith('stream:trust')) {
+    if (k === 'Down') return 'stream:trust_down';
+    if (k === 'Up') return 'stream:trust';
+  }
+  if (sc === 'dialogs:effort' && (k === 'Left' || k === 'Right')) return null;
+  if (k === 'Enter' || k === 'Escape' || k === 's') return AFTER[sc] || null;
+  return null;
+}
+
+const actions = {
+  choose: async (_s, index, expect) => { record('choose', { index, expect }); const n = AFTER[curScene]; if (n) later(() => show(n)); },
+  cancelDialog: async () => { record('cancel_dialog'); const n = AFTER[curScene]; if (n) later(() => show(n)); },
+  keys: async (_s, keys) => { record('keys', { keys }); for (const k of keys) { const n = keyTransition(k); if (n) later(() => show(n)); } },
+  freeText: async (_s, index, text) => { record('choose', { index, text }); later(() => show('stream:model_after_esc')); },
+  restart: async () => record('restart'),
+  openModelDialog: (ss) => openModel(ss, false),
+  applyModel: async (_s, body) => { record('model', body); await new Promise((r) => setTimeout(r, 200)); show('dialogs:model_after_esc'); return { ok: true }; },
+  applyEffort: async (_s, body) => { record('effort', body); await new Promise((r) => setTimeout(r, 200)); return { ok: true }; },
+  onApplied: () => log('（toast）已切换'),
+};
+
+// 用户点击：所有请求必须发生在 click() 调用栈及其后续微任务中
+async function click(el, label) {
+  if (!el) { check(false, '找不到要点击的元素：' + label); return; }
+  gesture++;
+  try { el.click(); await new Promise((r) => setTimeout(r, 80)); } finally { gesture--; }
+}
+
+// ---------- 头部 / 输入框 / 终端（与 app.js 同逻辑的精简版） ----------
+function openModel(ss, viaButton) {
+  if (modelCtrl && modelCtrl.isOpen()) return;
+  let pending = null;
+  if (viaButton) {
+    record('model_picker');
+    later(() => show('dialogs:model'), 60);
+    pending = new Promise((r) => setTimeout(() => r(FULL_MODELS), 400)).then((r) => { setModelList(ss, r); return r; });
+  }
+  ss.modelSuppress = false;
+  const ctrl = openModelModal({ s: ss, actions, pending, onClosed: () => { if (modelCtrl === ctrl) modelCtrl = null; const d = currentDialog(ss); ss.modelSuppress = !!(d && d.kind === 'model'); } });
+  modelCtrl = ctrl;
+}
+
+function onScreen(ss) {
+  const d = currentDialog(ss);
+  if (!d || d.kind !== 'model') ss.modelSuppress = false;
+  if (modelCtrl) {
+    if ((!d || d.kind !== 'model') && !modelCtrl.busy) { const c = modelCtrl; modelCtrl = null; c.close(true); }
+    else modelCtrl.update();
+  } else if (d && d.kind === 'model' && !ss.modelSuppress) openModel(ss, false);
+  if (termOpen) term.update(ss);
+  renderChrome();
+}
+
+function renderChrome() {
+  const st = (s.screen && s.screen.state) || {};
+  const d = currentDialog(s);
+  const busy = !!st.busy;
+  const dead = s.meta.state === 'exited';
+  const termBtn = h('button', { class: 'btn small ' + (termOpen ? 'primary' : 'ghost'), type: 'button', id: 'fx-term-btn' }, icon('terminal'), '终端');
+  termBtn.addEventListener('click', () => { termOpen = !termOpen; $('fx-term').hidden = !termOpen; if (termOpen) term.setSession(s); renderChrome(); });
+  // 头部只剩标题、状态、job 徽章与按钮（模型 / effort / 模式 / 统计都在输入框底栏）
+  $('fx-header').replaceChildren(
+    h('div', { class: 'hd-main' },
+      h('div', { class: 'hd-row' }, h('div', { class: 'hd-title' }, '回放会话'), h('span', { class: 'status-chip' }, d ? '待处理' : busy ? '运行中' : '空闲')),
+      h('div', { class: 'hd-sub' }, h('span', { class: 'chip job-badge mono' }, 'job 123456'))),
+    h('div', { class: 'hd-actions' }, fxChgBtn.el, termBtn));
+  fxChgSync();
+  // 与 app.js renderComposerControls 同样的禁用规则：模型/effort 在已退出/对话框/运行中/断线时禁用；模式运行中仍可切换
+  const why = dead ? '会话已退出' : d ? '请先处理当前对话框' : busy ? '运行中，请等本轮结束（或先中断）' : s.meta.link === 'down' ? '与计算节点的连接已断开' : '';
+  const modeBlocked = dead ? '会话已退出' : d ? '请先处理当前对话框' : s.meta.link === 'down' ? '与计算节点的连接已断开' : '';
+  ctl.update({
+    sid: s.sid, model: s.modelInfo.model || '默认模型', effort: s.modelInfo.effort || '默认', why,
+    mode: st.mode || '', cycle: cycleOf(s.meta), modeBlocked,
+    onModel: () => openModel(s, true),
+    onEffort: () => openEffortModal({ s, actions, current: s.modelInfo.effort }),
+    onPickMode: (id, needsRestart) => record(needsRestart ? 'restart' : 'mode', { mode: id }),
+    onCycle: () => record('mode/cycle'),
+  });
+  const ta = $('fx-input');
+  ta.disabled = !!d;
+  const ph = d ? '请先处理上方对话框' : busy ? '运行中：新消息会进入 claude 的输入队列' : '回放页：发送只记录到日志';
+  if (ta.placeholder !== ph) { ta.placeholder = ph; fxSizer.update(); }
+  $('fx-send').disabled = !!d;
+  $('fx-stop').hidden = !busy;
+  statsBar.update(s.meta.stats, { busy, dead });
+  const b = $('fx-banner');
+  b.hidden = !d;
+  b.textContent = d ? '请先处理上方对话框（选项按钮会把对应按键发给终端）' : '';
+}
+
+function setup() {
+  for (const el of $('fx-host').querySelectorAll('.chat-scroll')) el.remove();
+  if (modelCtrl) { modelCtrl.close(true); modelCtrl = null; }
+  closeModeMenu();
+  state = createState({ actions, onScreen: (ss) => onScreen(ss), onMeta: () => renderChrome(), onModelInfo: () => renderChrome(),
+    onFlush: (ss) => { fxMinimap.onFlush(ss); if (vizPanel) vizPanel.onSessionUpdate(ss); },
+    onSubagent: (ss) => { if (vizPanel) vizPanel.onSessionUpdate(ss); } });
+  s = ensureSession(state, SID, { title: '回放会话', jobid: '123456', cwd: '/mnt/ssd/home/demouser', state: 'idle', link: 'ready', launch: { model: null, permission_mode: null, skip_permissions: false, effort: null } });
+  mountSession(s, $('fx-host'));
+  fxMinimap.setSession(s);
+  term = new TermPanel($('fx-term'), {
+    onKeys: (keys) => actions.keys(s, keys),
+    onRefresh: async () => { log('GET screen（回放：重放当前画面）'); if (curScene && screens.has(curScene)) show(curScene); },
+    onClose: () => { termOpen = false; $('fx-term').hidden = true; renderChrome(); },
+  });
+  renderChrome();
+}
+
+// ---------- transcript ----------
+function transcriptEntries() {
+  return transcriptLines.filter((d) => (d.type === 'user' || d.type === 'assistant' || d.type === 'system') && !d.isSidechain);
+}
+
+// ---------- 流式回放 ----------
+async function playStream(speed, observe) {
+  if (!streamFrames.length) { log('没有 stream_frames', 'bad'); return; }
+  const t0 = streamFrames[0].t;
+  const start = performance.now();
+  for (let i = 0; i < streamFrames.length; i++) {
+    const f = streamFrames[i];
+    const due = ((f.t - t0) * 1000) / speed;
+    const wait = due - (performance.now() - start);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    pushScreen(f.s, 'frame' + i);
+    await new Promise((r) => requestAnimationFrame(() => r()));
+    if (observe) observe(i);
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+const q = (sel) => s.view.root.querySelector(sel);
+const qa = (sel) => [...s.view.root.querySelectorAll(sel)];
+
+async function autoTest() {
+  $('fx-log').replaceChildren();
+  calls.length = 0; checksOk = 0; checksBad = 0; errors = 0;
+  setup();
+  const speed = Number($('fx-speed').value) || 2;
+  log('== 1. transcript 渲染 / uuid 去重 / reset');
+  const ents = transcriptEntries();
+  pushTranscript(ents, true);
+  await raf(); flushNow(s);
+  const users = qa('.k-user').map((e) => e.textContent);
+  check(users.some((t) => t.includes('touch /tmp/ccr_tui_probe_denied2')) && users.some((t) => t.includes('Write 工具')), '用户消息渲染（2 条真实提示）');
+  check(!users.some((t) => t.includes('local-command-caveat')), 'isMeta 的 caveat 条目不显示');
+  check(qa('.k-cmd').some((e) => e.textContent.includes('/model') && e.textContent.includes('Kept model as Haiku 5.5')), '/model 本地命令 + 输出合并为一条');
+  check(qa('.k-cmd').some((e) => e.textContent.includes('/effort') && e.textContent.includes('Cancelled')), '/effort 本地命令 + Cancelled');
+  check(qa('.k-tool.st-denied').length === 2, '两个被拒绝的工具调用（Bash / Write）');
+  check(qa('.k-notice').length === 2, '两条中断提示');
+  const n1 = s.items.length;
+  pushTranscript(ents.slice(-5), false);
+  check(s.items.length === n1, 'uuid 去重：重复条目不再追加');
+  pushTranscript(ents.slice(0, 3), true);
+  await raf(); flushNow(s);
+  check(s.items.length < n1 && qa('.k-tool').length === 0, 'reset=true 整体重建');
+  pushTranscript(ents, true);
+  await raf(); flushNow(s);
+
+  log('== 1b. 输入框不抖动（关闭滚动锚定模拟 WebKit）');
+  await typingChecks();
+  pushTranscript(ents, true);
+  await raf(); flushNow(s);
+
+  log('== 1c. 输入框 ↑/↓ 历史（prompthist.js：之前发过的消息放回输入框）');
+  await recallChecks();
+
+  log('== 1d. 左侧 prompt 小格子（minimap.js：鱼眼、预览卡、跳转、可见轮次、上一轮/下一轮、键盘、滚轮、常驻/悬停）');
+  await minimapChecks();
+
+  log('== 2. 信任目录卡片');
+  show('stream:trust');
+  await raf();
+  check(!!q('.dlg-card.kind-trust'), '出现 trust 卡片');
+  check(qa('.dlg-card.kind-trust .dlg-opt').length === 2, 'trust 两个选项');
+  check((q('.dlg-card.kind-trust') || {}).textContent?.includes('home folder, so Yes lasts for this session only'), '原文含“home 目录仅本次有效”说明');
+  check($('fx-input').disabled, '有对话框时输入框禁用');
+  check(calls.length === 0, '对话框出现时没有自动发送任何请求');
+  show('stream:trust_down');
+  await raf();
+  check(qa('.dlg-card.kind-trust .dlg-opt.cursor')[0]?.dataset.optIndex === '1', '光标移到第 2 项只更新样式');
+  await click(qa('.dlg-card.kind-trust .dlg-opt')[1], 'trust Yes');
+  check(calls.at(-1)?.op === 'choose' && calls.at(-1).body.index === 1, '点击 → choose(1)');
+  await sleep(250);
+  check(!q('.dlg-card'), '选择后卡片消失');
+  check(!$('fx-input').disabled, '输入框恢复可用');
+  check(s.modelInfo.model === 'Haiku 5.5' && s.modelInfo.effort === 'low', '头部模型/effort 来自状态栏：Haiku 5.5 / low');
+  check($('fx-mode').dataset.mode === 'auto' && $('fx-mode').textContent.includes('自动') && /auto/.test($('fx-mode').title), '权限模式 chip = 自动（auto，英文 id 在 tooltip）');
+
+  log('== 3. 实时草稿（stream_frames 29 帧）');
+  const draft = s.view.draft;
+  const pre = s.view.draftPre;
+  let lens = []; let sawSpinner = false; let sawBusyDraft = false;
+  await playStream(speed, (i) => {
+    if (draftVisible(s) && !draft.hidden) sawBusyDraft = true;
+    if (/Schlepping/.test(s.view.draftText.textContent)) sawSpinner = true;
+    if (i >= 19 && i <= 27) lens.push(pre.textContent.length);
+  });
+  check(sawBusyDraft, '忙时显示“生成中”草稿卡片');
+  check(sawSpinner, '草稿显示 spinner 文本（Schlepping…）');
+  check(lens.length > 0 && lens.every((v, k) => k === 0 || v >= lens[k - 1]) && lens.at(-1) > lens[0], '草稿内容逐帧增长：' + lens.join(','));
+  check(s.view.draftPre === pre && pre.isConnected, '草稿节点复用（不重建、不闪）');
+  check(!draft.hidden && pre.textContent.includes('热泉'), '空闲后、transcript 未到时保留最后草稿');
+  const finalText = '深海热泉是洋中脊、弧后盆地等板块边界上的海底喷口。……（回放合成的 assistant 条目）';
+  pushTranscript([
+    { type: 'user', uuid: 'sim-u1', timestamp: new Date().toISOString(), message: { role: 'user', content: '写一段约 400 字的中文短文，介绍深海热泉，不要用任何工具。' } },
+    { type: 'assistant', uuid: 'sim-a1', timestamp: new Date().toISOString(), message: { id: 'msg_sim', role: 'assistant', content: [{ type: 'text', text: finalText }] } },
+  ], false);
+  await raf(); flushNow(s);
+  check(draft.hidden, 'assistant 条目到达后草稿隐藏');
+  check(qa('.k-text').some((e) => e.textContent.includes('回放合成的 assistant 条目')), 'assistant 条目以 markdown 渲染');
+
+  log('== 4. AskUserQuestion 卡片（含 Type something 自由输入）');
+  show('stream:model_down');
+  await raf();
+  const qc = q('.dlg-card.kind-question');
+  check(!!qc && qc.textContent.includes('颜色偏好') && qc.textContent.includes('你更喜欢红色还是蓝色？'), 'question 卡片：header + 问题');
+  check(qa('.dlg-card.kind-question .dlg-opt').length === 4, 'question 4 个选项');
+  check(qc && qc.textContent.includes('选择红色'), '选项描述（缩进续行）');
+  const before = calls.length;
+  await click(q('.dlg-card.kind-question .dlg-opt.free'), 'Type something');
+  check(calls.length === before, '点“自己输入…”只展开文本框，不发请求');
+  const fi = q('.dlg-free-input');
+  check(!!fi && !q('.dlg-free').hidden, '自由输入框出现');
+  fi.value = '绿色'; fi.dispatchEvent(new Event('input'));
+  await click(q('.dlg-free .btn.primary'), '提交回答');
+  await sleep(120);
+  check(calls.at(-1)?.op === 'choose' && calls.at(-1).body.index === 2 && calls.at(-1).body.text === '绿色', '提交 = POST choose {index:2, text:"绿色"}（选中自由输入项 + 粘贴 + 回车）');
+  await sleep(200);
+  check(!q('.dlg-card'), '回答后卡片消失');
+
+  log('== 5. 权限卡片（Bash）');
+  show('dialogs:perm');
+  await raf();
+  const pc = q('.dlg-card.kind-permission');
+  check(!!pc && pc.textContent.includes('Bash command'), 'permission 卡片：工具名');
+  check(pc && q('.dlg-preview')?.textContent.includes('touch /tmp/ccr_tui_probe_denied2'), '预览（等宽）');
+  check(pc && pc.textContent.includes('Create probe file in /tmp') && pc.textContent.includes('Do you want to proceed?'), '描述 + 问题');
+  check(qa('.dlg-card.kind-permission .dlg-opt').length === 4, 'Bash 权限 4 个选项');
+  check($('fx-model-btn').disabled && $('fx-effort-btn').disabled, '有对话框时“切换模型/effort”禁用');
+  await click([...pc.querySelectorAll('button')].find((b) => b.textContent.includes('取消（Esc）')), 'Esc 取消');
+  check(calls.at(-1)?.op === 'cancel_dialog', 'Esc 取消 → cancel_dialog');
+  await sleep(200);
+  check(!q('.dlg-card'), '取消后卡片消失');
+
+  log('== 6. 权限卡片（Write，选项折行）');
+  show('dialogs:perm_write');
+  await raf();
+  const wopts = qa('.dlg-card.kind-permission .dlg-opt');
+  check(wopts.length === 3 && wopts[1].textContent.includes('(shift+tab)'), 'Write 3 个选项，折行并入第 2 项');
+  check(q('.dlg-card.kind-permission .dlg-opt.deny')?.textContent.includes('No'), '“No” 用拒绝样式');
+  await click(wopts[2], 'No');
+  check(calls.at(-1)?.op === 'choose' && calls.at(-1).body.index === 2, '点击 3. No → choose(2)');
+  {
+    const ex = calls.at(-1)?.body?.expect;
+    check(ex && ex.kind === 'permission' && ex.title === 'Create file' && ex.labels.length === 3 && ex.labels[2] === 'No',
+      'choose 带对话框指纹 expect {kind,title,question,preview,labels}');
+  }
+  await sleep(200);
+
+  log('== 7. 用户自己输入 /model：同一弹窗（可见窗口 + 滚动累积）');
+  show('dialogs:model');
+  await raf(); await sleep(50);
+  let dlg = document.querySelector('dialog.modal');
+  check(!!dlg && dlg.textContent.includes('切换模型'), '屏幕出现 model 面板 → 自动弹出模型弹窗');
+  check(calls.length && calls.at(-1).op !== 'model_picker', '自动弹窗不发 model_picker');
+  check(dlg && dlg.querySelectorAll('.model-row').length === 3, '可见窗口 3 行');
+  check(dlg && dlg.querySelector('.model-row.on')?.textContent.includes('Haiku') && dlg.textContent.includes('✔ 当前'), '默认选中当前（Haiku ✔）');
+  await click([...dlg.querySelectorAll('button')].find((b) => b.textContent.includes('光标下移')), '光标下移');
+  check(calls.at(-1)?.op === 'keys' && calls.at(-1).body.keys[0] === 'Down', '滚动 → keys Down');
+  await sleep(200);
+  dlg = document.querySelector('dialog.modal');
+  check(dlg && dlg.querySelectorAll('.model-row').length === 4, '滚动后累积到 4 行（3–6）');
+  await click([...dlg.querySelectorAll('.model-row')].find((b) => b.textContent.includes('Fable 5.2')), '选 Fable 5.2');
+  await click([...dlg.querySelectorAll('.seg-item')].find((b) => b.textContent.startsWith('high')), 'effort high');
+  check(dlg.textContent.includes('会写入服务器 ~/.claude/settings.json，和你在终端里按 Enter 一样'), '“保存为默认”附说明');
+  await click([...dlg.querySelectorAll('button')].find((b) => b.textContent === '仅本会话（s）'), '仅本会话');
+  await sleep(350);
+  const mc = calls.filter((c) => c.op === 'model').at(-1);
+  check(mc && mc.body.index === 5 && mc.body.effort === 'high' && mc.body.scope === 'session', 'POST model {index:5, effort:high, scope:session}');
+  check(!document.querySelector('dialog.modal'), '切换后弹窗关闭');
+
+  log('== 8. “切换模型”按钮：model_picker → 完整列表');
+  show('dialogs:ready');
+  await raf();
+  await click($('fx-model-btn'), '切换模型');
+  check(calls.some((c) => c.op === 'model_picker'), '点击 → POST model_picker');
+  dlg = document.querySelector('dialog.modal');
+  check(!!dlg && /正在读取/.test(dlg.textContent), '读取中提示');
+  await sleep(600);
+  dlg = document.querySelector('dialog.modal');
+  check(dlg && dlg.querySelectorAll('.model-row').length === 6, '完整列表 6 项');
+  check(dlg && dlg.querySelector('.model-row.on')?.textContent.includes('Haiku'), '光标 = 当前 Haiku');
+  await click([...dlg.querySelectorAll('.model-row')].find((b) => b.textContent.includes('Sonnet')), '选 Sonnet');
+  await click([...dlg.querySelectorAll('button')].find((b) => b.textContent.startsWith('保存为默认')), '保存为默认');
+  await sleep(350);
+  const mc2 = calls.filter((c) => c.op === 'model').at(-1);
+  check(mc2 && mc2.body.index === 3 && mc2.body.effort === null && mc2.body.scope === 'save', 'POST model {index:3, effort:null, scope:save}');
+  show('dialogs:model');
+  await raf(); await sleep(50);
+  dlg = document.querySelector('dialog.modal');
+  await click([...(dlg ? dlg.querySelectorAll('button') : [])].find((b) => b.textContent === '取消（Esc）'), '取消（Esc）');
+  await sleep(250);
+  check(calls.at(-1)?.op === 'cancel_dialog', '弹窗“取消（Esc）” → cancel_dialog');
+  check(!document.querySelector('dialog.modal'), '取消后弹窗关闭且不再自动弹出');
+
+  log('== 9. /effort 面板卡片 + effort 弹窗');
+  show('dialogs:effort');
+  await raf();
+  const ec = q('.dlg-card.kind-effort');
+  check(!!ec && ec.querySelector('.seg-item.on')?.textContent === 'low', 'effort 卡片：当前档位 low（▲ 对齐）');
+  await click([...ec.querySelectorAll('button')].find((b) => b.textContent.includes('提高')), '提高');
+  check(calls.at(-1)?.op === 'keys' && calls.at(-1).body.keys[0] === 'Right', '提高 → keys Right');
+  await sleep(5100); // 等卡片“提交中”状态自动恢复（屏幕未变化）
+  await click([...q('.dlg-card.kind-effort').querySelectorAll('button')].find((b) => b.textContent.startsWith('仅本会话')), '仅本会话');
+  check(calls.at(-1)?.op === 'keys' && calls.at(-1).body.keys[0] === 's', '仅本会话 → keys s');
+  await sleep(250);
+  check(!q('.dlg-card'), 'effort 面板关闭');
+  await click($('fx-effort-btn'), 'effort 按钮');
+  dlg = document.querySelector('dialog.modal');
+  check(!!dlg && dlg.textContent.includes('调整 effort'), 'effort 弹窗');
+  await click([...dlg.querySelectorAll('.seg-item')].find((b) => b.textContent === 'max'), 'max');
+  await click([...dlg.querySelectorAll('button')].find((b) => b.textContent === '仅本会话（s）'), '仅本会话');
+  await sleep(300);
+  const ef = calls.filter((c) => c.op === 'effort').at(-1);
+  check(ef && ef.body.level === 'max' && ef.body.scope === 'session', 'POST effort {level:max, scope:session}');
+
+  log('== 10. generic 对话框 + 键盘区');
+  const gen = ['', '────────────────────────────────────────', ' Resume a conversation', '', ' ❯ 1. 昨天的会话', '   2. 前天的会话', '', ' Enter to select · Esc to cancel'].join('\n');
+  pushScreen(gen, 'sim:generic');
+  await raf();
+  const gc = q('.dlg-card.kind-generic');
+  check(!!gc && gc.querySelector('.dlg-generic')?.textContent.includes('Resume a conversation'), 'generic：原文行');
+  check(gc && gc.querySelectorAll('.dlg-opt').length === 2 && gc.querySelectorAll('.keypad .key').length === 7, 'generic：选项按钮 + 键盘区');
+  await click([...gc.querySelectorAll('.key')].find((b) => b.textContent === '↓'), '↓');
+  check(calls.at(-1)?.op === 'keys' && calls.at(-1).body.keys[0] === 'Down', '键盘区 ↓ → keys Down');
+
+  log('== 11. 终端面板');
+  await click($('fx-term-btn'), '终端');
+  check(!$('fx-term').hidden && $('fx-term').querySelector('.term-screen').textContent.includes('Resume a conversation'), '终端面板显示最新屏幕原文');
+  await click([...$('fx-term').querySelectorAll('.key')].find((b) => b.textContent === 'Shift+Tab'), 'Shift+Tab');
+  check(calls.at(-1)?.op === 'keys' && calls.at(-1).body.keys[0] === 'BTab', 'Shift+Tab → keys BTab');
+  await click([...$('fx-term').querySelectorAll('.key')].find((b) => b.textContent === 'Ctrl+C'), 'Ctrl+C');
+  check(calls.at(-1)?.body.keys[0] === 'C-c', 'Ctrl+C → keys C-c');
+  show('dialogs:final');
+  await raf();
+  check($('fx-term').querySelector('.term-screen').textContent.includes('Rejected write'), '终端面板随 screen 事件更新');
+  check($('fx-mode').dataset.mode === 'manual' && $('fx-mode').textContent.includes('手动审批'), '模式 chip = 手动审批（manual）');
+  await click($('fx-cycle'), '切换模式');
+  check(calls.at(-1)?.op === 'mode/cycle', '切换（Shift+Tab）→ mode/cycle');
+
+  log('== 12. busy_count → interrupted');
+  show('stream:busy_count');
+  await raf(); flushNow(s);
+  check(!s.view.draft.hidden && s.view.draftPre.textContent.includes('20'), '忙时草稿显示逐行输出');
+  check(!$('fx-stop').hidden, 'busy 时显示“中断（Esc）”');
+  show('stream:interrupted');
+  await sleep(3300); flushNow(s);
+  check(s.view.draft.hidden, '空闲后草稿在宽限期后隐藏');
+
+  log('== 13. 统计条（meta.stats：上下文圆环 / 花费 / tok/s）');
+  await statsChecks();
+
+  log('== 13b. 输入框底栏（模型/effort 胶囊、权限模式、Shift+Tab、不换行、分级折叠）');
+  await composerBarChecks();
+
+  log('== 13c. 侧栏「新回复」/「待处理」（sessrow.js：状态优先级、行 class、颜色、窗口标题未读数）');
+  await sessRowChecks();
+
+  log('== 14. 可视化（图片引用 / 灯箱 / 文件 chip / 本轮改动 / 网页预览 / 彩色区分）');
+  await vizChecks();
+
+  log('== 14b. 右侧代码改动栏（changes.js：按文件 / 按轮、diff 行号、联动、开关与记忆、空状态、懒渲染、不发请求、不动时间线）');
+  await changesChecks();
+
+  log('== 14c. dmg 版自动更新提示条与设置项（update.js：各状态、只在点击时请求、更新说明、下载页链接、浅色 / 深色对比度）');
+  await updateChecks();
+
+  log('== 15. 红线 / 控制台');
+  check(calls.every((c) => c.gesture), '所有请求都发生在用户点击中（共 ' + calls.length + ' 个）');
+  check(errors === 0, '控制台零错误');
+  $('fx-result').textContent = `自测完成：通过 ${checksOk} · 失败 ${checksBad} · 控制台错误 ${errors}`;
+  window.__fxResult = { ok: checksOk, bad: checksBad, errors, calls: calls.length };
+}
+
+// ---------- 输入框不抖动 ----------
+// 与 app.js 同一个 AutoSize：镜像测量、不临时缩小输入框；时间线贴底时随输入框长高继续贴底，停在中间时 scrollTop 不动。
+// 关掉 overflow-anchor 模拟 WebKit（原生应用的 WKWebView 没有滚动锚定）；两次按键之间模拟一次“有输出到达时贴底”。
+const fxSizer = new AutoSize($('fx-input'), { onChange: fxPin });
+function fxPin() { if (s && s.view && s.view.stick && s.view.root.isConnected) s.view.root.scrollTop = s.view.root.scrollHeight; }
+$('fx-input').addEventListener('input', () => fxSizer.update());
+window.addEventListener('resize', () => fxSizer.update());
+if (typeof ResizeObserver === 'function') new ResizeObserver(fxPin).observe($('fx-host'));
+
+// ---------- 输入框 ↑/↓ 历史 ----------
+// 与 app.js 同一套 prompthist.js + AutoSize.caretEdges；列表 = 本页时间线里的用户消息（+ 模拟的“已发出、还没写进 transcript”）。
+let fxNav = new PromptNav();
+let fxPending = [];
+$('fx-input').addEventListener('keydown', (e) => {
+  const dir = historyDir(e, false);
+  if (!dir || !s) return;
+  const text = recallInto($('fx-input'), dir, fxSizer, fxNav, () => {
+    const r = mergePending(promptsFromItems(s.items), fxPending);
+    fxPending = r.pending;
+    return r.list;
+  });
+  if (text == null) return;
+  e.preventDefault();
+  fxSizer.update();
+});
+
+async function recallChecks() {
+  const ta = $('fx-input');
+  const n0 = calls.length;
+  ta.disabled = false;
+  ta.focus();
+  fxNav = new PromptNav();
+  fxPending = [];
+  const P = promptsFromItems(s.items);
+  const P1 = '用 Bash 执行 touch /tmp/ccr_tui_probe_denied2 ，如果被拒绝就直接告诉我';
+  const P2 = '请用 Write 工具在 /mnt/ssd/home/demouser/.ccr_probe_write_denied.txt 写入 hi，被拒绝就直接告诉我';
+  check(P.length === 2 && P[0] === P1 && P[1] === P2, '历史列表 = 时间线上的 2 条用户消息（不含 /effort 命令、caveat、中断标记）');
+  const set = (v, pos = v.length, end = pos) => { ta.value = v; ta.setSelectionRange(pos, end); fxSizer.update(); };
+  const key = (k, opt = {}) => !ta.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...opt }));
+  // 调出的消息可能折成几行（光标在开头）：真实按键会先把光标移到最后一行；合成事件没有默认动作，这里直接把光标放到末尾
+  const down = (opt) => { ta.setSelectionRange(ta.value.length, ta.value.length); return key('ArrowDown', opt); };
+
+  set('');
+  check(key('ArrowUp') && ta.value === P2 && ta.selectionStart === 0, '空输入框按 ↑：放入最近一条，光标在开头');
+  check(key('ArrowUp') && ta.value === P1, '再按 ↑：更早一条');
+  check(!key('ArrowUp') && ta.value === P1, '已是最早一条：↑ 交给浏览器（不改内容）');
+  check(down() && ta.value === P2 && ta.selectionStart === P2.length, '↓：下一条，光标在末尾');
+  check(down() && ta.value === '', '↓ 翻过最新一条：回到原来的（空）草稿');
+  check(!key('ArrowDown') && ta.value === '', '没在浏览时 ↓ 不处理');
+
+  set('写了一半的草稿');
+  check(key('ArrowUp') && ta.value === P2, '有草稿、光标在第一行：↑ 调出最近一条');
+  check(down() && ta.value === '写了一半的草稿' && ta.selectionStart === ta.value.length, '↓ 回来：草稿原样恢复');
+
+  set('');
+  key('ArrowUp');
+  set(P2 + ' 改一下');
+  check(!down() && ta.value === P2 + ' 改一下', '改过调出来的内容：退出浏览，↓ 不处理（不丢字）');
+  ta.setSelectionRange(0, 0);   // 改后的文字可能折成两行：光标先回到第一行
+  check(key('ArrowUp') && ta.value === P2 && down() && ta.value === P2 + ' 改一下', '再按 ↑ 从最新一条开始，↓ 回到改后的文字');
+
+  set('第一行\n第二行\n第三行', 6);
+  check(!key('ArrowUp') && ta.value.startsWith('第一行'), '多行内容、光标不在第一行：↑ 只移动光标');
+  set('第一行\n第二行\n第三行', 2);
+  check(key('ArrowUp') && ta.value === P2, '多行内容、光标在第一行：↑ 调出历史');
+  check(down() && ta.value === '第一行\n第二行\n第三行', '↓ 回到多行草稿');
+
+  // 自动折行：一个逻辑行折成多个视觉行，光标在后面的视觉行时 ↑ 只移动光标
+  const long = '很长的一段话会自动折行 '.repeat(30).trim();
+  set(long);
+  const wrapped = ta.offsetHeight > 50;
+  const e1 = fxSizer.caretEdges(long.length), e0 = fxSizer.caretEdges(3);
+  check(wrapped && !e1.first && e1.last && e0.first && !e0.last, '自动折行：caretEdges 区分第一 / 最后视觉行（末尾 ' + JSON.stringify(e1) + '，开头 ' + JSON.stringify(e0) + '）');
+  check(!key('ArrowUp') && ta.value === long, '折行后光标在最后一个视觉行：↑ 只移动光标');
+  set(long, 3);
+  check(key('ArrowUp') && ta.value === P2, '折行后光标在第一个视觉行：↑ 调出历史');
+  // 中文没有空格：一整段中文折成几行，光标在第一个视觉行时 ↑ 也要调出历史（不能把光标后面整段都当成一个词）
+  const zh = '这是一段没有空格的中文长句子，用来检查自动折行时的第一行判断。'.repeat(8);
+  ta.value = '';
+  fxNav = new PromptNav();
+  set(zh, 3);
+  const z0 = fxSizer.caretEdges(3), z1 = fxSizer.caretEdges(zh.length);
+  check(ta.offsetHeight > 50 && z0.first && !z0.last && !z1.first && z1.last, '中文长段折行：caretEdges 第一 / 最后视觉行判断正确（开头 ' + JSON.stringify(z0) + '，末尾 ' + JSON.stringify(z1) + '）');
+  check(key('ArrowUp') && ta.value === P2, '中文长段、光标在第一个视觉行：↑ 调出历史');
+  ta.value = '';
+  fxNav = new PromptNav();
+
+  set('abc', 0, 2);
+  check(!key('ArrowUp') && ta.value === 'abc', '选中了文字：↑ 不处理');
+  set('');
+  check(!key('ArrowUp', { shiftKey: true }) && !key('ArrowUp', { altKey: true }) && !key('ArrowUp', { metaKey: true }) && ta.value === '', 'Shift / Alt / ⌘ + ↑ 不处理');
+  check(!key('ArrowUp', { isComposing: true }) && !key('ArrowUp', { keyCode: 229 }) && ta.value === '', '输入法组字中的 ↑ 不处理');
+  ta.disabled = true;
+  check(!key('ArrowUp') && ta.value === '', '输入框禁用（有对话框 / 已退出）时不处理');
+  ta.disabled = false;
+
+  // 已发出、transcript 里还没出现的消息（运行中排队）：排在最后；写进 transcript 后不重复
+  fxPending = [{ text: '排队中的消息', n: P.length }];
+  set('');
+  check(key('ArrowUp') && ta.value === '排队中的消息' && key('ArrowUp') && ta.value === P2, '已发出但还没写进 transcript 的消息排在最前（最近）');
+  fxNav = new PromptNav();
+  pushTranscript([{ type: 'user', uuid: 'fx-recall-q', timestamp: new Date().toISOString(), message: { role: 'user', content: '排队中的消息' } }], false);
+  await raf(); flushNow(s);
+  set('');
+  key('ArrowUp'); const a1 = ta.value; key('ArrowUp'); const a2 = ta.value;
+  check(a1 === '排队中的消息' && a2 === P2 && fxPending.length === 0, '写进 transcript 后只出现一次，待出现列表清空');
+  ta.value = '';
+  fxNav = new PromptNav();
+  fxSizer.update();
+  check(calls.length === n0, '↑/↓ 历史不发任何请求');
+  pushTranscript(transcriptEntries(), true);   // 去掉本节补的消息，后面各节照旧
+  await raf(); flushNow(s);
+}
+
+// ---------- 左侧 prompt 小格子 ----------
+// 与 app.js 同一个 minimap.js（PromptMinimap 挂在 #fx-host，onFlush 钩子来自 render.js）。临时补 200 轮消息（400 个条目，
+// 前 100 个不在首屏渲染窗口里）检查跳转 / 补渲染；合成鼠标、键盘、滚轮事件直接发给小格子。
+function mmTranscript(nTurns) {
+  const out = [];
+  const ts = new Date().toISOString();
+  for (let k = 0; k < nTurns; k++) {
+    out.push({ type: 'user', uuid: 'mm-u' + k, timestamp: ts, message: { role: 'user', content: `第 ${k} 轮提问：请解释一下 **第 ${k} 个** 话题` } });
+    out.push({ type: 'assistant', uuid: 'mm-a' + k, timestamp: ts, message: { id: 'mm-m' + k, role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text',
+      text: `## 第 ${k} 轮回答\n\n- 要点一：\`code_${k}\`\n- 要点二：*斜体*说明\n\n这一轮的回答比较长，用来撑高时间线。` }] } });
+  }
+  return out;
+}
+
+async function minimapChecks() {
+  const mm = fxMinimap;
+  const host = $('fx-host');
+  const ta = $('fx-input');
+  const n0 = calls.length;
+  const root = s.view.root;
+  const settle = async () => {   // 等平滑滚动停下（连续 8 帧 scrollTop 不变）
+    let last = -1, same = 0;
+    for (let i = 0; i < 240 && same < 8; i++) { await raf(); if (root.scrollTop === last) same++; else { same = 0; last = root.scrollTop; } }
+    await raf();
+  };
+  const toBottom = async () => { root.scrollTop = root.scrollHeight; s.view.stick = true; s.view.jump.hidden = true; await raf(); await raf(); };
+  const n = () => mm.entries.length;
+  const yOf = (i) => { const r = mm.btn.getBoundingClientRect(); return r.top + (topPercent(i, n()) / 100) * r.height; };
+  const mev = (el, type, y, opt = {}) => {
+    const r = el.getBoundingClientRect();
+    const e = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: r.left + 4, clientY: y, buttons: 0, ...opt });
+    el.dispatchEvent(e);
+    return e;
+  };
+  const clickAt = async (i) => {
+    const y = yOf(i);
+    mev(mm.btn, 'mousemove', y);
+    const d = mev(mm.btn, 'mousedown', y, { buttons: 1 });
+    mev(mm.btn, 'mouseup', y);
+    mev(mm.btn, 'click', y, { detail: 1 });
+    await settle();
+    return d;
+  };
+  const userTop = (i) => Math.round(mm.entries[i].item.el.getBoundingClientRect().top - root.getBoundingClientRect().top);
+  const near24 = (i) => Math.abs(userTop(i) - MM_TARGET_OFFSET) <= 2;
+  const key = (k) => mm.btn.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+  const inView = () => mm.strips.map((x) => x.dataset.inView === 'true');
+
+  // 回放 transcript：2 条真实提示
+  check(host.querySelectorAll('.pmap').length === 1 && !root.querySelector('.pmap'), '#chat-host 里只有一个小格子覆盖层（不在时间线里）');
+  check(!mm.root.hidden && mm.strips.length === qa('.k-user').length && mm.strips.length === 2, '条目数 = 时间线用户消息数（' + mm.strips.length + '）');
+  check(Math.round(mm.rail.getBoundingClientRect().height) === 8, '2 条时高度 = (2-1)×8px');
+  const one = [{ type: 'user', uuid: 'mm-one', timestamp: new Date().toISOString(), message: { role: 'user', content: '只有一条' } }];
+  pushTranscript(one, true); await raf(); flushNow(s); await raf();
+  check(mm.root.hidden, '少于 2 条用户消息时隐藏');
+
+  // 200 轮
+  pushTranscript(mmTranscript(200), true); await raf(); flushNow(s);
+  await toBottom();
+  const N = n();
+  check(!mm.root.hidden && N === 200 && mm.strips.length === 200 && s.renderStart === 100, '200 轮：200 格（前 100 个条目不在首屏渲染窗口里，renderStart=' + s.renderStart + '）');
+  const tops = mm.strips.map((x) => parseFloat(x.style.top));
+  check(tops[0] === 0 && tops[199] === 100 && Math.abs(tops[100] - 100 * 100 / 199) < 1e-3 && tops.every((v, i) => !i || v > tops[i - 1]), 'top% 从 0 到 100 均匀分布');
+  const hostH = host.getBoundingClientRect().height, railR = mm.rail.getBoundingClientRect();
+  check(Math.abs(railR.height - Math.max(64, hostH - 144)) <= 1 && Math.abs(railR.top + railR.height / 2 - (host.getBoundingClientRect().top + hostH / 2)) <= 1,
+    '高度 = min(199×8px, 时间线高 − 9rem) 且竖向居中（' + Math.round(railR.height) + ' / ' + Math.round(hostH) + '）');
+
+  // 常驻（回放页 .main 约 1060px 宽：留白 ≈ 130 + 28）
+  const hr = host.getBoundingClientRect();
+  check(mm.root.dataset.persistent === 'true' && getComputedStyle(mm.root).opacity === '1' && getComputedStyle(mm.root).display !== 'none',
+    '宽：左侧留白 ' + Math.round(mm.gutter) + 'px ≥ 48 → 常驻显示');
+  check(Math.round(railR.left - hr.left) === 12 && Math.round(railR.width) === 40, '宽：小格子在左边 12px、命中宽 40px');
+  const cs = getComputedStyle(mm.root);
+  check(cs.position === 'absolute' && cs.zIndex === '4' && cs.pointerEvents === 'none', '覆盖层：absolute、z-index 4（低于抽屉 40 / 弹层）、自身不接收指针');
+  // 不改变时间线布局
+  const colKey = () => { const r = s.view.col.getBoundingClientRect(); return [Math.round(r.left), Math.round(r.width), root.scrollHeight, root.clientWidth].join(','); };
+  const withMm = colKey();
+  mm.root.hidden = true; await raf();
+  const withoutMm = colKey();
+  mm.root.hidden = false; await raf();
+  check(withMm === withoutMm, '小格子不改变 .chat-col 位置 / 宽度和时间线 scrollHeight（' + withMm + '）');
+
+  // 在底部：最后几轮加深、最前面的不加深；下一轮禁用
+  await raf();
+  let iv = inView();
+  check(iv[199] && !iv[0] && !iv[150] && iv.filter(Boolean).length < 12, '在底部：最后几轮 data-in-view=true，其它为 false（' + iv.filter(Boolean).length + ' 格）');
+  check(mm.nextBtn.disabled && !mm.prevBtn.disabled, '在底部：「下一轮」禁用、「上一轮」可用');
+
+  // 悬停：鱼眼 + 预览卡
+  mev(mm.btn, 'mousemove', yOf(120));
+  check(mm.active === 120, '悬停：指针所在那一格高亮（120）');
+  const dd = [117, 118, 119, 120, 121, 122, 123].map((i) => mm.strips[i].dataset.d ?? '-').join('');
+  check(dd === '-21012-', '鱼眼：距离 0 / 1 / 2 → data-d，更远不写（' + dd + '）');
+  await sleep(220);   // 等 .15s 过渡
+  const sx = (i) => new DOMMatrixReadOnly(getComputedStyle(mm.strips[i]).transform).a;
+  const scales = [120, 121, 122, 123, 119].map((i) => Math.round(sx(i) * 1000) / 1000);
+  check(scales.join() === '1,0.667,0.417,0.333,0.667', 'scaleX：1 / .667 / .417 / .333（' + scales.join(' / ') + '）');
+  const card = mm.card, cr = card.getBoundingClientRect();
+  check(!card.hidden && mm.cardUser.textContent === '第 120 轮提问：请解释一下 第 120 个 话题' &&
+    mm.cardText.textContent === '第 120 轮回答 要点一：code_120 要点二：斜体说明 这一轮的回答比较长，用来撑高时间线。',
+    '预览卡：用户文字一行 + 该轮最后一段助手文字（纯文本，去掉 markdown 记号）');
+  const sr = mm.strips[120].getBoundingClientRect();
+  check(Math.abs(cr.top + cr.height / 2 - (sr.top + sr.height / 2)) <= 1.5 && Math.round(cr.left - railR.left) === 32 && getComputedStyle(card).pointerEvents === 'none',
+    '预览卡在小格子右侧 32px、以悬停那一格为中线、不接收指针');
+  check(cr.right <= hr.right && document.documentElement.scrollWidth <= document.documentElement.clientWidth && getComputedStyle(mm.cardText).webkitLineClamp === '3',
+    '预览卡不出时间线右边、不撑出横向滚动；助手文字最多 3 行');
+  mev(mm.btn, 'mousemove', yOf(0));
+  const c0 = card.getBoundingClientRect();
+  mev(mm.btn, 'mousemove', yOf(199));
+  const c1 = card.getBoundingClientRect();
+  check(c0.top >= hr.top && c1.bottom <= hr.bottom, '两端那一格的预览卡也在时间线区域内（不压到会话头 / 输入框）');
+  mev(mm.btn, 'mouseleave', yOf(199));
+  check(mm.active === null && card.hidden && !mm.strips.some((x) => x.dataset.d), '移开：高亮与预览卡消失');
+
+  // 补渲染（renderStart 之前的条目）：内容在屏幕上不动
+  root.style.overflowAnchor = 'none';   // 模拟 WebKit（没有滚动锚定）：位置全靠 renderEarlier 自己补
+  root.scrollTop = Math.round(root.scrollHeight / 2); s.view.stick = false; await raf();
+  const anchor = s.items[300].el, aTop = anchor.getBoundingClientRect().top;
+  check(revealItem(s, s.items[60]) && s.renderStart === 60 && !!s.items[60].el && s.items[60].el.isConnected, 'revealItem：从目标条目开始补渲染（renderStart 100 → 60）');
+  check(Math.abs(anchor.getBoundingClientRect().top - aTop) <= 1 && !s.view.more.hidden && /共 60 条/.test(s.view.more.textContent), '补渲染保持滚动位置、「显示更早」计数更新');
+  root.style.overflowAnchor = '';
+  pushTranscript(mmTranscript(200), true); await raf(); flushNow(s);
+  await toBottom();
+
+  // 点击跳转（已渲染）：目标顶端在视口顶端下方 24px，不抢输入框焦点
+  ta.focus();
+  const md = await clickAt(150);
+  check(md.defaultPrevented && document.activeElement === ta, '点击：mousedown 被拦（不抢输入框焦点）');
+  check(near24(150), '点击已渲染的第 150 条：消息顶端在视口顶端下方 ' + userTop(150) + 'px（期望 24）');
+  check(!s.view.stick && s.view.jump.hidden, '跳离底部：不再贴底（新内容不会把视图拉回底部）');
+  iv = inView();
+  check(iv[150] && !iv[199] && !iv[0] && mm.current === 150, '跳转后：第 150 轮加深、底部那几轮不再加深，当前下标 = 150');
+  pushTranscript([{ type: 'assistant', uuid: 'mm-late', timestamp: new Date().toISOString(), message: { id: 'mm-late', role: 'assistant', content: [{ type: 'text', text: '新到的回复' }] } }], false);
+  await raf(); flushNow(s); await raf();
+  check(near24(150) && !s.view.jump.hidden, '跳转后有新内容：位置不动、出现「最新」按钮');
+
+  // 上一轮 / 下一轮
+  mm.nextBtn.click(); await settle();
+  check(near24(151) && mm.current === 151, '「下一轮」→ 第 151 条到视口顶端下方 24px');
+  mm.prevBtn.click(); await settle(); mm.prevBtn.click(); await settle();
+  check(near24(149) && mm.current === 149, '「上一轮」×2 → 第 149 条');
+
+  // 点击 renderStart 之前、还没渲染的条目
+  check(s.renderStart > 6 && !s.items[6].el, '第 3 条用户消息（条目 6）还没渲染');
+  await clickAt(3);
+  check(s.renderStart <= 6 && s.items[6].el && s.items[6].el.isConnected && near24(3), '点击未渲染的第 3 条：先补渲染再跳转，顶端在视口下方 ' + userTop(3) + 'px');
+  check(mm.current === 3 && inView()[3] && !inView()[150], '可见轮次随滚动更新（第 3 轮加深）');
+  await clickAt(0);
+  check(userTop(0) >= 0 && mm.current === 0 && mm.prevBtn.disabled && !mm.nextBtn.disabled, '跳到第一条：「上一轮」禁用');
+
+  // 键盘：↑/↓/Home/End 移动高亮，Enter 跳转，失焦清除；不影响输入框
+  ta.value = '草稿不变'; fxSizer.update();
+  mev(mm.btn, 'mouseleave', 0);
+  // 没有系统焦点的 headless 页面里 focus() / blur() 不派发 focus / blur 事件：这时补发一个（处理函数是幂等的）
+  const sysFocus = document.hasFocus();
+  mm.btn.focus();
+  if (!sysFocus) mm.btn.dispatchEvent(new FocusEvent('focus'));
+  check(document.activeElement === mm.btn && mm.active === 0 && !card.hidden, '键盘聚焦：高亮当前那一格（0）并显示预览卡');
+  key('ArrowDown'); key('ArrowDown');
+  const a2 = mm.active;
+  key('End'); const aEnd = mm.active;
+  key('ArrowUp'); const aUp = mm.active;
+  key('Home'); const aHome = mm.active;
+  check(a2 === 2 && aEnd === 199 && aUp === 198 && aHome === 0, '↓↓ → 2、End → 199、↑ → 198、Home → 0');
+  key('ArrowDown'); key('ArrowDown'); key('ArrowDown');
+  const ent = !mm.btn.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await settle();
+  check(ent && near24(3) && ta.value === '草稿不变', 'Enter：跳到高亮的第 3 条；输入框内容不变');
+  const focused = document.activeElement === mm.btn;
+  mm.btn.blur();
+  if (!sysFocus) mm.btn.dispatchEvent(new FocusEvent('blur'));
+  check(focused && mm.active === null && card.hidden, '失焦：清除高亮');
+  ta.value = ''; fxSizer.update();
+
+  // 滚轮转发给时间线
+  root.scrollTop = 4000; await raf();
+  const w0 = root.scrollTop;
+  const we = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 120, deltaMode: 0, clientX: railR.left + 4, clientY: yOf(100) });
+  mm.btn.dispatchEvent(we);
+  await sleep(260);
+  check(we.defaultPrevented && Math.abs(root.scrollTop - w0 - 120) <= 1, '滚轮（像素）：转发给时间线 +' + (root.scrollTop - w0) + 'px');
+  const w1 = root.scrollTop;
+  mm.btn.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -3, deltaMode: 1 }));
+  await sleep(260);
+  check(Math.abs(root.scrollTop - w1 + 48) <= 1, '滚轮（按行，deltaMode=1）：3 行 = ' + (root.scrollTop - w1) + 'px');
+
+  // 从别处开始的拖动（选文字）经过：穿透，不高亮
+  mev(mm.rail, 'mousemove', yOf(50), { buttons: 1 });
+  mev(mm.btn, 'mousemove', yOf(50), { buttons: 1 });
+  check(mm.rail.classList.contains('pass') && getComputedStyle(mm.rail).pointerEvents === 'none' && mm.active === null, '按着键从别处拖过来：小格子穿透（pointer-events:none）、不高亮');
+  window.dispatchEvent(new MouseEvent('mouseup', { buttons: 0 }));
+  check(!mm.rail.classList.contains('pass') && getComputedStyle(mm.rail).pointerEvents === 'auto', '松开后恢复');
+
+  // 窄：留白 < 48 → 平时隐藏，只在精确指针悬停时淡入
+  const main = document.querySelector('.fx-main .main');
+  main.style.flex = '0 0 760px';
+  await raf(); await raf(); await sleep(220);   // 等 .15s 淡出
+  const fine = matchMedia('(pointer: fine)').matches;
+  const ncs = getComputedStyle(mm.root);
+  check(mm.root.dataset.persistent === 'false' && ncs.opacity === '0' && ncs.display === (fine ? 'block' : 'none'),
+    '窄（760px，留白 ' + Math.round(mm.gutter) + 'px；' + [ncs.opacity, ncs.display].join() + '）：平时透明' + (fine ? '，精确指针下可悬停淡入' : '，非精确指针不显示'));
+  check(Math.round(mm.rail.getBoundingClientRect().width) === Math.max(0, Math.min(40, Math.floor(mm.gutter) - 12)) && !mm.rail.classList.contains('nav-off'),
+    '窄：命中宽 = clamp(留白 − 12, 0, 40) = ' + Math.round(mm.rail.getBoundingClientRect().width) + 'px，导航可点');
+  const nKey = colKey();
+  mm.root.hidden = true; await raf();
+  check(colKey() === nKey, '窄：小格子同样不改变时间线布局');
+  mm.root.hidden = false;
+  main.style.flex = '';
+  await raf(); await raf(); await raf();
+  check(mm.root.dataset.persistent === 'true', '恢复宽度后重新常驻（ResizeObserver 重新测量）');
+
+  // 颜色：浅色 / 深色都看得见，可见轮次明显更深
+  const th = window.ccrTheme;
+  const prevPref = th ? th.pref() : 'system';
+  const colors = () => {
+    const bg = rgbaOf(getComputedStyle(main).backgroundColor);
+    const strip = mm.strips[0];
+    const base = over(rgbaOf(getComputedStyle(strip).backgroundColor), bg);
+    const lit = over(rgbaOf(getComputedStyle(strip, '::after').backgroundColor), base);
+    const cardBg = over(rgbaOf(getComputedStyle(mm.card.firstChild).backgroundColor), bg);
+    return { base: contrast(base, bg), lit: contrast(lit, bg), text: contrast(rgbaOf(getComputedStyle(mm.cardUser).color), cardBg),
+      vars: ['--pmap-strip', '--pmap-strip-hot', '--pmap-strip-inview', '--pmap-card-bg', '--pmap-card-border'].map((v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim()) };
+  };
+  const res = {};
+  for (const t of ['light', 'dark']) {
+    if (th) th.set(t, { persist: false });
+    await raf(); await raf();
+    res[t] = colors();
+  }
+  if (th) th.set(prevPref, { persist: false });
+  await raf();
+  const f2 = (x) => x.toFixed(2);
+  for (const t of ['light', 'dark']) {
+    const c = res[t];
+    check(c.vars.every(Boolean) && c.base >= 1.3 && c.lit >= 3 && c.text >= 7,
+      (t === 'light' ? '浅色' : '深色') + '：横条对背景 ' + f2(c.base) + ':1、可见轮次 ' + f2(c.lit) + ':1、预览卡文字 ' + f2(c.text) + ':1');
+  }
+  check(res.light.vars.join() !== res.dark.vars.join(), '--pmap-* 变量浅色 / 深色取值不同');
+
+  // 跟随会话：没有会话（空白页 / showEmpty）时隐藏，回来再显示
+  fxMinimap.setSession(null);
+  check(mm.root.hidden, '没有当前会话时隐藏');
+  fxMinimap.setSession(s);
+  check(!mm.root.hidden && mm.strips.length === 200, '重新指向会话后恢复');
+
+  check(calls.length === n0, '小格子不发任何请求（悬停 / 点击 / 键盘 / 滚轮）');
+  pushTranscript(transcriptEntries(), true);   // 去掉本节补的消息，后面各节照旧
+  await raf(); flushNow(s);
+  await toBottom();
+}
+
+async function typingChecks() {
+  const ta = $('fx-input');
+  const root = s.view.root;
+  const keep = [root, ta, document.documentElement, document.body].map((el) => [el, el.style.overflowAnchor]);
+  for (const [el] of keep) el.style.overflowAnchor = 'none';
+  // 时间线不够长时补几条用户消息，保证能滚动
+  for (let k = 0; root.scrollHeight < root.clientHeight * 2.5 && k < 40; k++) {
+    pushTranscript([{ type: 'user', uuid: 'fx-typing-' + k, timestamp: new Date().toISOString(), message: { role: 'user', content: '补充的较长消息 ' + k + '：'.padEnd(200, '填') } }], false);
+    await raf(); flushNow(s);
+  }
+  const dist = () => Math.round(root.scrollHeight - root.scrollTop - root.clientHeight);
+  const max = () => Math.round(innerHeight * 0.4);
+  const setVal = async (v) => { ta.value = v; ta.setSelectionRange(v.length, v.length); ta.dispatchEvent(new Event('input', { bubbles: true })); await raf(); await raf(); };
+  const type = (ch) => {
+    ta.focus();
+    if (!document.execCommand('insertText', false, ch)) { ta.setRangeText(ch, ta.selectionStart, ta.selectionEnd, 'end'); ta.dispatchEvent(new Event('input', { bubbles: true })); }
+  };
+  const text = '输入框超过一行以后，每次输入都不应该让时间线或滚动条上下跳动。'.repeat(3) + '\n第二段 Shift+Enter 换行后继续输入。\n第三段 abc def ghi 0123456789';
+  ta.disabled = false;
+  check(root.scrollHeight > root.clientHeight * 1.5, '时间线足够长可以滚动（' + root.scrollHeight + ' / ' + root.clientHeight + '）');
+
+  // 贴底：每次按键前若贴底就滚到底（模拟输出到达），按键后不得往下掉、仍贴底
+  await setVal('');
+  root.scrollTop = root.scrollHeight; await raf(); await raf();
+  let drops = 0, off = 0, bars = 0, grows = 0;
+  for (const ch of text) {
+    if (dist() < 60) { root.scrollTop = root.scrollHeight; await raf(); }
+    const t0 = root.scrollTop, h0 = ta.offsetHeight;
+    type(ch); await raf();
+    if (root.scrollTop < t0) drops++;
+    if (dist() > 1) off++;
+    if (ta.offsetHeight !== h0) grows++;
+    if (ta.offsetHeight < max() && (ta.offsetWidth - ta.clientWidth > 0 || ta.scrollTop !== 0 || getComputedStyle(ta).overflowY !== 'hidden')) bars++;
+  }
+  check(drops === 0 && off === 0, `贴底打字 ${[...text].length} 字：时间线回跳 ${drops} 次、离开底部 ${off} 次（输入框长高 ${grows} 次）`);
+  check(bars === 0, '未到最大高度时输入框没有滚动条 / 内部偏移（' + bars + ' 次）');
+
+  // 停在中间：scrollTop 全程不变
+  await setVal('');
+  root.scrollTop = Math.round((root.scrollHeight - root.clientHeight) / 2); await raf(); await raf();
+  const mid = root.scrollTop;
+  let moved = 0;
+  for (const ch of text) { type(ch); await raf(); if (root.scrollTop !== mid) moved++; }
+  check(moved === 0, '停在中间打字：时间线 scrollTop 变化 ' + moved + ' 次');
+
+  // 最大高度：高度与时间线都不动，输入框自己滚动
+  await setVal(Array.from({ length: 40 }, (_, i) => '预填第 ' + i + ' 行').join('\n'));
+  root.scrollTop = root.scrollHeight; await raf(); await raf();
+  // 光标放到末尾后重新聚焦 → 浏览器把光标滚进视野（无头模式下已聚焦时设光标不会滚动）
+  ta.blur(); ta.setSelectionRange(ta.value.length, ta.value.length); ta.focus();
+  await raf();
+  const capH = ta.offsetHeight, capTop = root.scrollTop, taTop0 = ta.scrollTop;
+  check(capH === max() && getComputedStyle(ta).overflowY === 'auto', '超长内容：输入框封顶 40% 视口（' + capH + 'px）且可滚动');
+  let capMoves = 0;
+  let taBack = 0;
+  for (const ch of '最大高度时继续打字') {
+    const tt = ta.scrollTop;
+    type(ch); await raf();
+    if (ta.offsetHeight !== capH || root.scrollTop !== capTop) capMoves++;
+    if (ta.scrollTop < tt) taBack++;
+  }
+  check(capMoves === 0 && taBack === 0 && taTop0 > 0, `最大高度时打字：高度与时间线都不动（${capMoves} 次），输入框内部没有往回滚（${taBack} 次，scrollTop ${Math.round(taTop0)}→${Math.round(ta.scrollTop)}）`);
+
+  // 发送后清空：回到一行，仍贴底
+  await setVal('');
+  check(ta.offsetHeight < 40 && getComputedStyle(ta).overflowY === 'hidden' && dist() <= 1, '清空后回到一行（' + ta.offsetHeight + 'px）且仍贴底');
+
+  // 输入框上方的横幅出现 / 消失：贴底保持贴底，中间保持不动
+  const b = $('fx-banner');
+  const bHidden = b.hidden, bText = b.textContent;
+  root.scrollTop = root.scrollHeight; await raf(); await raf();
+  b.textContent = '模拟提示条'; b.hidden = false; await raf(); await raf();
+  const dShown = dist();
+  b.hidden = true; await raf(); await raf();
+  const dHidden = dist();
+  root.scrollTop = Math.round((root.scrollHeight - root.clientHeight) / 2); await raf(); await raf();
+  const m0 = root.scrollTop;
+  b.hidden = false; await raf(); await raf();
+  const m1 = root.scrollTop;
+  b.hidden = true; await raf(); await raf();
+  check(dShown <= 1 && dHidden <= 1 && m1 === m0 && root.scrollTop === m0, '横幅出现/消失：贴底时仍贴底，停在中间时不动');
+  b.hidden = bHidden; b.textContent = bText;
+  for (const [el, v] of keep) el.style.overflowAnchor = v;
+  await setVal('');
+}
+
+// ---------- 统计条 ----------
+// 后端从屏幕/transcript 汇总 meta.stats（Python 单测覆盖计算）；这里用与真实 fixtures 一致的值检查展示。
+async function statsChecks() {
+  const bar = statsBar.el;
+  const part = (k) => bar.querySelector('.st-' + k);
+  const txt = (k) => part(k).textContent;
+  const vis = (el) => !!el && !el.hidden && getComputedStyle(el).display !== 'none';
+  const ring = () => part('ctx').querySelector('.st-ring');
+  const ringOffset = () => parseFloat(part('ctx').querySelector('.st-ring-fill').style.strokeDashoffset);
+  const nCalls = calls.length;
+  pushMeta({ state: 'idle', stats: null });
+  show('stream:after_stream');
+  await raf();
+  check(bar.hidden, '没有 meta.stats 时统计条隐藏');
+  // stream:after_stream 的状态栏 "3% 25k/1M $0.0035" + 上一轮（spinner 最终 211 tokens / 6s）
+  pushMeta({ stats: { context_used: 25000, context_limit: 1000000, context_pct: 3, context_source: 'status', context_approx: false,
+    cost_usd: 0.0035, cost_text: '$0.0035', cost_source: 'status', tok_s_live: null, tok_s_last: 35.2, last_turn_tokens: 211, last_turn_elapsed_s: 6, updated_at: Date.now() / 1000 } });
+  await raf();
+  check(!bar.hidden && bar.isConnected && bar.parentElement === $('fx-stats') && bar.closest('.composer-bar'), '统计在输入框底栏右侧的固定槽位');
+  check(vis(ring()) && ring().tagName.toLowerCase() === 'svg' && part('ctx').querySelector('.st-pct').textContent === '3%', '上下文 = 圆环 + 3%');
+  check(Math.abs(ringOffset() - RING_C * 0.97) < 0.01 && part('ctx').querySelector('.st-ring-fill').getAttribute('stroke-dasharray') === RING_C.toFixed(3),
+    '圆环 dashoffset 与百分比一致（' + ringOffset().toFixed(2) + ' = 周长 × 97%）');
+  check(!txt('ctx').includes('上下文') && !txt('ctx').includes('25k') && /25k \/ 1M/.test(part('ctx').title) && /25,000 \/ 1,000,000/.test(part('ctx').title),
+    '「上下文」与 25k / 1M 挪进 tooltip（界面只显示百分比）');
+  check(part('ctx').getAttribute('aria-label').startsWith('上下文已用 3%'), 'aria-label：上下文已用 3%');
+  check(!vis(part('ctx').querySelector('.st-approx')) && /状态栏/.test(part('ctx').title), '状态栏来源：不标“约”，tooltip 说明来源');
+  check(!part('ctx').classList.contains('warn'), '≤80% 不是警告色');
+  check(txt('cost').includes('$0.0035') && /Claude Code 状态栏/.test(part('cost').title), '花费 $0.0035（tooltip：来自 Claude Code 状态栏）');
+  check(vis(part('rate')) && txt('rate').includes('35 tok/s') && /上一轮/.test(part('rate').title) && /上一轮/.test(part('rate').getAttribute('aria-label')) && !part('rate').classList.contains('live'),
+    '空闲：35 tok/s（「上一轮」在 tooltip / aria-label 里）');
+  check(/211 tokens/.test(part('rate').title) && /6s/.test(part('rate').title), '上一轮 tooltip 给出口径（211 tokens ÷ 6s）');
+  // 忙：生成中速率
+  show('stream:busy_count');
+  pushMeta({ stats: { ...s.meta.stats, tok_s_live: 46.3 } });
+  await raf();
+  check(part('rate').classList.contains('live') && txt('rate').includes('46 tok/s') && !/上一轮/.test(part('rate').getAttribute('aria-label')), '生成中 46 tok/s');
+  check(vis(part('rate').querySelector('.st-dot')) && /生成中/.test(part('rate').title) && /thinking/.test(part('rate').title), '生成中：脉冲点 + tooltip 说明口径（含 thinking）');
+  pushMeta({ stats: { ...s.meta.stats, tok_s_live: null } });
+  await raf();
+  check(part('rate').classList.contains('pending') && txt('rate').includes('— tok/s'), '生成中但 spinner 还没有 token 数：— tok/s');
+  // 后备：transcript usage（约）+ 没有花费
+  show('stream:interrupted');
+  pushMeta({ stats: { context_used: 28303, context_limit: 200000, context_pct: 14.2, context_source: 'transcript', context_approx: true,
+    cost_usd: null, cost_text: null, cost_source: null, tok_s_live: null, tok_s_last: null } });
+  await raf();
+  check(vis(part('ctx').querySelector('.st-approx')) && txt('ctx').includes('14%') && /约 14% · 28.3k \/ 200k/.test(part('ctx').title), '后备：约 14%（tooltip：约 14% · 28.3k / 200k）');
+  check(/transcript/.test(part('ctx').title) && /200,000/.test(part('ctx').title), '后备 tooltip：transcript usage + 上限推断');
+  check(txt('cost').includes('—') && part('cost').classList.contains('empty') && /不自行/.test(part('cost').title), '没有状态栏花费：显示 —（不估价）');
+  check(!vis(part('rate')), '没有任何速率时不显示 tok/s');
+  // 只有百分比
+  pushMeta({ stats: { context_used: null, context_limit: null, context_pct: 45, context_source: 'status', cost_usd: 1.23, cost_text: '$1.23', cost_source: 'status' } });
+  await raf();
+  check(part('ctx').querySelector('.st-pct').textContent === '45%' && Math.abs(ringOffset() - RING_C * 0.55) < 0.01, '只有百分比：圆环 45%');
+  // 只有 token 数（没有上限 / 百分比）：不画圆环，直接显示数字
+  pushMeta({ stats: { context_used: 28303, context_limit: null, context_pct: null, context_source: 'status', cost_usd: 1.23, cost_text: '$1.23', cost_source: 'status' } });
+  await raf();
+  check(!vis(ring()) && part('ctx').querySelector('.st-pct').textContent === '28.3k', '只有 token 数：不画圆环，显示 28.3k');
+  // 警告色
+  pushMeta({ stats: { context_used: 170000, context_limit: 200000, context_pct: 85, context_source: 'status', cost_usd: 1.23, cost_text: '$1.23', cost_source: 'status' } });
+  await raf();
+  const fill = part('ctx').querySelector('.st-ring-fill');
+  const warnColor = getComputedStyle(part('ctx').querySelector('.st-pct')).color;
+  check(part('ctx').classList.contains('warn') && getComputedStyle(fill).stroke === warnColor, '>80% 圆环与百分比变警告色（' + warnColor + '）');
+  pushMeta({ stats: { ...s.meta.stats, context_used: 196000, context_pct: 98 } });
+  await raf();
+  const critColor = getComputedStyle(part('ctx').querySelector('.st-pct')).color;
+  check(part('ctx').classList.contains('crit') && !part('ctx').classList.contains('warn') && getComputedStyle(fill).stroke === critColor && critColor !== warnColor, '≥95% 危险色');
+  // 主题：变量在浅色/深色都有定义，且取值不同
+  const th = window.ccrTheme;
+  const prevPref = th ? th.pref() : 'system';
+  const vars = () => ['--stats-track', '--stats-fill', '--stats-live'].map((v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+  const track = () => getComputedStyle(part('ctx').querySelector('.st-ring-track')).stroke;
+  if (th) th.set('light', { persist: false });
+  await raf();
+  const lightVars = vars(), lightTrack = track();
+  if (th) th.set('dark', { persist: false });
+  await raf();
+  const darkVars = vars(), darkTrack = track();
+  if (th) th.set(prevPref, { persist: false });
+  await raf();
+  check(lightVars.every(Boolean) && darkVars.every(Boolean), '浅色/深色都定义了 --stats-* 变量');
+  check(lightTrack !== darkTrack, '圆环底槽随主题变化（' + lightTrack + ' / ' + darkTrack + '）');
+  check(calls.length === nCalls, '统计条不发任何请求');
+}
+
+// ---------- 侧栏「新回复」/「待处理」 ----------
+// 纯函数用 app.js 同一个 sessrow.js；侧栏行在本页临时画几行样例（与 app.js 相同的结构与 class），比对浅色/深色下的计算颜色。
+function rgbaOf(c) {
+  const m = String(c).match(/[\d.]+/g) || [];
+  return { r: +m[0] || 0, g: +m[1] || 0, b: +m[2] || 0, a: m.length > 3 ? +m[3] : 1 };
+}
+function over(top, base) {   // 半透明底色叠到不透明的底上
+  const a = top.a;
+  return { r: top.r * a + base.r * (1 - a), g: top.g * a + base.g * (1 - a), b: top.b * a + base.b * (1 - a), a: 1 };
+}
+function relLum(c) {
+  const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+  return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+}
+function contrast(a, b) { const x = relLum(a), y = relLum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+
+async function sessRowChecks() {
+  const nCalls = calls.length;
+  const base = { state: 'idle', link: 'ready' };
+  const st = (meta, x = {}) => sessionStatus({ meta: { ...base, ...meta }, dialog: null, busy: false, subRunning: 0, jobEnded: false, localSeen: null, ...x });
+  const U = { done_at: 1.7e9, seen_at: null, unread: true };
+  // 状态优先级：死状态 > 待处理 > 运行中 > 新回复 > 空闲
+  check(st(U)[0] === 'unread' && st(U)[1] === '新回复' && st({})[0] === 'ready', '未读且空闲 → 新回复；没有未读 → 空闲');
+  check(st(U, { dialog: { kind: 'permission' } })[0] === 'pending' && st({ ...U, state: 'waiting' })[1] === '待处理'
+    && st({ ...U, state: 'trust' })[1] === '待信任目录', '待处理（对话框 / 信任目录）压过新回复');
+  check(st(U, { busy: true })[1] === '运行中' && st(U, { subRunning: 2 })[1] === '子代理运行中', '运行中 / 子代理运行中压过新回复（新一轮刚开始 meta.unread 还没清）');
+  check(st({ ...U, state: 'exited' })[0] === 'exited' && st({ ...U, state: 'error' })[0] === 'error'
+    && st({ ...U, link: 'down' })[1] === '连接断开' && st({ ...U, state: 'starting' })[1] === '启动中'
+    && st({ ...U, state: 'exited' }, { jobEnded: true })[1] === '作业已结束', '死状态 / 断线 / 启动中最高');
+  check(st({ ...U, state: 'waiting' }, { busy: true })[0] === 'pending', '待处理压过运行中');
+  // 未读判定：meta.unread 为准；本页已乐观标为已读同一个 done_at → 不再显示
+  check(!isUnread({ unread: true }) && !isUnread({ unread: false, done_at: 1 }) && isUnread(U) && !isUnread(U, U.done_at)
+    && isUnread(U, U.done_at - 1) && st(U, { localSeen: U.done_at })[0] === 'ready', 'isUnread：缺 done_at / 已读 / 乐观已读都不算');
+  // 行 class
+  check(rowClass('unread', false) === 'sess unread' && rowClass('pending', true) === 'sess active attn' && rowClass('ready', true) === 'sess active'
+    && rowClass('error', false) === 'sess' && rowClass('busy', false) === 'sess', '行 class：unread / attn / active，错误与运行中无底色');
+  // 窗口标题未读数（与原生壳 main.swift 同一规则）
+  const sts = [st(U), st(U, { busy: true }), st({ ...U, done_at: 1.8e9 }), st({}), st(U, { dialog: { kind: 'ask' } })];
+  check(unreadCount(sts) === 2 && docTitle(unreadCount(sts)) === '(2) ' + APP_TITLE && docTitle(0) === APP_TITLE, '标题未读数 = 显示「新回复」的行数：' + docTitle(unreadCount(sts)));
+  check(titleCount('(12) CC Remote Chat') === 12 && titleCount(APP_TITLE) === 0 && titleCount('(3)x') === 0 && titleCount('(ab) x') === 0, '标题前缀解析（程序坞角标）');
+  // 样例侧栏：普通空闲 / 新回复 / 待处理 / 错误 / 选中×三种
+  const side = h('div', { class: 'fx-side' });
+  side.style.position = 'fixed'; side.style.left = '0'; side.style.top = '0'; side.style.width = '288px';
+  side.style.zIndex = '50'; side.style.padding = '8px'; side.style.background = 'var(--bg-side)';
+  const mk = (stt, active, title) => {
+    const [cls, text] = stt;
+    return h('div', { class: rowClass(cls, active), 'data-k': cls + (active ? '-active' : '') },
+      h('span', { class: 'dot st-' + cls, title: text }),
+      h('div', { class: 'sess-main' }, h('div', { class: 'sess-title' }, title),
+        h('div', { class: 'sess-sub' }, h('span', { class: 'mono' }, 'job 123456'), h('span', { class: 'st-label st-' + cls }, text))));
+  };
+  side.append(mk(st({}), false, '普通空闲'), mk(st(U), false, '有新回复'), mk(st({ state: 'waiting' }), false, '等待审批'),
+    mk(['error', '错误'], false, '出错了'), mk(st({}), true, '选中·空闲'), mk(st(U), true, '选中·新回复'), mk(st({ state: 'trust' }), true, '选中·待信任'));
+  document.body.appendChild(side);
+  const row = (k) => side.querySelector('[data-k="' + k + '"]');
+  const th = window.ccrTheme;
+  const prevPref = th.pref();
+  for (const theme of ['light', 'dark']) {
+    th.set(theme, { persist: false }); await raf();
+    const sideBg = rgbaOf(getComputedStyle(side).backgroundColor);
+    const bgOf = (k) => over(rgbaOf(getComputedStyle(row(k)).backgroundColor), sideBg);
+    const fmt = (c) => 'rgb(' + [c.r, c.g, c.b].map((v) => Math.round(v)).join(',') + ')';
+    const plain = bgOf('ready'), unread = bgOf('unread'), attn = bgOf('pending'), err = bgOf('error');
+    const act = bgOf('ready-active'), unreadAct = bgOf('unread-active'), attnAct = bgOf('pending-active');
+    const redness = (c) => c.r - (c.g + c.b) / 2;
+    const yellowness = (c) => (c.r + c.g) / 2 - c.b;
+    const tag = theme === 'light' ? '浅色' : '深色';
+    check(redness(unread) > redness(plain) + 4 && fmt(unread) !== fmt(plain), tag + '：新回复行偏红（' + fmt(unread) + ' vs 普通 ' + fmt(plain) + '）');
+    check(yellowness(attn) > yellowness(plain) + 4 && redness(attn) < redness(unread) + 20 && fmt(attn) !== fmt(unread), tag + '：待处理行偏黄（' + fmt(attn) + '）');
+    check(fmt(err) === fmt(plain), tag + '：错误行没有底色（只靠红点/红字，与新回复区分）');
+    check(redness(unreadAct) > redness(act) + 4 && redness(unreadAct) > redness(unread) && /inset/.test(getComputedStyle(row('unread-active')).boxShadow),
+      tag + '：选中的新回复行仍明显偏红（' + fmt(unreadAct) + ' vs 选中 ' + fmt(act) + '）+ 左侧色条');
+    check(yellowness(attnAct) > yellowness(act) + 4 && /inset/.test(getComputedStyle(row('pending-active')).boxShadow), tag + '：选中的待处理行仍偏黄（' + fmt(attnAct) + '）+ 左侧色条');
+    const dot = getComputedStyle(row('unread').querySelector('.dot'));
+    const errDot = getComputedStyle(row('error').querySelector('.dot'));
+    check(dot.animationName === 'none' && dot.boxShadow !== 'none' && errDot.boxShadow === 'none' && dot.backgroundColor === errDot.backgroundColor,
+      tag + '：新回复是实心红点 + 光圈、静态；错误红点无光圈');
+    const tw = (k) => Number(getComputedStyle(row(k).querySelector('.sess-title')).fontWeight);
+    check(tw('unread') > tw('ready') && tw('unread-active') > tw('ready-active'), tag + '：新回复标题加粗（' + tw('unread') + ' vs ' + tw('ready') + '）');
+    const ratios = ['unread', 'pending', 'unread-active', 'pending-active'].map((k) => contrast(rgbaOf(getComputedStyle(row(k).querySelector('.sess-sub')).color), bgOf(k)));
+    check(ratios.every((x) => x >= 4.5), tag + '：浅红/浅黄底上第二行文字对比度 ≥ 4.5（' + ratios.map((x) => x.toFixed(2)).join(' / ') + '）');
+    const lbl = contrast(rgbaOf(getComputedStyle(row('unread').querySelector('.st-label')).color), unread);
+    check(lbl >= 3, tag + '：「新回复」红色标签对比度 ' + lbl.toFixed(2) + ' ≥ 3（加粗）');
+  }
+  th.set(prevPref, { persist: false }); await raf();
+  side.remove();
+  check(calls.length === nCalls, '侧栏状态判定与渲染不发任何请求');
+}
+
+// ---------- 输入框底栏 ----------
+async function composerBarChecks() {
+  const bar = document.querySelector('.fx .composer-bar');
+  const ta = $('fx-input');
+  const vis = (el) => !!el && !el.hidden && getComputedStyle(el).display !== 'none' && el.getClientRects().length > 0;
+  const part = (k) => statsBar.el.querySelector('.st-' + k);
+  const menu = () => document.querySelector('.popover.mode-menu');
+  const nCalls = calls.length;
+  pushMeta({ state: 'idle', link: 'ready', stats: { context_used: 25000, context_limit: 1000000, context_pct: 3, context_source: 'status', cost_usd: 0.0035, cost_text: '$0.0035', cost_source: 'status', tok_s_last: 35.2 } });
+  show('stream:ready');
+  await raf();
+  // 胶囊：一个外框里两个点击区（左 = 模型，右 = effort），中间细分隔线
+  const cap = document.querySelector('#fx-ctl .cb-capsule');
+  const kids = cap ? [...cap.children] : [];
+  check(kids.length === 3 && kids[0] === $('fx-model-btn') && kids[1].classList.contains('cb-div') && kids[2] === $('fx-effort-btn'), '模型/effort 是一个胶囊、两个点击区（中间分隔线）');
+  check($('fx-model-btn').textContent.includes('Haiku 5.5') && $('fx-effort-btn').textContent.trim() === 'low'
+    && /切换模型/.test($('fx-model-btn').title) && /调整 effort/.test($('fx-effort-btn').title), '左半显示模型、右半显示 effort，各自 title');
+  check(getComputedStyle($('fx-effort-btn')).color !== getComputedStyle($('fx-model-btn')).color, 'effort 用弱化色');
+  check($('fx-mode').nextElementSibling === $('fx-cycle') && /Shift\+Tab/.test($('fx-cycle').textContent), '模式 chip 旁保留 Shift+Tab 小按钮');
+  // 内容不变不重建（hover 不丢、不闪）
+  const capEl = cap, modeEl = $('fx-mode');
+  renderChrome(); renderChrome();
+  check(document.querySelector('#fx-ctl .cb-capsule') === capEl && $('fx-mode') === modeEl, 'key 不变时底栏控件不重建');
+  // 运行中：模型/effort 禁用（title 说原因），模式与 Shift+Tab 仍可用
+  show('stream:busy_count');
+  await raf();
+  check($('fx-model-btn').disabled && $('fx-effort-btn').disabled && /运行中/.test($('fx-model-btn').title) && /运行中/.test($('fx-effort-btn').title), '运行中：胶囊两半都禁用，title 说明原因');
+  check(!$('fx-mode').disabled && !$('fx-cycle').disabled, '运行中：权限模式与 Shift+Tab 仍可用');
+  check(/运行中/.test(ta.placeholder) && !$('fx-stop').hidden, '运行中：提示写在占位文字里，底栏显示中断');
+  check(document.querySelector('#fx-ctl .cb-capsule') !== capEl && $('fx-mode') === modeEl, '只重建变了的部分（胶囊重建、模式 chip 不动）');
+  // 已退出：全部禁用，统计变淡
+  pushMeta({ state: 'exited' });
+  show('stream:ready');
+  await raf();
+  check($('fx-model-btn').disabled && $('fx-cycle').disabled && !$('fx-mode').disabled && /已退出/.test($('fx-model-btn').title) && /已退出/.test($('fx-cycle').title) && statsBar.el.classList.contains('dead'),
+    '已退出：模型/effort/Shift+Tab 禁用（模式列表仍可打开选「需重启」），统计变淡');
+  pushMeta({ state: 'idle', link: 'down' });
+  await raf();
+  check($('fx-model-btn').disabled && $('fx-cycle').disabled && /连接已断开/.test($('fx-cycle').title), '断线：禁用并说明原因');
+  pushMeta({ state: 'idle', link: 'ready' });
+  await raf();
+  check(!$('fx-model-btn').disabled && !$('fx-effort-btn').disabled && !$('fx-cycle').disabled, '恢复后重新可用');
+  // 没有会话：清空；再渲染时恢复
+  ctl.update(null);
+  check(!$('fx-ctl').children.length, '没有活动会话时左侧控件组清空');
+  renderChrome();
+  check(!!$('fx-model-btn') && !!$('fx-mode'), '重新渲染后恢复');
+
+  // 模式菜单：从底栏向上弹，不出窗口；打开期间 chip 保持填充
+  show('dialogs:final');
+  await raf();
+  await click($('fx-mode'), '模式 chip');
+  let pop = menu();
+  const cr = $('fx-mode').getBoundingClientRect();
+  const pr = pop ? pop.getBoundingClientRect() : null;
+  check(!!pop && pr.top >= 0 && pr.bottom <= innerHeight && pr.left >= 0 && pr.right <= innerWidth, '模式菜单完整在窗口内（' + (pr ? Math.round(pr.top) + '–' + Math.round(pr.bottom) : '-') + ' / ' + innerHeight + '）');
+  check(!!pr && pr.bottom <= cr.top, '模式菜单在 chip 上方弹出');
+  check($('fx-mode').getAttribute('aria-expanded') === 'true' && getComputedStyle($('fx-mode')).backgroundColor !== 'rgba(0, 0, 0, 0)', '菜单打开时 chip 保持填充');
+  check(pop && pop.querySelector('.mode-row.on .mode-id')?.textContent === 'manual', '菜单标出当前 manual');
+  check(calls.length === nCalls, '打开菜单不发请求');
+  // 菜单开着时模式变了（终端里按了 Shift+Tab）：底栏重建，菜单挂到新 chip 上并刷新「当前」
+  const oldChip = $('fx-mode');
+  show('stream:ready');
+  await raf();
+  pop = menu();
+  check($('fx-mode') !== oldChip && !!pop && $('fx-mode').getAttribute('aria-expanded') === 'true' && pop.querySelector('.mode-row.on .mode-id')?.textContent === 'auto',
+    '菜单打开时模式变化：在新 chip 上重新打开，当前 = auto');
+  check(document.querySelectorAll('.popover.mode-menu').length === 1, '始终只有一个模式菜单');
+  await click([...pop.querySelectorAll('.mode-row')].find((b) => b.querySelector('.mode-id')?.textContent === 'plan'), '选 plan');
+  check(calls.at(-1)?.op === 'mode' && calls.at(-1).body.mode === 'plan' && !menu() && $('fx-mode').getAttribute('aria-expanded') === 'false', '选循环里的模式 → mode {plan}，菜单关闭');
+  await click($('fx-mode'), '模式 chip');
+  await click($('fx-mode'), '模式 chip（再点一次）');
+  check(!menu(), '再点一次 chip 收起菜单');
+  await click($('fx-mode'), '模式 chip');
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  check(!menu() && $('fx-mode').getAttribute('aria-expanded') === 'false', 'Esc 关闭菜单');
+
+  // 底栏：固定高度、不换行；右侧统计 + 中断 + 发送永远完整可见；按宽度分级折叠
+  show('stream:busy_count');
+  pushMeta({ stats: { ...s.meta.stats, tok_s_live: 46.3 } });
+  await raf();
+  const taW = ta.offsetWidth;
+  const LEVELS = [
+    { w: 720, stopText: true, rate: true, cost: true, pct: true, modeName: true },
+    { w: 660, stopText: false, rate: true, cost: true, pct: true, modeName: true },
+    { w: 580, stopText: false, rate: false, cost: true, pct: true, modeName: true },
+    { w: 500, stopText: false, rate: false, cost: false, pct: true, modeName: true },
+    { w: 380, stopText: false, rate: false, cost: false, pct: false, modeName: false },
+  ];
+  for (const L of LEVELS) {
+    bar.style.width = L.w + 'px';
+    await raf();
+    const br = bar.getBoundingClientRect();
+    const send = $('fx-send').getBoundingClientRect(), stop = $('fx-stop').getBoundingClientRect(), st = statsBar.el.getBoundingClientRect();
+    const oneRow = [...bar.children].filter(vis).every((c) => { const r = c.getBoundingClientRect(); return r.top >= br.top - 0.5 && r.bottom <= br.bottom + 0.5; });
+    check(getComputedStyle(bar).flexWrap === 'nowrap' && bar.offsetHeight === 32 && oneRow, L.w + 'px：底栏一行、高 32px（' + bar.offsetHeight + '）');
+    check(send.right <= br.right + 0.5 && stop.right <= send.left && st.right <= stop.left + 0.5 && vis(part('ctx').querySelector('.st-ring')), L.w + 'px：圆环、中断、发送完整可见且不重叠');
+    const got = { stopText: vis($('fx-stop').querySelector('.stop-text')), rate: vis(part('rate')), cost: vis(part('cost')), pct: vis(part('ctx').querySelector('.st-pct')), modeName: vis($('fx-mode').querySelector('.cb-label')) };
+    check(Object.keys(got).every((k) => got[k] === L[k]), L.w + 'px：折叠 ' + JSON.stringify(got));
+  }
+  bar.style.width = '';
+  await raf();
+  check(ta.offsetWidth === taW, '底栏折叠不影响输入框宽度');
+  // 很长的模型名：省略号截断，不撑宽输入框、不换行
+  const box = bar.closest('.composer-box');
+  const keepModel = s.modelInfo.model;
+  s.modelInfo.model = 'claude-some-extremely-long-custom-model-name-for-testing[1m]';
+  renderChrome();
+  await raf();
+  const lbl = $('fx-model-btn').querySelector('.cb-label');
+  check(lbl.clientWidth <= 161 && lbl.scrollWidth > lbl.clientWidth && box.scrollWidth <= box.clientWidth && bar.offsetHeight === 32 && ta.offsetWidth === taW,
+    '长模型名省略号截断（' + lbl.clientWidth + 'px），底栏不撑宽、不换行');
+  s.modelInfo.model = keepModel;
+  renderChrome();
+  show('stream:interrupted');
+  await raf();
+  check(calls.length === nCalls + 1, '底栏检查期间只有用户点击的一次 mode 请求');
+}
+
+// ---------- 可视化（§10）：桩 api（stat/open）+ 桩 blob 取回，不连后端 ----------
+const VCWD = '/Users/demo/proj';
+const VFILES = {
+  [VCWD + '/site/index.html']: { kind: 'html', url: '/static/dev/viz_demo.html', size: 420 },
+  [VCWD + '/site/style.css']: { kind: 'text', url: '/static/dev/viz_demo.css', size: 180 },
+  [VCWD + '/shot.png']: { kind: 'image', url: '/static/favicon.png', size: 2048 },
+};
+let vizStatCalls = 0;
+const vizBatchSizes = [];
+let vizPanel = null;
+function ensureVizPanel() {
+  if (!vizPanel) vizPanel = new PreviewPanel({ host: document.querySelector('.fx-main'), chgKey: FX_CHG_KEY, onState: () => fxChgSync() });
+  return vizPanel;
+}
+const vizApi = {
+  token: '',
+  sessionPath: (sid, tail) => '/api/sessions/' + encodeURIComponent(sid) + tail,
+  post: async (path, body) => {
+    if (path.endsWith('/local/stat')) {
+      vizStatCalls++;
+      vizBatchSizes.push((body.paths || []).length);
+      if ((body.paths || []).length > STAT_BATCH) throw new Error('一次 stat 超过 ' + STAT_BATCH + ' 个路径');
+      return { results: (body.paths || []).map((p) => {
+        const abs = p.startsWith('/') ? p : VCWD + '/' + p;
+        const f = VFILES[abs] || (abs.startsWith(VCWD + '/many/') ? { kind: 'text', url: '/static/dev/viz_demo.css', size: 1 } : null);
+        return f ? { path: p, abs, real: abs, exists: true, type: 'file', ok: true, mtime: 1, ...f }
+          : { path: p, abs, exists: false, ok: false, reason: '文件不存在' };
+      }) };
+    }
+    if (path.endsWith('/local/open')) { record('local/open', body); return { ok: true }; }
+    throw new Error('回放页不支持：' + path);
+  },
+};
+
+function refPng(ref) {
+  const c = document.createElement('canvas');
+  c.width = 480; c.height = 300;
+  const g = c.getContext('2d');
+  let hsh = 0;
+  for (const ch of ref) hsh = (hsh * 31 + ch.charCodeAt(0)) >>> 0;
+  g.fillStyle = 'hsl(' + (hsh % 360) + ', 55%, 60%)';
+  g.fillRect(0, 0, 480, 300);
+  g.fillStyle = '#fff';
+  g.font = 'bold 28px sans-serif';
+  g.fillText('ccr_ref ' + ref.slice(-6), 30, 160);
+  return c.toDataURL('image/png');
+}
+
+function vizEntries() {
+  const U = (i) => '00000000-0000-4000-8000-' + String(i).padStart(12, '0');
+  const ref = (n) => ({ type: 'image', source: { type: 'ccr_ref', media_type: 'image/png', ref: 'm.59dd443a-c637-4148-bf1c-fd720f2e5b1f.' + (1000 * n) + '.0-1.' + String(n).repeat(16).slice(0, 16), bytes: 150000 } });
+  const base = (i, type, extra) => ({ type, uuid: U(i), cwd: VCWD, sessionId: '59dd443a-c637-4148-bf1c-fd720f2e5b1f', timestamp: new Date().toISOString(), ...extra });
+  const asst = (i, content, stop) => base(i, 'assistant', { message: { id: 'msg_v' + i, role: 'assistant', content, stop_reason: stop || 'tool_use' } });
+  const res = (i, id, content, tur) => base(i, 'user', { message: { role: 'user', content: [{ tool_use_id: id, type: 'tool_result', content }] }, ...(tur ? { toolUseResult: tur } : {}) });
+  const html = '<!doctype html>\n<html>\n<head>\n<title>x</title>\n</head>\n<body>\n<p>hi</p>\n</body>\n</html>';
+  return [
+    base(1, 'user', { message: { role: 'user', content: [{ type: 'text', text: '做个网页并截图看看' }, ref(1)] }, origin: { kind: 'human' }, promptSource: 'typed' }),
+    asst(2, [{ type: 'thinking', thinking: '先截图，再写页面。' }]),
+    asst(3, [{ type: 'tool_use', id: 'tv1', name: 'mcp__chrome-devtools__take_screenshot', input: { pageId: 1 } }]),
+    res(4, 'tv1', [{ type: 'text', text: 'Took a screenshot' }, { ...ref(2), source: { ...ref(2).source, ref: ref(2).source.ref.replace('.0-1.', '.0-1.') } }, { type: 'text', text: '[Image]' }],
+      [{ type: 'text', text: 'Took a screenshot' }, { type: 'image', source: { type: 'ccr_dropped', media_type: 'image/png' } }]),
+    asst(5, [{ type: 'tool_use', id: 'tv2', name: 'Write', input: { file_path: VCWD + '/site/index.html', content: html } }]),
+    res(6, 'tv2', 'File created successfully', { type: 'create', filePath: VCWD + '/site/index.html', content: html, structuredPatch: [] }),
+    asst(7, [{ type: 'tool_use', id: 'tv3', name: 'Edit', input: { file_path: VCWD + '/site/index.html', old_string: '<p>hi</p>', new_string: '<h1>标题</h1>\n<p>hi!</p>' } }]),
+    res(8, 'tv3', 'The file has been updated', { filePath: VCWD + '/site/index.html', structuredPatch: [{ oldStart: 5, oldLines: 3, newStart: 5, newLines: 4, lines: [' </head>', ' <body>', '-<p>hi</p>', '+<h1>标题</h1>', '+<p>hi!</p>', ' </body>'] }] }),
+    asst(9, [{ type: 'tool_use', id: 'tv4', name: 'Bash', input: { command: 'python3 tools/shot.py --out ' + VCWD + '/shot.png && echo ok' } }]),
+    res(10, 'tv4', 'saved ' + VCWD + '/shot.png\nServing on http://localhost:5173/'),
+    asst(11, [{ type: 'tool_use', id: 'tv5', name: 'Read', input: { file_path: VCWD + '/shot.png' } }]),
+    res(12, 'tv5', [ref(3)], { type: 'image', file: { type: 'image/png', ccr_dropped: 'base64' } }),
+    asst(13, [{ type: 'text', text: '完成：页面在 `site/index.html:5`，样式 [style](site/style.css)，缺少 `site/nope.txt`。\n\n预览 http://localhost:5173/ ，本程序 http://127.0.0.1:' + (location.port || '80') + '/ 不应可预览。\n\n![截图](shot.png)' }], 'end_turn'),
+    base(14, 'system', { subtype: 'turn_duration', durationMs: 1234, content: '' }),
+  ];
+}
+
+async function vizChecks() {
+  ensureVizPanel();
+  initViz({ api: vizApi, getConfig: () => ({}), toast: (t) => log('（toast）' + t), panel: vizPanel });
+  _setBlobLoader((d) => refPng(d.ref));
+  const nCalls = calls.length;
+  s.localOverride = true;
+  pushTranscript(vizEntries(), true);
+  await raf(); flushNow(s);
+  // 滚到各处，触发 IntersectionObserver 懒加载
+  for (const el of qa('.cimg')) { el.scrollIntoView({ block: 'center' }); await raf(); }
+  await sleep(300);
+  const imgs = qa('.cimg');
+  check(qa('.k-user .cimg').length === 1 && qa('.k-tool .viewed-imgs .cimg').length === 2, '用户粘贴图 + MCP 截图 + Read 缩略图条（ccr_ref）');
+  check(imgs.filter((e) => e._img && e._img.ref).every((e) => e.classList.contains('ready')), 'ccr_ref 图片进入视口后加载完成（' + imgs.length + ' 张）');
+  check(!!q('.k-thinking') && q('.k-thinking .think-label').textContent === '思考', '思考块标签为“思考”');
+  check(/5 个工具调用：/.test((q('.tool-group-sum') || {}).textContent || '') && /读取 1 个文件/.test(q('.tool-group-sum').textContent), '工具组摘要：' + ((q('.tool-group-sum') || {}).textContent || ''));
+  // 灯箱
+  const readThumb = q('.k-tool.cat-read .viewed-imgs .cimg');
+  readThumb.click();
+  await sleep(120);
+  const lb = document.querySelector('.lb');
+  check(!!lb && /2 \/ 2|1 \/ 2/.test(lb.querySelector('.lb-count').textContent), '点击缩略图打开灯箱（同组 MCP 截图 + Read 图片可切换）');
+  const before = lb.querySelector('.lb-count').textContent;
+  const finder = () => !lb.querySelector('.lb-btn[title="在 Finder 中显示"]').hidden;
+  check(finder() && !!lb.querySelector('.lb-btn[title="复制图片"]') && !!lb.querySelector('.lb-btn[title="下载"]'), '本机 Read 图片：复制 / 下载 / 在 Finder 中显示');
+  lb.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+  await sleep(80);
+  check(lb.querySelector('.lb-count').textContent !== before && !finder(), '← 切换到上一张（MCP 截图没有本机路径 → 不显示 Finder 按钮）：' + lb.querySelector('.lb-count').textContent);
+  const z0 = lb.querySelector('.lb-zoom').textContent;
+  lb.dispatchEvent(new KeyboardEvent('keydown', { key: '+', bubbles: true }));
+  await raf();
+  const wheel = new WheelEvent('wheel', { deltaY: -120, ctrlKey: true, bubbles: true, cancelable: true, clientX: 300, clientY: 300 });
+  const notPrevented = lb.querySelector('.lb-view').dispatchEvent(wheel);
+  check(lb.querySelector('.lb-zoom').textContent !== z0 && !notPrevented, 'Ctrl+滚轮/+ 缩放（拦住页面缩放）：' + z0 + ' → ' + lb.querySelector('.lb-zoom').textContent);
+  lb.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await raf();
+  check(!document.querySelector('.lb'), 'Esc 关闭灯箱');
+  // 文件 chip（本机）
+  await sleep(120);
+  const chips = qa('.k-text .fchip');
+  check(chips.length >= 3, '回复里的路径变成文件 chip（' + chips.map((c) => c.textContent).join(' / ') + '）');
+  check(chips.some((c) => c.classList.contains('ok')) && chips.some((c) => c.classList.contains('missing')), '存在的文件可点、不存在的灰显');
+  const pvBtns = qa('.k-text .url-pv');
+  check(pvBtns.length === 1, 'localhost 链接可“预览”，本 app 端口不行');
+  check(qa('.k-text .cimg.md-img').length === 1, 'markdown 本机图片显示缩略图');
+  // 本轮改动 / 网页预览 / 本轮图片
+  const tc = q('.k-turnsum .tc-changes');
+  check(!!tc && /1 个文件/.test(tc.textContent) && /\+11/.test(tc.textContent) && /−1/.test(tc.textContent), '本轮改动：1 个文件 +11 −1（新建 9 行 + Edit +2/−1）');
+  const web = q('.k-turnsum .web-card');
+  await sleep(150);
+  const fr = web && web.querySelector('iframe');
+  check(!!fr && fr.getAttribute('sandbox') === 'allow-scripts allow-forms allow-popups allow-modals', '网页预览卡片：沙箱 iframe（无 allow-same-origin）');
+  check(!!q('.k-turnsum .tc-images') && !q('.k-turnsum .tc-images').hidden, '本轮图片（Bash 输出里的 png 经 stat 确认）');
+  // diff 面板
+  await click(q('.tc-row'), '本轮改动文件行');
+  await raf();
+  const pv = document.querySelector('.pv');
+  check(pv && !pv.hidden && !!pv.querySelector('.pv-diff .diff.patch'), '点击文件 → 右侧面板 diff 标签');
+  const lns = [...pv.querySelectorAll('.pv-diff .diff.patch .diff-del .ln')].map((e) => e.textContent).filter(Boolean);
+  check(lns.includes('7'), 'diff 带旧行号（删除行 = 7）');
+  // 文件标签
+  await click(chips.find((c) => c.classList.contains('ok')), '文件 chip');
+  await sleep(200);
+  check(pv.querySelectorAll('.pv-tab').length === 2, '文件 chip → 新标签（' + [...pv.querySelectorAll('.pv-tab')].map((t) => t.textContent).join(' | ') + '）');
+  check(!!pv.querySelector('.pv-view iframe[sandbox]') || !!pv.querySelector('.pv-gutter'), 'HTML 用沙箱 iframe / 文本带行号');
+  // 一次超过 200 个路径：分批查询，第 200 个以后的不能被当成"不存在"
+  const many = Array.from({ length: 250 }, (_, k) => VCWD + '/many/f' + k + '.txt');
+  const nb = vizBatchSizes.length;
+  const manyRes = await Promise.all(many.map((p) => statPath(s, p)));
+  const sizes = vizBatchSizes.slice(nb);
+  check(manyRes.every((r) => r && r.exists) && sizes.length >= 2 && sizes.every((n) => n <= STAT_BATCH),
+    'stat 250 个路径：分 ' + sizes.length + ' 批（' + sizes.join('+') + '），全部拿到真实结果');
+  // 引用图片同一时间最多取 BLOB_CONCURRENCY 张
+  let active = 0, peak = 0;
+  await Promise.all(Array.from({ length: 6 }, () => limitBlob(async () => { active++; peak = Math.max(peak, active); await sleep(25); active--; })));
+  check(peak === BLOB_CONCURRENCY && BLOB_CONCURRENCY === 2, '引用图片取回并发上限 = ' + peak);
+  // 彩色区分
+  const root = document.documentElement;
+  const th = window.ccrTheme;
+  const catColor = () => getComputedStyle(q('.k-tool.cat-edit')).borderLeftColor;
+  const varOf = (v) => getComputedStyle(root).getPropertyValue(v).trim();
+  th.setColorful(true, { persist: false });
+  await raf();
+  const onColor = catColor();
+  th.setColorful(false, { persist: false });
+  await raf();
+  const offColor = catColor();
+  th.setColorful(true, { persist: false });
+  check(onColor !== offColor, '彩色区分开/关：编辑类工具色条 ' + onColor + ' / ' + offColor);
+  const prevPref = th.pref();
+  th.set('light', { persist: false }); await raf();
+  const lightVars = ['--c-read', '--c-edit', '--c-think', '--c-user-bg'].map(varOf);
+  const lum = (c) => { const m = c.match(/\d+(\.\d+)?/g).slice(0, 3).map(Number).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]; };
+  const ratio = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const probe = h('span', { class: 'muted' }, 'x');
+  document.body.appendChild(probe);
+  const mutedRatio = ratio(getComputedStyle(probe).color, getComputedStyle(document.body).backgroundColor);
+  th.set('dark', { persist: false }); await raf();
+  const darkVars = ['--c-read', '--c-edit', '--c-think', '--c-user-bg'].map(varOf);
+  th.set(prevPref, { persist: false }); await raf();
+  probe.remove();
+  check(lightVars.every(Boolean) && darkVars.every(Boolean) && lightVars.join() !== darkVars.join(), '语义色在浅色/深色都有定义且不同');
+  check(mutedRatio >= 4.5, '浅色弱化文字对比度 ' + mutedRatio.toFixed(2) + ':1 ≥ 4.5');
+  // 服务器会话：只有改动卡片 + diff，文件 chip 只复制路径，没有网页/图片预览
+  vizPanel.closeAll();
+  s.localOverride = false;
+  pushTranscript(vizEntries(), true);
+  await raf(); flushNow(s);
+  await sleep(100);
+  check(!q('.web-card') && !q('.tc-images') && !!q('.tc-changes'), '服务器会话：保留本轮改动，无网页预览 / 本轮图片');
+  check(qa('.k-text .fchip').every((c) => c.classList.contains('remote')) && !q('.k-text .url-pv'), '服务器会话：chip 只复制路径，不提供 localhost 预览');
+  await click(q('.tc-row'), '服务器会话的改动行');
+  await raf();
+  check(!!document.querySelector('.pv:not([hidden]) .pv-diff'), '服务器会话也能打开 diff（数据来自 structuredPatch）');
+  vizPanel.closeAll();
+  s.localOverride = null;
+  check(calls.length === nCalls, '可视化部分没有发出任何按键/操作请求（stat ' + vizStatCalls + ' 次，只读）');
+}
+
+// ---------- 右侧「代码改动」栏（changes.js，SPEC §10.4「改动」标签） ----------
+// 构造的两轮编辑（形状照真实 CLI 的 toolUseResult：Edit / Write create / NotebookEdit / 被拒绝 / 失败 / 截断）+ 一个子代理的编辑。
+const CCWD = '/Users/demo/calc';
+const CHG_AGENT = 'agfx1';
+function chgEntries() {
+  const U = (i) => '00000000-0000-4000-9000-' + String(i).padStart(12, '0');
+  const t0 = Date.parse('2026-11-24T06:00:00Z');
+  const base = (i, type, extra) => ({ type, uuid: U(i), cwd: CCWD, sessionId: 'chg-fx', timestamp: new Date(t0 + i * 1000).toISOString(), ...extra });
+  const say = (i, text) => base(i, 'user', { message: { role: 'user', content: [{ type: 'text', text }] }, origin: { kind: 'human' }, promptSource: 'typed' });
+  const use = (i, id, name, input, extra) => base(i, 'assistant', { message: { id: 'msg_c' + i, role: 'assistant', content: [{ type: 'tool_use', id, name, input }], stop_reason: 'tool_use' }, ...extra });
+  const res = (i, id, content, tur, extra = {}) => base(i, 'user', { message: { role: 'user', content: [{ tool_use_id: id, type: 'tool_result', content, ...(extra.isError ? { is_error: true } : {}) }] },
+    ...(tur !== undefined ? { toolUseResult: tur } : {}), ...(extra.denied ? { toolDenialKind: 'user-rejected' } : {}), ...(extra.truncated ? { truncated: true } : {}) });
+  const done = (i, text) => [base(i, 'assistant', { message: { id: 'msg_c' + i, role: 'assistant', content: [{ type: 'text', text }], stop_reason: 'end_turn' } }),
+    base(i + 1, 'system', { subtype: 'turn_duration', durationMs: 3000, content: '' })];
+  const calc = CCWD + '/calc.py', notes = CCWD + '/notes.txt', strs = CCWD + '/utils/strings.py';
+  const p1 = [{ oldStart: 4, oldLines: 3, newStart: 4, newLines: 13, lines: [' ', ' def sub(a, b):', '     return a - b', '+', '+', '+def mul(a, b):', '+    return a * b',
+    '+', '+', '+def div(a, b):', '+    if b == 0:', '+        raise ValueError("division by zero")', '+    return a / b'] }];
+  const p2 = [{ oldStart: 1, oldLines: 2, newStart: 1, newLines: 3, lines: [' hello', '-world', '+there', '+bye'] }];
+  const p3 = [{ oldStart: 14, oldLines: 3, newStart: 14, newLines: 3, lines: ['     if b == 0:', '         raise ValueError("division by zero")', '-    return a / b', '+    return a // b'] }];
+  const shout = 'def shout(s):\n    return s.upper() + "!"\n';
+  const big = Array.from({ length: 1200 }, (_, k) => k + ',' + (k * 7 % 13)).join('\n') + '\n';
+  const nb = CCWD + '/nb/analysis.ipynb';
+  return [
+    say(1, '把 calc.py 加上 mul 和 div，notes.txt 的 world 改成 there 并加一行 bye，再新建 utils/strings.py'),
+    use(2, 'c1', 'Edit', { file_path: calc, old_string: '    return a - b\n', new_string: '    return a - b\n\n\ndef mul…' }),
+    res(3, 'c1', 'The file ' + calc + ' has been updated successfully.', { filePath: calc, oldString: '…', newString: '…', originalFile: 'x', structuredPatch: p1, userModified: false, replaceAll: false }),
+    use(4, 'c2', 'Edit', { file_path: notes, old_string: 'world', new_string: 'there\nbye' }),
+    res(5, 'c2', 'The file ' + notes + ' has been updated successfully.', { filePath: notes, structuredPatch: p2, userModified: false, replaceAll: false }),
+    use(6, 'c3', 'Write', { file_path: strs, content: shout }),
+    res(7, 'c3', 'File created successfully at: ' + strs, { type: 'create', filePath: strs, content: shout, structuredPatch: [], originalFile: null }),
+    use(8, 'c4', 'Write', { file_path: '/tmp/denied.txt', content: 'no' }),
+    res(9, 'c4', "The user doesn't want to proceed with this tool use. The tool use was rejected", 'User rejected tool use', { isError: true, denied: true }),
+    use(10, 'c5', 'Edit', { file_path: notes, old_string: 'nope', new_string: 'x' }),
+    res(11, 'c5', '<tool_use_error>String to replace not found in file.</tool_use_error>', 'Error: String to replace not found in file.', { isError: true }),
+    ...done(12, '完成：calc.py、notes.txt、utils/strings.py。'),
+    say(20, '再把 div 改成整除，更新笔记本，导出数据，并让子代理改配置'),
+    use(21, 'c6', 'Edit', { file_path: calc, old_string: 'a / b', new_string: 'a // b' }),
+    res(22, 'c6', 'The file ' + calc + ' has been updated successfully.', { filePath: calc, structuredPatch: p3, userModified: false, replaceAll: false }),
+    use(23, 'c7', 'NotebookEdit', { notebook_path: nb, cell_id: 'c3', new_source: 'df = load()\ndf.describe()' }),
+    res(24, 'c7', 'Updated cell c3 with df = load()…', { new_source: 'df = load()\ndf.describe()', old_source: 'df = load()', cell_id: 'c3', cell_type: 'code', notebook_path: nb, original_file: '{}', updated_file: '{}' }),
+    use(25, 'c8', 'Write', { file_path: CCWD + '/data/big.csv', content: big }, { truncated: true }),
+    res(26, 'c8', 'File created successfully at: ' + CCWD + '/data/big.csv', { type: 'create', filePath: CCWD + '/data/big.csv', content: big, structuredPatch: [], originalFile: null }, { truncated: true }),
+    use(27, 'c9', 'Agent', { description: '改配置', prompt: '把 conf/app.toml 的端口改成 8080', subagent_type: 'general-purpose' }),
+    res(28, 'c9', 'Async agent launched successfully.\nagentId: ' + CHG_AGENT, { isAsync: true, status: 'async_launched', agentId: CHG_AGENT, description: '改配置' }),
+    ...done(29, '都改好了。'),
+  ];
+}
+function chgSubagent(withEdit2) {
+  const ent = (i, type, extra) => ({ type, isSidechain: true, agentId: CHG_AGENT, uuid: 'sa-' + i, timestamp: new Date(Date.parse('2026-11-24T06:00:30Z') + i * 1000).toISOString(), ...extra });
+  const conf = CCWD + '/conf/app.toml';
+  const entries = [
+    ent(0, 'user', { parentUuid: null, message: { role: 'user', content: '把 conf/app.toml 的端口改成 8080' } }),
+    ent(1, 'assistant', { message: { role: 'assistant', content: [{ type: 'tool_use', id: 'sx1', name: 'Write', input: { file_path: conf, content: 'port = 8080\n' } }] } }),
+    ent(2, 'user', { toolUseResult: { type: 'create', filePath: conf, content: 'port = 8080\n', structuredPatch: [], originalFile: null },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'sx1', content: 'File created successfully at: ' + conf }] } }),
+  ];
+  if (withEdit2) entries.push(
+    ent(3, 'assistant', { message: { role: 'assistant', content: [{ type: 'tool_use', id: 'sx2', name: 'Edit', input: { file_path: CCWD + '/conf/extra.toml' } }] } }),
+    ent(4, 'user', { toolUseResult: { filePath: CCWD + '/conf/extra.toml', structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-a = 1', '+a = 2'] }] },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'sx2', content: 'ok' }] } }));
+  return { type: 'subagent', agent_id: CHG_AGENT, gen: 1, from: 0, total: entries.length, entries,
+    summary: { tool_use_id: 'c9', agent_id: CHG_AGENT, description: '改配置', agent_type: 'general-purpose', status: 'completed', tool_uses: entries.length > 3 ? 2 : 1 } };
+}
+
+async function changesChecks() {
+  const pv = ensureVizPanel();
+  initViz({ api: vizApi, getConfig: () => ({}), toast: (t) => log('（toast）' + t), panel: pv });
+  const nCalls = calls.length, nStat = vizStatCalls;
+  let fetches = 0;
+  const origFetch = window.fetch;
+  window.fetch = (...a) => { fetches++; return origFetch(...a); };
+  try {
+    pv.closeAll();
+    localStorage.removeItem(FX_CHG_KEY);
+    s.localOverride = false;   // 先按服务器会话：数据只来自 transcript
+    // 空状态：fixtures 里真实的 transcript 只有两个被拒绝的工具调用（Bash / Write）→ 不计入
+    pushTranscript(transcriptEntries(), true);
+    await raf(); flushNow(s);
+    renderChrome();
+    check(fxChgBtn.count.hidden && fxChgBtn.el.getAttribute('aria-pressed') === 'false', '会话头「改动」按钮：没有改动时不显示角标、未按下');
+    await click(fxChgBtn.el, '会话头「改动」按钮');
+    await raf();
+    const root = pv.root;
+    const tabs = () => [...root.querySelectorAll('.pv-tab')];
+    const view = () => root.querySelector('.chg');
+    check(!root.hidden && tabs().length === 1 && tabs()[0].classList.contains('is-chg') && !tabs()[0].querySelector('.pv-tab-x'), '打开右侧栏：「改动」标签在最左、不可关闭');
+    check(!!view() && !view().querySelector('.chg-empty').hidden && /本会话还没有改动文件/.test(view().textContent), '空状态：真实 transcript 里被拒绝的 Write / Bash 不计入（' + (view() && view().querySelector('.chg-empty-t').textContent) + '）');
+    check(fxChgBtn.el.getAttribute('aria-pressed') === 'true' && fxChgBtn.el.classList.contains('on'), '按钮显示按下状态');
+    check(localStorage.getItem(FX_CHG_KEY) === '1', '开关状态记在 localStorage（回放页用自己的键）');
+    check(pv.barEl.hidden && (view().querySelector('.chg-foot') || {}).textContent === NOTE_TEXT, '底部固定一行口径说明；文件标签的地址栏隐藏');
+    // 两轮编辑 + 子代理
+    pushTranscript(chgEntries(), true);
+    applyEnvelope(state, env('subagent', chgSubagent(false)));
+    await raf(); flushNow(s);
+    await raf();
+    const rows = () => [...view().querySelectorAll('.chg-file')];
+    const rowOf = (rel) => rows().find((r) => r.querySelector('.chg-path').textContent === rel);
+    const rels = rows().map((r) => r.querySelector('.chg-path').textContent);
+    check(rels.join(',') === 'calc.py,conf/app.toml,data/big.csv,nb/analysis.ipynb,notes.txt,utils/strings.py', '文件列表（相对 cwd、按路径排序；被拒绝 / 失败的不算）：' + rels.join(', '));
+    const sum = view().querySelector('.chg-sum').textContent;
+    check(/6 个文件/.test(sum) && /\+1\.2k/.test(sum) && /−2/.test(sum), '汇总「6 个文件 +1.2k −2」（compact 计数）：' + sum);
+    check(fxChgBtn.count.textContent === '6' && !fxChgBtn.count.hidden && (tabs()[0].querySelector('.pv-tab-n') || {}).textContent === '6', '会话头按钮与标签的角标 = 6');
+    const calcRow = rowOf('calc.py');
+    check(/2 次/.test(calcRow.textContent) && calcRow.querySelector('.chg-add').textContent === '+11' && calcRow.querySelector('.chg-del').textContent === '−1', 'calc.py：2 次编辑合并 +11 −1');
+    const strRow = rowOf('utils/strings.py');
+    check(!!strRow.querySelector('.chg-tag.is-new') && !strRow.querySelector('.chg-del') && strRow.querySelector('.chg-add').textContent === '+2', '新建文件标「新建」，0 的一侧不显示（+2）');
+    check(!!rowOf('conf/app.toml').querySelector('.chg-tag.is-sub') && /子代理/.test(rowOf('conf/app.toml').textContent), '子代理改的文件标「子代理」');
+    check(!!rowOf('data/big.csv').querySelector('.chg-tag.is-approx'), '截断的 Write 标「≈」（行数可能不准）');
+    check(!!rowOf('nb/analysis.ipynb').querySelector('.chg-tag.is-nb') && rowOf('nb/analysis.ipynb').querySelector('.chg-add').textContent === '+1', 'NotebookEdit 计入并标「单元格」（old/new_source LCS：+1）');
+    const dirEl = rowOf('utils/strings.py').querySelector('.chg-dir'), nameEl = rowOf('utils/strings.py').querySelector('.chg-name');
+    check(dirEl.textContent === 'utils/' && nameEl.textContent === 'strings.py' && Number(getComputedStyle(nameEl).fontWeight) >= 600 && getComputedStyle(dirEl).color !== getComputedStyle(nameEl).color, '目录灰色、文件名加粗');
+    // 按轮
+    const sel = view().querySelector('.chg-scope');
+    const opts = [...sel.options].map((o) => o.textContent);
+    check(sel.options.length === 3 && sel.value === 'all' && opts[0] === '本会话（全部 2 轮）' && /^第 2 轮 · /.test(opts[1]) && /^第 1 轮 · /.test(opts[2]) && /（4 个文件）/.test(opts[1]),
+      '范围选择：本会话 + 有改动的轮（最新在上）：' + opts.join(' | '));
+    const q1 = '把 calc.py 加上 mul 和 div，notes.txt 的 world 改成 there 并加一行 bye，再新建 utils/strings.py';
+    check(opts[2].includes(' · ' + q1.slice(0, 30) + '…（') && /\d\d:\d\d/.test(opts[2]), '轮的选项 = 第一句提问前 30 字 + 时间：' + opts[2]);
+    sel.value = '1';
+    sel.dispatchEvent(new Event('change'));
+    await raf();
+    check(rows().map((r) => r.querySelector('.chg-path').textContent).join(',') === 'calc.py,notes.txt,utils/strings.py' && /3 个文件/.test(view().querySelector('.chg-sum').textContent) && !/2 次/.test(rowOf('calc.py').textContent),
+      '切到第 1 轮：3 个文件，calc.py 只算这一轮的 1 次');
+    // 展开 diff（行号）
+    await click(rowOf('calc.py').querySelector('.chg-row'), 'calc.py 行');
+    const body = rowOf('calc.py').querySelector('.chg-body');
+    const newNos = [...body.querySelectorAll('.diff.patch .diff-add .ln:nth-child(2)')].map((e) => e.textContent);
+    check(!body.hidden && !!body.querySelector('.diff-hunk') && newNos[0] === '7' && newNos[newNos.length - 1] === '16', '展开 diff：hunk 头 + 新行号 7…16（' + newNos.length + ' 行新增）');
+    check(rowOf('calc.py').querySelector('.chg-row').getAttribute('aria-expanded') === 'true', '展开状态 aria-expanded=true');
+    sel.value = 'all';
+    sel.dispatchEvent(new Event('change'));
+    await raf();
+    await click(rowOf('calc.py').querySelector('.chg-row'), 'calc.py 行（本会话）');
+    const secs = [...rowOf('calc.py').querySelectorAll('.chg-sec')];
+    check(secs.length === 2 && /第 1 次/.test(secs[0].textContent) && /第 1 轮/.test(secs[0].textContent) && /第 2 次/.test(secs[1].textContent) && /第 2 轮/.test(secs[1].textContent),
+      '本会话范围：逐次编辑按时间顺序，每段标出第几轮');
+    const delNos = [...secs[1].querySelectorAll('.diff-del .ln')].map((e) => e.textContent).filter(Boolean);
+    check(delNos.includes('16'), '第 2 次编辑的旧行号（删除行 = 16）');
+    // 懒渲染：1200 行的 Write 先放占位，进入视口才渲染
+    gesture++; rowOf('data/big.csv').querySelector('.chg-row').click(); gesture--;
+    const lazy0 = !!rowOf('data/big.csv').querySelector('.chg-lazy');   // 同步看：IntersectionObserver 回调之前还是占位
+    for (let k = 0; k < 10 && rowOf('data/big.csv').querySelector('.chg-lazy'); k++) { rowOf('data/big.csv').scrollIntoView({ block: 'start' }); await sleep(50); }
+    check(lazy0 && !rowOf('data/big.csv').querySelector('.chg-lazy') && rowOf('data/big.csv').querySelectorAll('.diff-add').length === 1200,
+      '大 diff（1200 行 > ' + EAGER_LINES + '）先占位，进入视口才渲染');
+    check(/已截断/.test(rowOf('data/big.csv').textContent), '截断的编辑在 diff 段头标「已截断，行数可能不准」');
+    // 全部展开 / 折叠
+    const allBtn = view().querySelector('.chg-all');
+    await click(allBtn, '全部展开');
+    check(rows().every((r) => r.classList.contains('open')) && /全部折叠/.test(allBtn.textContent), '全部展开');
+    await click(allBtn, '全部折叠');
+    check(rows().every((r) => !r.classList.contains('open')) && /全部展开/.test(allBtn.textContent), '全部折叠');
+    // 不改变时间线：面板里的展开 / 子代理带来的新改动都不动时间线
+    const tl = s.view.root;
+    tl.scrollTop = Math.max(0, tl.scrollHeight / 2);
+    s.view.stick = false;
+    await raf();
+    const before = [tl.scrollHeight, tl.scrollTop, s.view.col.getBoundingClientRect().width, $('fx-header').getBoundingClientRect().height];
+    const nodeCalc = rowOf('calc.py');
+    await click(rowOf('notes.txt').querySelector('.chg-row'), 'notes.txt 行');
+    applyEnvelope(state, env('subagent', chgSubagent(true)));
+    await raf(); flushNow(s); await raf();
+    const after = [tl.scrollHeight, tl.scrollTop, s.view.col.getBoundingClientRect().width, $('fx-header').getBoundingClientRect().height];
+    check(rows().length === 7 && fxChgBtn.count.textContent === '7' && !!rowOf('conf/extra.toml'), '实时：子代理的新编辑到达后自动更新（7 个文件，角标 7）');
+    check(rowOf('calc.py') === nodeCalc && rowOf('notes.txt').classList.contains('open'), '实时更新复用未变化的文件节点、保留展开状态');
+    check(after.join() === before.join(), '时间线 scrollHeight / scrollTop / 列宽、会话头高度都不变（' + before.join(',') + ' → ' + after.join(',') + '）');
+    // 联动：「本轮改动」卡片 → 打开右侧栏、切到那一轮、展开并滚到那个文件
+    sel.value = 'all';
+    sel.dispatchEvent(new Event('change'));
+    await click(fxChgBtn.el, '会话头「改动」按钮（关闭）');
+    check(root.hidden && fxChgBtn.el.getAttribute('aria-pressed') === 'false' && localStorage.getItem(FX_CHG_KEY) === '0', '再点按钮关闭（没有其它标签时整个面板隐藏），记住关闭');
+    const card = qa('.k-turnsum .tc-changes')[0];
+    const notesBtn = card && [...card.querySelectorAll('.tc-row')].find((b) => b.textContent.includes('notes.txt'));
+    await click(notesBtn, '第 1 轮「本轮改动」卡片的 notes.txt');
+    await raf();
+    const hit = rowOf('notes.txt');
+    const sc = view().querySelector('.chg-scroll');
+    const off = hit.getBoundingClientRect().top - sc.getBoundingClientRect().top;
+    check(!root.hidden && view().querySelector('.chg-scope').value === '1' && hit.classList.contains('open') && hit.classList.contains('chg-hit') && off >= -1 && off < 40,
+      '联动：切到第 1 轮、只展开 notes.txt（其它折叠）并滚到顶部（偏移 ' + Math.round(off) + 'px）');
+    check(rows().filter((r) => r.classList.contains('open')).length === 1, '联动时这一轮的其它文件折叠');
+    check([...hit.querySelectorAll('.diff-del .ln')].some((e) => e.textContent === '2'), '联动打开的 diff 带旧行号（删除行 = 2）');
+    check(!hit.querySelector('.chg-acts .btn[title^="在预览面板中打开"]') && !!hit.querySelector('.chg-acts .btn[title^="复制绝对路径"]'), '服务器会话：只有「复制路径」，没有「打开文件」');
+    // 文件标签 + 「改动」：关闭文件标签后回到「改动」
+    s.localOverride = true;
+    pv.open(s, { kind: 'diff', path: CCWD + '/calc.py', change: { path: CCWD + '/calc.py', edits: [], add: 0, del: 0 } });   // 不会发请求的标签
+    await raf();
+    check(tabs().length === 2 && tabs()[0].classList.contains('is-chg') && tabs()[1].classList.contains('on') && fxChgBtn.el.getAttribute('aria-pressed') === 'false', '另开标签时「改动」仍在最左，按钮不再按下');
+    tabs()[1].querySelector('.pv-tab-x').click();
+    await raf();
+    check(tabs().length === 1 && tabs()[0].classList.contains('on') && !!view(), '关掉其它标签后回到「改动」');
+    // 记忆：新面板实例读同一个键 → 打开
+    const p2 = new PreviewPanel({ host: document.createElement('div'), chgKey: FX_CHG_KEY });
+    const remembered = p2.chgOpen;
+    clearInterval(p2.timer); p2.root.remove(); p2.pill.remove();
+    check(remembered === true, '重新加载后记得「改动」栏是打开的');
+    // 颜色：浅色 / 深色
+    const th = window.ccrTheme;
+    const prevPref = th.pref();
+    const colorRes = [];
+    for (const t of ['light', 'dark']) {
+      th.set(t, { persist: false }); await raf();
+      const bg = rgbaOf(getComputedStyle(view()).backgroundColor);
+      const row = rowOf('notes.txt');   // 第 1 轮：+2 −1
+      const add = rgbaOf(getComputedStyle(row.querySelector('.chg-add')).color), del = rgbaOf(getComputedStyle(row.querySelector('.chg-del')).color);
+      const dir = rgbaOf(getComputedStyle(rowOf('utils/strings.py').querySelector('.chg-dir')).color);
+      const foot = rgbaOf(getComputedStyle(view().querySelector('.chg-foot')).color), footBg = rgbaOf(getComputedStyle(view().querySelector('.chg-foot')).backgroundColor);
+      colorRes.push([t, contrast(add, bg), contrast(del, bg), contrast(dir, bg), contrast(foot, over(footBg, bg))].map((x) => (typeof x === 'number' ? x.toFixed(1) : x)));
+    }
+    th.set(prevPref, { persist: false }); await raf();
+    check(colorRes.every((r) => r.slice(1).every((v) => Number(v) >= 4.5)) && colorRes[0][1] !== colorRes[1][1], '浅色 / 深色：+ / − / 目录 / 口径说明对比度都 ≥ 4.5（' + colorRes.map((r) => r.join(' ')).join('；') + '）');
+    // 关闭面板（×）= 「改动」也关掉
+    pv.closeAll();
+    await raf();
+    check(root.hidden && !pv.chgOpen && localStorage.getItem(FX_CHG_KEY) === '0', '面板右上角 × 关闭所有标签（含「改动」）');
+    check(trackerOf(s).turns.length === 3 && s.items.filter((it) => it.kind === 'user').length === 2, 'tracker 的轮 = 用户消息（+ 开头一段）');
+  } finally {
+    window.fetch = origFetch;
+    s.localOverride = null;
+    localStorage.removeItem(FX_CHG_KEY);
+  }
+  check(calls.length === nCalls && vizStatCalls === nStat && fetches === 0, '改动栏没有发出任何请求（按键 / stat / fetch 都是 0）');
+}
+
+// ---------- dmg 版自动更新（update.js） ----------
+async function updateChecks() {
+  const base = { enabled: true, current: '2.12', auto_check: true, checking: false, last_check: null, available: null,
+    phase: 'idle', progress: null, error: null, busy: [], manual: false, page: 'https://github.com/o/r/releases/latest', just_updated: null };
+  const av = { version: '2.13', notes: '新增：自动更新\n修复：若干问题', page: 'https://github.com/o/r/releases/tag/v2.13', size: 40e6, snoozed: false };
+  const st = (o) => ({ ...base, ...o });
+  // 纯函数
+  check(bannerModel(null) === null && bannerModel({ enabled: false }) === null && bannerModel(st({})) === null, '没开启 / 没有新版本：不显示');
+  const mAv = bannerModel(st({ available: av }));
+  check(mAv && mAv.text === '新版本 2.13 可用' && mAv.actions.map((a) => a.id).join() === 'install,later' && mAv.notes.includes('自动更新'), '新版本可用：立即更新 / 稍后 / 更新说明');
+  check(bannerModel(st({ available: { ...av, snoozed: true } })) === null, '「稍后」之后 24 小时内不再提示同一版本');
+  const mW = bannerModel(st({ available: av, phase: 'waiting', busy: ['会话 A', '会话 B'] }));
+  check(mW && mW.text.includes('等所有会话空闲后自动开始更新到 2.13') && mW.text.includes('会话 A、会话 B') && mW.actions.map((a) => a.id).join() === 'cancel', '有会话在忙：等空闲（可取消）');
+  const mD = bannerModel(st({ available: av, phase: 'downloading', progress: { done: 15e6, total: 40e6 } }));
+  check(mD && mD.pct === 37 && mD.text.includes('37%') && pctOf({ done: 1, total: 0 }) === null, '下载进度 %');
+  check(bannerModel(st({ available: av, phase: 'verifying' })).text.includes('校验') && bannerModel(st({ available: av, phase: 'installing' })).text.includes('安装')
+    && bannerModel(st({ available: av, phase: 'relaunching' })).text.includes('即将重新打开窗口'), '校验 → 安装 → 即将重新打开窗口');
+  const mM = bannerModel(st({ available: av, phase: 'manual', manual: true, error: '无法自动替换（…）' }));
+  check(mM && mM.kind === 'warn' && mM.actions.map((a) => a.id).join() === 'open_dmg,retry,page,dismiss', '无法自动替换：打开已下载的安装包 / 重试 / 打开下载页 / 关闭');
+  const mF = bannerModel(st({ available: av, phase: 'failed', error: '签名校验失败' }));
+  check(mF && mF.kind === 'error' && mF.text === '更新失败：签名校验失败' && mF.actions.map((a) => a.id).join() === 'retry,page,dismiss', '失败：原因 + 重试 + 打开下载页');
+  const mU = bannerModel(st({ just_updated: { version: '2.13', from: '2.12' } }));
+  check(mU && mU.kind === 'ok' && mU.text === '已更新到 2.13' && mU.actions[0].id === 'ack', '更新完成后提示一次「已更新到 X」');
+  const now = Date.now() / 1000;
+  check(checkText(st({ checking: true })) === '正在检查…' && checkText(st({})) === '还没有检查过'
+    && checkText(st({ last_check: { at: now, result: 'uptodate' } })).startsWith('已是最新版本')
+    && checkText(st({ last_check: { at: now, result: 'none' } })).startsWith('还没有发布任何版本')
+    && checkText(st({ last_check: { at: now, result: 'error', error: '网络错误：x' } })).startsWith('检查失败：网络错误'), '设置里的检查结果文字');
+  // DOM：挂在会话头上方（与 app.js 相同位置）
+  const store = new UpdateStore();
+  const acts = [];
+  const fakeApi = { post: async (path, body) => { record('update ' + path, body); acts.push(path); return null; } };
+  const hd = $('fx-header');
+  const banner = new UpdateBanner(store, { mount: (el) => hd.parentNode.insertBefore(el, hd), act: (id) => updateAction(fakeApi, store, id) });
+  const nCalls = calls.length;
+  store.set(st({}));
+  check(!banner.el || banner.el.hidden, '没有新版本：不挂 / 隐藏');
+  store.set(st({ available: av }));
+  await raf();
+  const el = banner.el;
+  check(!!el && !el.hidden && el.nextElementSibling === hd && el.textContent.includes('新版本 2.13 可用'), '提示条在会话头上方');
+  check(calls.length === nCalls, '显示提示条不发任何请求');
+  const notesBtn = el.querySelector('.upd-link');
+  await click(notesBtn, '更新说明');
+  const pre = el.querySelector('.upd-notes pre');
+  const ghLink = el.querySelector('.upd-notes a');
+  check(!!pre && pre.textContent.includes('修复：若干问题') && ghLink && ghLink.target === '_blank' && ghLink.href === av.page && calls.length === nCalls, '更新说明：展开纯文本 + 「在 GitHub 上查看」新窗口链接，不发请求');
+  await click(el.querySelector('[data-act="later"]'), '稍后');
+  check(calls.at(-1)?.op === 'update /api/update/snooze' && calls.at(-1).body.version === '2.13', '「稍后」→ POST /api/update/snooze {version}');
+  await click(el.querySelector('[data-act="install"]'), '立即更新');
+  check(calls.at(-1)?.op === 'update /api/update/install', '「立即更新」→ POST /api/update/install');
+  store.set(st({ available: av, phase: 'downloading', progress: { done: 20e6, total: 40e6 } }));
+  await raf();
+  const bar = el.querySelector('.upd-bar > span');
+  check(el.classList.contains('is-progress') && !!el.querySelector('.spin') && bar && bar.style.width === '50%', '下载中：spinner + 进度条 50%');
+  await click(el.querySelector('[data-act="cancel"]'), '取消');
+  check(calls.at(-1)?.op === 'update /api/update/cancel', '「取消」→ POST /api/update/cancel');
+  store.set(st({ available: av, phase: 'manual', manual: true, error: '无法自动替换' }));
+  await raf();
+  const page = el.querySelector('a[data-act="page"]');
+  check(!!page && page.target === '_blank' && page.href === base.page && page.rel.includes('noopener'), '「打开下载页」是新窗口链接（只在用户点击时打开）');
+  await click(el.querySelector('[data-act="open_dmg"]'), '打开已下载的安装包');
+  check(calls.at(-1)?.op === 'update /api/update/open_dmg', '「打开已下载的安装包」→ POST /api/update/open_dmg');
+  // 颜色：各状态在浅色 / 深色下文字对比度
+  const th = window.ccrTheme;
+  const prevPref = th.pref();
+  const res = [];
+  const bodyBg = () => rgbaOf(getComputedStyle(document.querySelector('.fx-main .main')).backgroundColor);
+  for (const t of ['light', 'dark']) {
+    th.set(t, { persist: false });
+    for (const [kind, s2] of [['info', st({ available: av })], ['progress', st({ available: av, phase: 'verifying' })],
+      ['warn', st({ available: av, phase: 'manual', error: 'x' })], ['error', st({ available: av, phase: 'failed', error: 'x' })],
+      ['ok', st({ just_updated: { version: '2.13', from: '2.12' } })]]) {
+      store.set(s2); await raf();
+      const cs = getComputedStyle(el.querySelector('.upd-text'));
+      res.push([t, kind, contrast(rgbaOf(cs.color), over(rgbaOf(getComputedStyle(el).backgroundColor), bodyBg()))]);
+    }
+  }
+  th.set(prevPref, { persist: false }); await raf();
+  check(res.every((r) => r[2] >= 4.5), '浅色 / 深色：各状态提示文字对比度 ≥ 4.5（最低 ' + Math.min(...res.map((r) => r[2])).toFixed(1) + '）');
+  await click(el.querySelector('[data-act="ack"]'), '知道了');
+  check(calls.at(-1)?.op === 'update /api/update/ack', '「知道了」→ POST /api/update/ack');
+  // 设置项
+  store.set(st({ last_check: { at: now, result: 'uptodate' } }));
+  const fld = updateSettingsField(fakeApi, store, {});
+  document.body.appendChild(fld.el);
+  check(fld.el.querySelector('input[name="update_auto_check"]').checked && fld.el.textContent.includes('当前版本 2.12') && fld.el.textContent.includes('已是最新版本'), '设置：自动检查开关（默认开）+ 当前版本 + 上次检查结果');
+  const box = fld.el.querySelector('input[name="update_auto_check"]');
+  gesture++; box.checked = false; box.dispatchEvent(new Event('change')); await sleep(50); gesture--;
+  check(calls.at(-1)?.op === 'update /api/update/settings' && calls.at(-1).body.auto_check === false, '关掉开关 → POST /api/update/settings {auto_check:false}');
+  await click(fld.el.querySelector('[data-act="check"]'), '立即检查');
+  check(calls.at(-1)?.op === 'update /api/update/check', '「立即检查」→ POST /api/update/check');
+  fld.dispose(); fld.el.remove();
+  store.set(st({}));
+  check(el.hidden, '状态回到无新版本：提示条隐藏');
+  el.remove();
+  check(acts.length === calls.length - nCalls, '更新相关请求都来自点击（共 ' + acts.length + ' 个）');
+}
+
+// ---------- 绑定 ----------
+$('fx-show').addEventListener('click', () => show($('fx-scene').value));
+$('fx-stream').addEventListener('click', () => playStream(Number($('fx-speed').value) || 2));
+$('fx-transcript').addEventListener('click', () => { pushTranscript(transcriptEntries(), true); log('transcript：' + s.items.length + ' 个条目'); });
+$('fx-viz').addEventListener('click', () => {
+  ensureVizPanel();
+  initViz({ api: vizApi, getConfig: () => ({}), toast: (t) => log('（toast）' + t), panel: vizPanel });
+  _setBlobLoader((d) => refPng(d.ref));
+  s.localOverride = $('fx-viz-remote').checked ? false : true;
+  pushTranscript(vizEntries(), true);
+  log('可视化示例：' + (s.localOverride ? '本机会话' : '服务器会话'));
+});
+$('fx-auto').addEventListener('click', () => { autoTest().catch((e) => { errors++; log('自测异常：' + (e && e.stack || e), 'bad'); }); });
+// 主题：用 theme.js（回放页只在本页生效、不写 localStorage）；?theme=light|dark|system 可直接指定
+{
+  const th = window.ccrTheme, sel = $('fx-theme');
+  const q = new URLSearchParams(location.search).get('theme');
+  if (th && q) th.set(q, { persist: false });
+  if (th) sel.value = th.pref() === 'system' ? '' : th.pref();
+  sel.addEventListener('change', (e) => th && th.set(e.target.value || 'system', { persist: false }));
+}
+$('fx-send').addEventListener('click', () => { gesture++; record('message', { text: $('fx-input').value }); gesture--; $('fx-input').value = ''; fxSizer.update(); });
+$('fx-stop').addEventListener('click', () => { gesture++; record('interrupt'); gesture--; });
+$('fx-file').addEventListener('change', async (e) => {
+  for (const f of e.target.files) ingest(f.name, await f.text());
+  fillScenes();
+});
+
+setup();
+loadFixtures().then(() => { if (new URLSearchParams(location.search).get('auto') === '1') $('fx-auto').click(); });

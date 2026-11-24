@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'self' http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>CC Remote Chat</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <script src="/static/theme.js"></script><!-- 同步加载：首帧前写好 data-theme，防闪白（CSP 禁内联脚本） -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <aside id="sidebar" class="sidebar">
+      <div class="side-top">
+        <div class="brand"><span class="brand-dot"></span>CC Remote Chat<button id="settings-btn" class="icon-btn theme-btn settings-btn" type="button" title="设置（服务器、提示音）"></button><button id="colorful-btn" class="icon-btn theme-btn colorful-btn" type="button" data-colorful-toggle title="彩色区分"></button><button id="theme-btn" class="icon-btn theme-btn" type="button" data-theme-toggle title="主题"></button><span id="host-label" class="muted host-label"></span></div>
+        <div class="job-field">
+          <label for="jobid-input" class="field-label">当前作业 jobid</label>
+          <div class="row">
+            <input id="jobid-input" class="input mono job-input" type="text" placeholder="未设置" autocomplete="off" spellcheck="false">
+            <button id="jobs-btn" class="btn ghost" type="button">我的作业</button>
+          </div>
+          <div id="job-hint" class="field-hint">回车保存；新会话默认使用此作业</div>
+        </div>
+        <button id="new-session-btn" class="btn primary block" type="button">新建会话</button>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab active" type="button" data-tab="sessions" role="tab">会话</button>
+        <button class="tab" type="button" data-tab="history" role="tab">历史会话</button>
+      </div>
+      <div id="session-list" class="side-list" role="list"></div>
+      <div id="history-pane" class="side-list" hidden>
+        <div id="history-target" class="seg hist-target" role="radiogroup" aria-label="历史会话所在位置">
+          <button class="seg-item" type="button" role="radio" data-target="server" title="服务器上的历史会话（登录节点 ~/.claude/projects）">服务器</button>
+          <button class="seg-item" type="button" role="radio" data-target="local" title="本机的历史会话（这台 Mac 的 ~/.claude/projects）">本机</button>
+        </div>
+        <div class="history-tools">
+          <input id="history-filter" name="history-filter" aria-label="筛选历史会话" class="input" type="search" placeholder="筛选标题 / 目录">
+          <button id="history-refresh" class="icon-btn" type="button" title="刷新"></button>
+        </div>
+        <div id="history-list"></div>
+      </div>
+      <div id="conn-status" class="side-foot"><span class="conn-dot"></span><span class="conn-text">连接中…</span></div>
+    </aside>
+
+    <main class="main">
+      <header id="chat-header" class="chat-header"></header>
+      <div id="chat-host" class="chat-host">
+        <div id="empty-state" class="empty-state">
+          <div class="empty-title">CC Remote Chat</div>
+          <div class="empty-sub">点“新建会话”开始：在这台 Mac 上运行，或在服务器的 Slurm 作业上运行（先在设置里填 SSH 主机、在左侧填作业号）；也可以从“历史会话”续接。</div>
+        </div>
+      </div>
+      <section id="term-panel" class="term-panel" hidden aria-label="终端面板"></section>
+      <footer id="composer" class="composer" hidden>
+        <div class="composer-inner">
+          <div id="composer-banner" class="composer-banner" hidden></div>
+          <div id="slash-pop" class="slash-pop" hidden role="listbox"></div>
+          <div id="hint-bar" class="hint-bar" hidden aria-label="Claude Code 快捷键提示"></div>
+          <div id="composer-box" class="composer-box">
+            <textarea id="input" name="message" aria-label="消息" rows="1" placeholder="给 Claude 发消息（Enter 发送 · Shift+Enter 换行 · / 命令）"></textarea>
+            <!-- 输入框底栏（SPEC §7）：左 = 模型/effort 胶囊、权限模式、Shift+Tab；右 = 统计（上下文圆环 · 花费 · tok/s）+ 中断/发送。固定一行、不换行 -->
+            <div class="composer-bar">
+              <div id="composer-ctl" class="composer-ctl"></div>
+              <span class="spacer"></span>
+              <span id="composer-stats" class="composer-stats"></span>
+              <button id="stop-btn" class="btn danger-ghost small stop-btn" type="button" hidden title="在终端里按 Esc 中断本轮"><span class="stop-text">中断（Esc）</span></button>
+              <button id="send-btn" class="send-btn" type="button" title="发送 (Enter)"></button>
+            </div>
+          </div>
+        </div>
+      </footer>
+    </main>
+  </div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

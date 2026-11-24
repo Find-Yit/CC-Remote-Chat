@@ -1,0 +1,11 @@
+.fx { display: flex; flex-direction: column; height: 100vh; }
+.fx-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--bg-side); font-size: 13px; }
+.fx-bar input[type=file] { font-size: 12px; max-width: 200px; }
+.fx-main { flex: 1; display: flex; min-height: 0; }
+.fx-main .main { flex: 1; }
+.fx-log { width: 340px; flex: none; border-left: 1px solid var(--border); background: var(--bg-side); display: flex; flex-direction: column; min-height: 0; }
+.fx-log-head { padding: 10px 12px; font-size: 12px; font-weight: 600; border-bottom: 1px solid var(--border); }
+#fx-log { flex: 1; overflow: auto; padding: 8px 12px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; }
+#fx-log .ok { color: var(--ok); } #fx-log .bad { color: var(--err); } #fx-log .info { color: var(--text-2); }
+#fx-log > div { padding: 3px 0; border-bottom: 1px dashed var(--border); white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 900px) { .fx-log { display: none; } }

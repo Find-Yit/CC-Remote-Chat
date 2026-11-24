@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'self' http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'">
+  <title>TUI 回放自测 · CC Remote Chat</title>
+  <link rel="icon" href="data:,">
+  <script src="/static/theme.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/dev/fixture.css">
+</head>
+<body>
+  <div class="fx">
+    <div class="fx-bar">
+      <strong>TUI 回放</strong>
+      <select id="fx-scene" class="mini-select" title="单个屏幕画面"></select>
+      <button id="fx-show" class="btn small" type="button">显示画面</button>
+      <button id="fx-stream" class="btn small" type="button">流式 29 帧</button>
+      <button id="fx-transcript" class="btn small" type="button">载入 transcript</button>
+      <select id="fx-speed" class="mini-select" title="流式回放速度">
+        <option value="1">1×（实时）</option><option value="2" selected>2×</option><option value="4">4×</option>
+      </select>
+      <button id="fx-viz" class="btn small" type="button" title="可视化示例：引用图片、灯箱、文件 chip、本轮改动、网页预览（桩数据）">可视化示例</button>
+      <label class="check" title="按服务器会话显示（只有改动卡片与 diff，文件 chip 只复制路径）">服务器 <input id="fx-viz-remote" name="fx-viz-remote" type="checkbox"></label>
+      <button id="fx-auto" class="btn small primary" type="button">全流程自测</button>
+      <label class="check" title="/fixtures 不可用时：选择本地 fixtures 目录里的文件（可多选）">本地文件 <input id="fx-file" name="fx-file" type="file" multiple accept=".ndjson,.jsonl"></label>
+      <span class="spacer"></span>
+      <span id="fx-result" class="muted"></span>
+      <select id="fx-theme" class="mini-select" title="主题">
+        <option value="">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option>
+      </select>
+    </div>
+    <div class="fx-main">
+      <div class="main">
+        <header id="fx-header" class="chat-header"></header>
+        <div id="fx-host" class="chat-host"></div>
+        <section id="fx-term" class="term-panel" hidden aria-label="终端面板"></section>
+        <footer class="composer">
+          <div class="composer-inner">
+            <div id="fx-banner" class="composer-banner" hidden></div>
+            <div class="composer-box">
+              <textarea id="fx-input" name="message" aria-label="消息" rows="1" placeholder="回放页：发送只记录到日志"></textarea>
+              <div class="composer-bar">
+                <div id="fx-ctl" class="composer-ctl"></div>
+                <span class="spacer"></span>
+                <span id="fx-stats" class="composer-stats"></span>
+                <button id="fx-stop" class="btn danger-ghost small stop-btn" type="button" hidden><span class="stop-text">中断（Esc）</span></button>
+                <button id="fx-send" class="btn small primary" type="button">发送</button>
+              </div>
+            </div>
+          </div>
+        </footer>
+      </div>
+      <aside class="fx-log">
+        <div class="fx-log-head">请求 / 校验日志 <span id="fx-progress" class="muted"></span></div>
+        <div id="fx-log"></div>
+      </aside>
+    </div>
+  </div>
+  <script type="module" src="/static/dev/fixture.js"></script>
+</body>
+</html>

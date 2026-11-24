@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+# local data never belongs in the repo (the app keeps it in ~/.cc-remote-chat/)
+.cc-remote-chat/
+api_keys.json
+session_keys.json
+*.log
+# tools/make_dmg.sh：下载缓存与输出
+build/
+dist/

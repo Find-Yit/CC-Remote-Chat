@@ -59,9 +59,11 @@ _SID_RE = re.compile(r"^s[0-9a-f]{12}\Z")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _DEFAULT_DATA_DIR = pathlib.Path("~/.cc-remote-chat").expanduser()
-_SET_MODEL_RE = re.compile(r"^(?:Set model to|Kept model as)\s+`?(.+?)`?(?:\s+with\s+\w+\s+effort)?"
-                           r"(?:\s+\(.*\))?\s*$")
-_SET_EFFORT_RE = re.compile(r"effort(?: level)? (?:to|as|at)\s+`?(\w+)`?", re.I)
+# /model、/effort 的结果文案解析在 tui_parse.parse_cmd_result（CLI 2.1.332 的新文案：" for this session only"、
+# "· effort stays max (set by CLAUDE_CODE_EFFORT_LEVEL)"、"CLAUDE_CODE_EFFORT_LEVEL=max overrides this session — …"）
+EFFORT_RESULT_UNKNOWN = "结果未知，请查看终端面板"
+# CLI 2.1.332：焦点在底部子代理列表上时模式行被换成 "↑/↓ to select" / "enter to view · x to stop"，Shift+Tab 的含义不确定
+AGENTS_FOCUS_MSG = "终端里的焦点在子代理列表上（模式行暂时被列表提示替换），请先在终端面板按 Esc 回到输入框再切换"
 
 
 # ============================================================================ 异常
@@ -189,6 +191,8 @@ class _Session:
         self.model: Optional[str] = None         # 仅展示（屏幕/面板解析得到）
         self.model_desc: Optional[str] = None    # /model 面板里当前模型的描述（推断 1M 上下文用）
         self.effort: Optional[str] = None
+        # effort 被环境变量锁定（只从 CLI 的结果文案推断，不读 claude 的环境）：{"level","source"}；重启后清空
+        self.effort_locked: Optional[dict] = None
         self.created_at = time.time()
         self.last_activity = self.created_at
         self.error: Optional[str] = None
@@ -208,6 +212,7 @@ class _Session:
         self.screen_pub_text: Optional[str] = None
         self.screen_pub_t = 0.0
         self.screen_timer: Optional[threading.Timer] = None
+        self.removed = False   # 已被删除（SessionManager.remove）：之后不再为它发布任何事件
         self.model_rows: Optional[list] = None
         # API key（显示用；明文从不放在 _Session 上）：名称与"已被删除"标记，随 api_keys.json 变更刷新
         self.api_key_name: Optional[str] = None
@@ -274,6 +279,7 @@ class _Session:
             "mode": self.mode, "busy": self.state == "busy", "dialog_kind": self.dialog_kind,
             "created_at": self.created_at, "last_activity": self.last_activity, "error": self.error,
             "link": self.link, "model": self.model, "effort": self.effort, "exit_status": self.exit_status,
+            "effort_locked": dict(self.effort_locked) if self.effort_locked else None,
             "subagents": sub_counts,
             "stats": dict(self.stats) if self.stats else None,
             "api_key_name": self.api_key_name, "api_key_missing": self.api_key_missing,
@@ -530,6 +536,7 @@ class SessionManager:
         self.step_timeout = 3.0          # 单步按键后等待屏幕响应
         self.panel_timeout = 10.0        # 等 /model、/effort 面板出现
         self.result_timeout = 5.0        # 等面板关闭/结果行
+        self.result_settle = 1.5         # 面板关闭后结果行还没出现时，再等这么久
         self.max_nav_steps = 24
         self.max_effort_steps = 8
         self.max_clear_steps = 12
@@ -584,13 +591,15 @@ class SessionManager:
                 pass
 
     def _events_since_locked(self, gseq: int) -> list:
+        # 缓冲里的 gseq 递增但**不连续**（screen / subagent 事件与已删除会话的事件不进 _global），
+        # 不能按 "gseq - 第一条的 gseq" 当下标（那样会漏掉重连期间的 transcript / meta）：从尾部往前找
         out = []
-        buf = self._global
-        if buf:
-            first = buf[0]["gseq"]
-            start = max(0, gseq - first + 1)
-            if start < len(buf):
-                out = [e for e in itertools.islice(buf, start, None) if e["sid"] in self._sessions]
+        for e in reversed(self._global):
+            if e["gseq"] <= gseq:
+                break
+            if e["sid"] in self._sessions:
+                out.append(e)
+        out.reverse()
         latest = [s.screen_env for s in self._sessions.values()
                   if s.screen_env is not None and s.screen_env["gseq"] > gseq]
         latest += [e for s in self._sessions.values() for e in s.sa_env.values() if e["gseq"] > gseq]
@@ -633,6 +642,9 @@ class SessionManager:
 
     def _publish(self, s: _Session, kind: str, data: dict) -> dict:
         with self._lock:
+            if s.removed:
+                # 删除之后（定时器、迟到的 agent 回调…）：不进缓冲、不推送，前端不会因此"复活"已删除的会话
+                return {"gseq": self._gseq, "sid": s.sid, "ts": time.time(), "kind": kind, "data": data}
             self._gseq += 1
             env = {"gseq": self._gseq, "sid": s.sid, "ts": time.time(), "kind": kind, "data": data}
             registered = self._sessions.get(s.sid) is s
@@ -803,7 +815,8 @@ class SessionManager:
             base = (s.title or "").rstrip("…").strip()
             s.title_user = not (base and s.cli_title.startswith(base))
 
-    def _emit_meta(self, s: _Session, force=False) -> None:
+    def _emit_meta(self, s: _Session, force=False, added=False) -> None:
+        """added=True：新建会话的第一条 meta（data.added），前端只凭它（或 bootstrap / 新建接口的返回）创建会话。"""
         with s.lock:
             self._notify_locked(s)
             self._op_track_locked(s)
@@ -813,7 +826,7 @@ class SessionManager:
             if not force and cmp == s.last_meta:
                 return
             s.last_meta = cmp
-            self._app(s, {"type": "meta", "meta": m})
+            self._app(s, dict({"type": "meta", "meta": m}, **({"added": True} if added else {})))
             # 生成中每秒都会变的 tok_s_live / updated_at 不值得重写 sessions.json（其余变化照常落盘）
             pk = dict(cmp)
             pk.pop("op", None)   # 阶段进度只在内存里（不为它重写 sessions.json）
@@ -1387,14 +1400,11 @@ class SessionManager:
             if hint and (hint.get("source") == "status" or s.model is None):
                 s.model = hint.get("model") or s.model
                 s.effort = hint.get("effort") or s.effort
-            res = st.get("last_result")
-            if res:
-                m = _SET_MODEL_RE.match(res)
-                if m:
-                    s.model = m.group(1).strip()
-                m = _SET_EFFORT_RE.search(res) or re.search(r"with (\w+) effort", res)
-                if m and m.group(1).lower() in EFFORT_LEVELS:
-                    s.effort = m.group(1).lower()
+            cr = st.get("cmd_result") or tui_parse.parse_cmd_result(st.get("last_result")) or {}
+            if cr.get("model"):
+                s.model = cr["model"]   # 只取模型名本身（旧版把 " for this session only · …" 也吞进来了）
+            if cr.get("effort") in EFFORT_LEVELS:
+                s.effort = cr["effort"]   # CLI 回报的实际档位（被环境变量锁定时 = 锁定的那一档）
             if d and d.get("kind") == "model":
                 for r in d.get("rows") or []:
                     if r.get("current"):
@@ -1713,7 +1723,8 @@ class SessionManager:
         if kid is None:
             return None, None
         try:
-            return self.api_keys.credentials(kid), self.api_keys.name_of(kid)
+            key, base = self.api_keys.credentials(kid)
+            return (key, base or self._default_base_url()), self.api_keys.name_of(kid)
         except ccr_api_keys.ApiKeyNotFound:
             label = "「%s」" % name_hint if name_hint else " "
             if restart:
@@ -1722,6 +1733,14 @@ class SessionManager:
             else:
                 msg = "所选 API key%s不存在（可能已被删除），请重新选择" % label
             raise OpError(msg, code="api_key_missing") from None
+
+    def _default_base_url(self) -> Optional[str]:
+        """设置里的默认 base_url（config.json 的 default_base_url；没设置/不合法 = None）：
+        没有自己 base_url 的 key 启动时用它写 key 文件的 ANTHROPIC_BASE_URL；None = 与以前一致（沿用 settings.json）。"""
+        try:
+            return ccr_api_keys.validate_base_url((self._get_config() or {}).get("default_base_url"))
+        except ValueError:
+            return None
 
     def _refresh_api_key_locked(self, s: _Session) -> None:
         kid = (s.launch or {}).get("api_key_id")
@@ -1882,6 +1901,7 @@ class SessionManager:
         try:
             with self._lock:
                 self._sessions[sid] = s
+            self._emit_meta(s, force=True, added=True)   # 该 sid 的第一条事件：前端据此新建（别的窗口也能看到）
             self._ensure_link(j)
             with s.lock:
                 s.link = self._link_state(j)
@@ -2178,6 +2198,8 @@ class SessionManager:
             st = self._fresh(s)
             if self._blocking_dialog(s, st):
                 raise OpError("请先处理当前对话框", code="dialog_open")
+            if st.get("agents_focus"):
+                raise OpError(AGENTS_FOCUS_MSG, code="agents_focus")
             old = st.get("mode_line")
             # Shift+Tab 在权限框里有别的含义：只在输入框确实可见（没有对话框）时才发
             self._keys(s, ["BTab"], guard={"input_box": True})
@@ -2199,6 +2221,8 @@ class SessionManager:
             st = self._fresh(s)
             if self._blocking_dialog(s, st) or s.state == "trust":
                 raise OpError("请先处理当前对话框", code="dialog_open")
+            if st.get("agents_focus"):
+                raise OpError(AGENTS_FOCUS_MSG, code="agents_focus")
             if not st.get("mode_line"):
                 raise OpError("终端里看不到权限模式行，暂时无法切换（可打开终端面板查看）", code="no_mode_line")
             cur = st.get("mode")
@@ -2479,10 +2503,35 @@ class SessionManager:
                 d = self._adjust_effort(s, d, effort, lambda dd: (dd.get("effort") or {}).get("level"),
                                         self._model_dialog)
             st2 = self._confirm_panel(s, scope, "model")
+        cr = tui_parse.parse_cmd_result(st2.get("last_result")) or {}
         with s.lock:
             s.model_rows = None
+            if cr.get("model"):
+                s.model = cr["model"]
+        out = {"ok": True, "result": st2.get("last_result"), "state": st2}
+        if cr.get("effort_locked"):
+            # 模型换成功了，但 effort 被环境变量锁定（"· effort stays max (set by CLAUDE_CODE_EFFORT_LEVEL); xhigh isn't saved"）
+            out.update(code="effort_env_locked", warning=self._note_effort_locked(s, cr["effort_locked"]))
+        elif not cr.get("model"):
+            out.update(code="result_unknown", warning=EFFORT_RESULT_UNKNOWN)
+        elif effort is not None and cr.get("effort") in EFFORT_LEVELS:
+            with s.lock:
+                s.effort_locked = None
         self._emit_meta(s)
-        return {"ok": True, "result": st2.get("last_result"), "state": st2}
+        return out
+
+    def _note_effort_locked(self, s: _Session, lk: dict) -> str:
+        """CLI 回报 effort 被环境变量锁定：记下实际档位与来源（meta.effort_locked），返回给用户看的说明。
+        只依据 CLI 自己打印的文案（红线：不读、不改 claude 的环境变量）。"""
+        level = lk.get("level") if lk.get("level") in EFFORT_LEVELS else None
+        src = lk.get("source") or "CLAUDE_CODE_EFFORT_LEVEL"
+        with s.lock:
+            if level:
+                s.effort = level
+            s.effort_locked = {"level": level, "source": src}
+        lv = level or "?"
+        return ("effort 被环境变量 %s=%s 锁定：本会话实际仍是 %s。清除该变量（例如 ~/.zshrc 里的 export）后"
+                "重启会话即可调整" % (src, lv, lv))
 
     def _adjust_effort(self, s: _Session, d: dict, level: str, get_level, get_dialog) -> dict:
         seen = []
@@ -2545,6 +2594,11 @@ class SessionManager:
         if st2 is None:
             raise OpError("已按下确认键，但面板没有在 %g 秒内关闭，结果未知；请在终端面板查看" % self.result_timeout,
                           code="panel_timeout", status=504)
+        if st2.get("last_result") is None:
+            # 面板关了、结果行（"⎿ …"）可能晚一帧才画出来
+            st3 = self._wait_for(s, lambda x: (x.get("dialog") or {}).get("kind") != kind
+                                 and x.get("last_result") is not None, self.result_settle)
+            st2 = st3 or st2
         return st2
 
     # ---------------------------------------------------------------- /effort
@@ -2563,10 +2617,24 @@ class SessionManager:
             st = self._open_panel(s, "/effort", "effort", bool(clear_input))
             d = self._adjust_effort(s, st["dialog"], level, lambda dd: dd.get("level"), eff_dialog)
             st2 = self._confirm_panel(s, scope, "effort")
-        with s.lock:
-            s.effort = level
+        # 以 CLI 的回报为准（不再无条件把 s.effort 写成用户选的档位）
+        cr = tui_parse.parse_cmd_result(st2.get("last_result")) or {}
+        out = {"ok": True, "result": st2.get("last_result"), "state": st2}
+        if cr.get("effort_locked"):
+            msg = self._note_effort_locked(s, cr["effort_locked"])
+            self._emit_meta(s)
+            if cr["effort_locked"].get("level") != level:
+                raise OpError(msg, code="effort_env_locked")
+            out.update(code="effort_env_locked", warning=msg)   # 选的正是被锁定的那一档：实际生效，仍提示锁定
+            return out
+        if cr.get("effort") in EFFORT_LEVELS:
+            with s.lock:
+                s.effort = cr["effort"]
+                s.effort_locked = None
+        else:
+            out.update(code="result_unknown", warning=EFFORT_RESULT_UNKNOWN)
         self._emit_meta(s)
-        return {"ok": True, "result": st2.get("last_result"), "state": st2}
+        return out
 
     # ---------------------------------------------------------------- 关闭 / 重启 / 删除
     def _force_local_exit(self, s: _Session, why: str) -> None:
@@ -2800,6 +2868,7 @@ class SessionManager:
                     s.launch = launch
                     s.api_key_name, s.api_key_missing = key_name, False
                     s.seen_base = {}
+                    s.effort_locked = None
                     s.modes_seen = set()
                     s.pane_pid = None
                     s.exited = False
@@ -2862,10 +2931,40 @@ class SessionManager:
             log.warning("强制删除会话 %s（远端可能仍在运行）", sid)
         with self._lock:
             self._sessions.pop(sid, None)
+        self._publish_removed(s)
+        with s.lock:
+            timers = (s.screen_timer, s.stats_timer)
+            s.screen_timer = s.stats_timer = None
+        for t in timers:
+            if t is not None:
+                t.cancel()
+        if self._link_state(s.jobid) == "ready":
+            # 已退出的会话 _close_session 不会 kill（kill 会先停监视）：这里再停一次 transcript / 子代理监视（尽力而为）
+            try:
+                self._req(s.jobid, "watch", sid=sid, on=False, timeout=5)
+            except Exception as e:  # noqa: BLE001
+                log.info("删除会话 %s：停止监视失败（%s）", sid, e)
         self.notifier.forget(sid)
         self._dirty.set()
         self._maybe_close_link(s.jobid)
         return {"ok": True}
+
+    def _publish_removed(self, s: _Session) -> None:
+        """会话已从列表移除：给所有在线的前端推一条 app/removed（其它窗口据此移除侧栏行），之后该 sid 不再有任何事件。
+        这一条不进事件缓冲（重连回放时 bootstrap 里已经没有这个会话，前端自己会移除）。"""
+        with self._lock:
+            if s.removed:
+                return
+            s.removed = True
+            s.events.clear()
+            s.sa_env = {}
+            s.screen_env = None
+            self._gseq += 1
+            env = {"gseq": self._gseq, "sid": s.sid, "ts": time.time(), "kind": "app", "data": {"type": "removed"}}
+            dead = [sub for sub in self._subs if not sub._offer(env)]
+            for sub in dead:
+                self._subs.remove(sub)
+                sub._drop()
 
     def rename(self, sid, title) -> dict:
         s = self._get(sid)
@@ -3034,12 +3133,20 @@ class SessionManager:
             for k in ("mode", "model", "effort", "status"):
                 v = m.get(k)
                 setattr(s, k, v if isinstance(v, str) and len(v) < 200 else None)
+            # 旧版把 "Haiku 5.5 for this session only · effort stays max …" 整句存成了模型名：截掉结果文案后缀
+            s.model = tui_parse.clean_model_name(s.model)
+            if s.effort not in EFFORT_LEVELS:
+                s.effort = None
             v = m.get("api_key_name")
             s.api_key_name = v if isinstance(v, str) and len(v) <= ccr_api_keys.MAX_NAME else None
             base = rec.get("seen_base")
             if isinstance(base, dict):
                 s.seen_base = {k: v for k, v in base.items()
                                if k in ("model", "effort", "mode") and isinstance(v, str) and len(v) < 200}
+                if "model" in s.seen_base:
+                    cm = tui_parse.clean_model_name(s.seen_base.pop("model"))
+                    if cm:
+                        s.seen_base["model"] = cm
             # 统计：恢复最后已知的上下文/花费/上一轮速率（存活会话随后由屏幕/transcript 刷新）
             s.stats = stats.sanitize(m.get("stats"))
             s.tracker.restore(s.stats)

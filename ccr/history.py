@@ -266,11 +266,37 @@ def is_system_injected(d):
     return isinstance(kind, str) and kind not in ("", "human") and d.get("promptSource") != "typed"
 
 
+def _trim_note_attachment(d):
+    """回复中途被吸收的子代理/后台任务通知（attachment / queued_command / commandMode=task-notification，
+    CLI 2.1.332 实测不再另写 user 条目）→ 精简的 attachment entry；其它 attachment 返回 None。"""
+    a = d.get("attachment")
+    if not isinstance(a, dict) or a.get("type") != "queued_command" or d.get("isSidechain"):
+        return None
+    origin = a.get("origin") if isinstance(a.get("origin"), dict) else {}
+    kind = origin.get("kind") if isinstance(origin.get("kind"), str) else None
+    if a.get("commandMode") != "task-notification" and kind != "task-notification":
+        return None
+    prompt = a.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    prompt, tr = _cut(prompt)
+    att = {"type": "queued_command", "commandMode": "task-notification", "prompt": prompt}
+    if kind:
+        att["origin"] = {"kind": kind[:64]}
+    entry = {"type": "attachment", "uuid": d.get("uuid"), "timestamp": d.get("timestamp"), "attachment": att}
+    if tr:
+        entry["truncated"] = True
+    return entry
+
+
 def trim_entry(d):
-    """把一条 transcript 记录变成 API entry；非 user/assistant、meta、sidechain 返回 None。"""
+    """把一条 transcript 记录变成 API entry；非 user/assistant、meta、sidechain 返回 None
+    （回复中途吸收的子代理通知 attachment 除外，见 _trim_note_attachment）。"""
     if not isinstance(d, dict):
         return None
     typ = d.get("type")
+    if typ == "attachment":
+        return _trim_note_attachment(d)
     if typ not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
         return None
     msg = d.get("message")
@@ -315,7 +341,8 @@ def read_lines(lines):
         if not line:
             continue
         lt = _line_type(line)
-        if lt is not None and lt not in ("user", "assistant"):
+        if lt is not None and lt not in ("user", "assistant") and not (
+                lt == "attachment" and b"task-notification" in line):
             continue
         d = _loads(line)
         if not d:

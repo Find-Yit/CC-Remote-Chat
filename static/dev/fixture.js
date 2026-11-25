@@ -3,9 +3,9 @@
 // 所有“请求”都由模拟 actions 记录到日志，并按 fixtures 切换到对应的后续画面；任何未经点击触发的请求都会被判为失败。
 import { h, icon } from '/static/dom.js';
 import {
-  createState, ensureSession, applyEnvelope, mountSession, flushNow, currentDialog, draftVisible, setModelList, revealItem, refreshTail,
+  createState, ensureSession, applyEnvelope, mountSession, flushNow, forgetSession, createsSession, currentDialog, draftVisible, setModelList, revealItem, refreshTail,
 } from '/static/render.js';
-import { openModelModal, openEffortModal, TermPanel, modeText } from '/static/tui.js';
+import { openModelModal, openEffortModal, TermPanel, modeText, effortLockText, appliedToast, resultText, effortSaveBlocked } from '/static/tui.js';
 import { loadToken, TOKEN_HEADER } from '/static/api.js';
 import { parseScreen } from '/static/dev/tui_sim.js';
 import { StatsBar, RING_C } from '/static/stats.js';
@@ -19,6 +19,10 @@ import { sessionStatus, rowClass, isUnread, docTitle, titleCount, unreadCount, A
 import { PromptMinimap, topPercent, MM_TARGET_OFFSET } from '/static/minimap.js';
 import { ChangesButton, trackerOf, NOTE_TEXT, EAGER_LINES } from '/static/changes.js';
 import { OpBanner, OpGuard, opModel, jobPromptModel, fmtSecs, busyLabel } from '/static/opprogress.js';
+import { SubagentUI } from '/static/subagents.js';
+import { apiKeySelect, baseInfo, baseEmptyHint, setDefaultBaseUrl, loadApiKeys } from '/static/apikeys.js';
+import { modal as fxModal, topDialog } from '/static/dialogs.js';
+import { settingsDialog } from '/static/settings.js';
 import { bannerModel, settingsModel, snoozeText, netText, hostsText, checkText, pctOf, UpdateStore, UpdateBanner, updateAction, updateSettingsField } from '/static/update.js';
 
 const $ = (id) => document.getElementById(id);
@@ -230,10 +234,11 @@ function renderChrome() {
   const why = dead ? '会话已退出' : d ? '请先处理当前对话框' : busy ? '运行中，请等本轮结束（或先中断）' : s.meta.link === 'down' ? '与计算节点的连接已断开' : '';
   const modeBlocked = dead ? '会话已退出' : d ? '请先处理当前对话框' : s.meta.link === 'down' ? '与计算节点的连接已断开' : '';
   ctl.update({
-    sid: s.sid, model: s.modelInfo.model || '默认模型', effort: s.modelInfo.effort || '默认', why,
+    sid: s.sid, model: s.modelInfo.model || '默认模型', effort: (s.meta.effort_locked && s.meta.effort_locked.level) || s.modelInfo.effort || '默认', why,
+    effortLock: effortLockText(s.meta),
     mode: st.mode || '', cycle: cycleOf(s.meta), modeBlocked,
     onModel: () => openModel(s, true),
-    onEffort: () => openEffortModal({ s, actions, current: s.modelInfo.effort }),
+    onEffort: () => openEffortModal({ s, actions, current: (s.meta.effort_locked && s.meta.effort_locked.level) || s.modelInfo.effort }),
     onPickMode: (id, needsRestart) => record(needsRestart ? 'restart' : 'mode', { mode: id }),
     onCycle: () => record('mode/cycle'),
   });
@@ -525,6 +530,9 @@ async function autoTest() {
   log('== 13b. 输入框底栏（模型/effort 胶囊、权限模式、Shift+Tab、不换行、分级折叠）');
   await composerBarChecks();
 
+  log('== 13b2. effort 被 CLAUDE_CODE_EFFORT_LEVEL 锁定（CLI 2.1.332）：胶囊带锁 + 说明、弹窗提示、max 档「保存为默认」置灰、结果绝不显示 null');
+  await effortLockChecks();
+
   log('== 13c. 侧栏「新回复」/「待处理」（sessrow.js：状态优先级、行 class、颜色、窗口标题未读数）');
   await sessRowChecks();
 
@@ -543,11 +551,161 @@ async function autoTest() {
   log('== 14d. /context 卡片与命令输出的 ANSI 颜色（ctxcard.js：真机 transcript、用量条、分类、小节、原文上色与网格对齐、浅色 / 深色）');
   await contextChecks();
 
+  log('== 14e. 子代理被停止（CLI 2.1.332：TaskStop / 用户停止后托盘立即移除、Agent 卡与通知行「已终止」；回复中途吸收的 attachment 通知）');
+  await subStopChecks();
+
+  log('== 14f. 删除的会话不复活（迟到事件 / 别的窗口删除 / 重连回放；同名会话按 sid 区分）');
+  removedChecks();
+
+  log('== 14g. API key 对话框（叠放的对话框只有一个是模态、每个输入框都能输入、修改地址、设置里的默认 base_url）');
+  await apiKeyChecks();
+
   log('== 15. 红线 / 控制台');
   check(calls.every((c) => c.gesture), '所有请求都发生在用户点击中（共 ' + calls.length + ' 个）');
   check(errors === 0, '控制台零错误');
   $('fx-result').textContent = `自测完成：通过 ${checksOk} · 失败 ${checksBad} · 控制台错误 ${errors}`;
   window.__fxResult = { ok: checksOk, bad: checksBad, errors, calls: calls.length };
+}
+
+// ---------- API key 对话框 ----------
+// 朋友在 dmg 版（WKWebView）里遇到「base_url 输入框打不进字」：API key 管理弹窗是从「新建会话」对话框里打开的，
+// 叠放了多个 showModal()。现在同一时刻只有一个模态对话框，嵌套的挂在它里面（dialogs.js modal()）。
+// 这里逐个检查：能获得焦点、点中的是它本身（没有覆盖层）、没有 inert / readonly / 0 宽、按键不被吞、能插入文字。
+function fxCanType(el, text) {
+  if (!el) return 'missing';
+  el.focus();
+  if (document.activeElement !== el) return 'no-focus';
+  if (el.readOnly || el.disabled) return 'readonly';
+  if (el.closest('[inert]')) return 'inert';
+  const b = el.getBoundingClientRect();
+  if (b.width < 60 || b.height < 16) return 'size ' + Math.round(b.width) + 'x' + Math.round(b.height);
+  if (document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2) !== el) return 'covered';
+  const kd = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true, cancelable: true });
+  el.dispatchEvent(kd);
+  if (kd.defaultPrevented) return 'keydown-prevented';
+  const before = el.value;
+  el.setSelectionRange(before.length, before.length);
+  if (!document.execCommand('insertText', false, text) || el.value !== before + text) return 'insert-failed';
+  return 'ok';
+}
+
+async function apiKeyChecks() {
+  const OWN = 'http://127.0.0.1:2/own', DEF = 'http://127.0.0.1:3';
+  const keys = [
+    { id: 'kown', name: 'own', masked: 'sk-test…1111', base_url: OWN, is_server_default: false, created_at: 1, in_use: 0 },
+    { id: 'knob', name: 'nobase', masked: 'sk-test…2222', base_url: null, is_server_default: false, created_at: 2, in_use: 1 },
+  ];
+  let cfgDefault = '';
+  const gets = [];
+  const fakeApi = {
+    get: async (path) => {
+      gets.push(path);
+      if (path === '/api/api_keys') return { keys: keys.map((k) => ({ ...k })), default_base_url: cfgDefault };
+      if (path.startsWith('/api/api_keys/usage')) return { usage: {} };
+      if (path === '/api/notify') return { sounds: [], available: false };
+      return {};
+    },
+    post: async (path, body) => {
+      record('apikey ' + path, body);
+      if (path === '/api/config') { cfgDefault = body.default_base_url || ''; return { default_base_url: cfgDefault }; }
+      return { api_key: { id: 'knew', name: body.name, masked: 'x…y', base_url: body.base_url || null, is_server_default: false } };
+    },
+    patch: async (path, body) => { record('apikey PATCH ' + path, body); const k = keys.find((x) => path.endsWith('/' + x.id)); if (k) Object.assign(k, body); return { api_key: k }; },
+    del: async (path) => { record('apikey DELETE ' + path); return {}; },
+  };
+  // 纯函数：地址显示的优先级
+  check(baseInfo({ base_url: OWN }, DEF).text === OWN && baseInfo({ base_url: null }, DEF).text === DEF + '（默认）'
+    && baseInfo({ base_url: null }, '').text === '默认地址（settings.json）', '地址：自己的 base_url → 默认 base_url（标注「默认」）→ 默认地址（settings.json）');
+  check(baseEmptyHint(DEF).includes(DEF) && baseEmptyHint('').includes('settings.json'), 'base_url 留空时的说明随默认 base_url 变化');
+
+  // 「新建会话」对话框（模态）里的「API」下拉 → 管理 API key…（真实路径：select 的 change）
+  const pick = apiKeySelect(fakeApi, {});
+  const host = fxModal({ title: '新建会话（回放）', body: h('div', { class: 'form-grid' }, pick.el, pick.hint), actions: [] });
+  await raf();
+  pick.el.value = '__manage__';
+  pick.el.dispatchEvent(new Event('change'));
+  await new Promise((r) => setTimeout(r, 120));
+  const mg = topDialog();
+  const modals = [...document.querySelectorAll('dialog[open]')].filter((d) => d.matches(':modal'));
+  check(mg && mg !== host && mg.classList.contains('nested') && host.contains(mg) && modals.length === 1 && modals[0] === host,
+    '从新建会话里打开「管理 API key」：只有一个模态对话框，管理弹窗嵌在它里面（WKWebView 叠放多个模态对话框时输入框可能打不进字）');
+  check(host.querySelector(':scope > .modal-form').inert && !mg.closest('[inert]'), '下层对话框的内容 inert，上层不受影响');
+  check(!mg.querySelector('input[type=password]'), '没有 type=password（不触发 WebKit / 密码管理器的强密码自动填充）');
+  const nameI = mg.querySelector('input[name=api_key_name]'), keyI = mg.querySelector('input[name=api_key_value]'), baseI = mg.querySelector('input[name=api_key_base]');
+  check(keyI && keyI.type === 'text' && getComputedStyle(keyI).webkitTextSecurity === 'disc' && keyI.getAttribute('autocomplete') === 'off',
+    'API key 输入框：普通文本框 + 圆点遮挡，autocomplete=off');
+  const r1 = [fxCanType(nameI, 'friend'), fxCanType(keyI, 'sk-test-x1234567'), fxCanType(baseI, 'http://127.0.0.1:4')];
+  check(r1.every((x) => x === 'ok'), '管理弹窗：名称 / API key / base_url 都能获得焦点并输入（' + r1.join(' / ') + '）');
+  check(baseI.placeholder === 'https://…' && [...mg.querySelectorAll('.apikey-add .field-sub')].map((e) => e.textContent).join() === '名称,API key,base_url（可选）',
+    '每个输入框单独一行、有自己的标签；placeholder 只是示例（不会被看成"已经用默认地址"）');
+  check(baseI.parentElement.querySelector('.field-hint').textContent.includes('settings.json'), '没有默认 base_url 时说明「留空 = 沿用 settings.json」');
+  const rows = () => [...mg.querySelectorAll('.apikey-row')];
+  check(rows().length === 2 && rows().every((r) => r.querySelector('.apikey-setbase')?.textContent === '修改地址'), '每条 key 都有「修改地址」入口');
+  check(rows()[1].querySelector('.apikey-base').textContent === '默认地址（settings.json）' && rows()[0].querySelector('.apikey-base').textContent === OWN,
+    '列表地址：自己的 base_url / 默认地址（settings.json）');
+  check(calls.length === calls.filter((c) => c.gesture).length, '打开弹窗、输入都不发写请求');
+
+  // 修改地址 → 编辑弹窗（嵌在管理弹窗里），焦点直接在 base_url
+  await click(rows()[1].querySelector('.apikey-setbase'), '修改地址');
+  await raf();
+  const ed = topDialog();
+  const edBase = ed && ed.querySelector('input[name=api_key_base]');
+  check(ed && ed !== mg && mg.contains(ed) && document.activeElement === edBase && [...document.querySelectorAll('dialog[open]')].filter((d) => d.matches(':modal')).length === 1,
+    '「修改地址」打开编辑弹窗（嵌套、仍只有一个模态），焦点直接在 base_url 上');
+  check(mg.querySelector(':scope > .modal-form').inert && fxCanType(edBase, 'http://127.0.0.1:5') === 'ok', '编辑弹窗的 base_url 能输入；管理弹窗暂时 inert');
+  edBase.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 60));
+  check(!ed.isConnected && mg.open && host.open && !mg.querySelector(':scope > .modal-form').inert, 'Esc 只关最上层（编辑），管理弹窗恢复可用');
+  check(fxCanType(nameI, '2') === 'ok', '关掉编辑弹窗后管理弹窗的输入框仍能输入');
+  const nCalls = calls.length;
+  await click(rows()[1].querySelector('.apikey-setbase'), '修改地址');
+  await raf();
+  const ed2 = topDialog();
+  const ed2Base = ed2.querySelector('input[name=api_key_base]');
+  ed2Base.value = '';
+  fxCanType(ed2Base, 'http://127.0.0.1:6');
+  await click([...ed2.querySelectorAll('button')].find((b) => b.textContent === '保存'), '编辑 · 保存');
+  await new Promise((r) => setTimeout(r, 60));
+  const pc = calls.slice(nCalls).find((c) => c.op.startsWith('apikey PATCH'));
+  check(pc && pc.gesture && pc.body.base_url === 'http://127.0.0.1:6' && !ed2.isConnected, '保存地址：PATCH base_url（点击触发）并关闭编辑弹窗');
+  keys[1].base_url = null;   // 改回没有地址，看默认 base_url 的显示
+  await loadApiKeys(fakeApi);
+
+  // 设置里的默认 base_url 生效：列表里没有地址的 key 显示「（默认）」
+  setDefaultBaseUrl(DEF);
+  await raf();
+  check(rows()[1].querySelector('.apikey-base').textContent === DEF + '（默认）' && baseI.parentElement.querySelector('.field-hint').textContent.includes(DEF),
+    '设置了默认 base_url：没有地址的 key 显示「…（默认）」，新增表单的说明随之更新');
+  check([...pick.el.options].some((o) => o.textContent.includes(DEF + '（默认）')), '新建会话的 API 下拉里同样显示默认 base_url');
+  await click([...mg.querySelectorAll('.modal-actions button')].find((b) => b.textContent === '完成'), '完成');
+  await raf();
+  check(!mg.isConnected && host.open && !host.querySelector(':scope > .modal-form').inert,
+    '关掉管理弹窗回到新建会话对话框（不再 inert）');
+  host.close();
+  await raf();
+  setDefaultBaseUrl('');
+
+  // 设置弹窗：默认 base_url
+  const sp = settingsDialog(fakeApi, { config: { default_base_url: '' } });
+  await raf();
+  const sd = topDialog();
+  const sb = sd && sd.querySelector('input[name=default_base_url]');
+  check(!!sb && fxCanType(sb, 'ftp://x') === 'ok', '设置里有「默认 base_url」输入框并能输入');
+  const nc2 = calls.length;
+  sb.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 30));
+  check(calls.length === nc2 && sd.querySelector('.field-err').textContent.includes('格式不正确'), '格式不对：提示错误、不保存');
+  sb.value = '';
+  fxCanType(sb, DEF);
+  await click([...sd.querySelectorAll('button')].find((b) => b.textContent === '保存'), '设置 · 保存默认 base_url');
+  await new Promise((r) => setTimeout(r, 60));
+  const cc = calls.slice(nc2).find((c) => c.op === 'apikey /api/config');
+  check(cc && cc.gesture && cc.body.default_base_url === DEF && baseInfo({ base_url: null }).text === DEF + '（默认）', '保存：POST /api/config {default_base_url}（点击触发），key 的地址显示随之更新');
+  check(sd.textContent.includes('不读写 ~/.claude') && sd.textContent.includes('/v1/usage'), '设置里说明默认 base_url 的用途（查询用量、启动时写进 key 文件；不碰 ~/.claude）');
+  await click([...sd.querySelectorAll('.modal-actions button')].find((b) => b.textContent === '完成'), '设置 · 完成');
+  await sp;
+  setDefaultBaseUrl('');
+  check(!document.querySelector('dialog[open]'), '对话框全部关闭');
 }
 
 // ---------- 输入框不抖动 ----------
@@ -1203,6 +1361,70 @@ async function sessRowChecks() {
 }
 
 // ---------- 输入框底栏 ----------
+async function effortLockChecks() {
+  // 纯函数：结果原文 / 提醒文字（null、缺字段都不显示成 "null"）
+  const t0 = appliedToast({ ok: true, result: null }, 'session');
+  check(t0.text === '仅本会话' && t0.level === 'info', 'result 为 null：提示只写「仅本会话」，不出现 null');
+  const t1 = appliedToast({ ok: true, result: null, code: 'result_unknown', warning: '结果未知，请查看终端面板' }, 'session');
+  check(t1.text === '结果未知，请查看终端面板' && t1.level === 'warn', '结果未知：warn 提示「结果未知，请查看终端面板」');
+  const t2 = appliedToast({ ok: true, result: 'Set model to `Haiku 5.5` for this session only · effort stays max (set by CLAUDE_CODE_EFFORT_LEVEL); xhigh isn\'t saved', code: 'effort_env_locked', warning: 'effort 被环境变量 CLAUDE_CODE_EFFORT_LEVEL=max 锁定' }, 'session');
+  check(t2.level === 'warn' && t2.text.includes('Haiku 5.5') && !t2.text.includes('`') && t2.text.includes('锁定'), '/model 结果 + 锁定提醒：原文去掉反引号，附锁定说明');
+  check([null, undefined, {}, { result: 5 }, { result: '  ' }].every((r) => !/null|undefined/.test(appliedToast(r, 'save').text) && resultText(r) === ''), '各种缺失 / 非字符串结果都不显示 null / undefined');
+  check(effortSaveBlocked('max') !== '' && effortSaveBlocked('high') === '' && effortLockText({}) === '' && effortLockText(null) === '', 'max 档不能保存为默认；没锁定时没有说明');
+
+  const n0 = calls.length;
+  show('stream:ready');
+  pushMeta({ state: 'idle', link: 'ready', effort: 'max', effort_locked: { level: 'max', source: 'CLAUDE_CODE_EFFORT_LEVEL' } });
+  await raf();
+  const eb = $('fx-effort-btn');
+  check(eb.classList.contains('is-locked') && eb.textContent.trim() === 'max' && !!eb.querySelector('svg.cb-lock'), '锁定时胶囊右半显示实际档位 max + 锁图标');
+  check(/CLAUDE_CODE_EFFORT_LEVEL=max 锁定/.test(eb.title) && /实际仍是 max/.test(eb.title) && /重启会话/.test(eb.title), 'tooltip 说明被环境变量锁定、实际档位与解决办法');
+  check(getComputedStyle(eb).color !== getComputedStyle($('fx-model-btn')).color, '锁定时 effort 用警示色');
+  await click(eb, 'effort 按钮（锁定）');
+  let dlg = document.querySelector('dialog.modal[open]');
+  const note = dlg && dlg.querySelector('.effort-lock-note');
+  check(!!note && note.textContent.includes('CLAUDE_CODE_EFFORT_LEVEL=max') && note.textContent.includes('~/.zshrc'), 'effort 弹窗里提示锁定与清除方法');
+  check(!!dlg && dlg.textContent.includes('当前：max'), '弹窗当前档位 = 锁定的 max');
+  const saveBtn = () => [...dlg.querySelectorAll('button')].find((b) => b.textContent.startsWith('保存为默认'));
+  const why = () => dlg.querySelector('.save-why');
+  check(saveBtn().disabled && /只能「仅本会话」/.test(saveBtn().title) && !why().hidden && why().textContent.includes('max'), 'max 档：「保存为默认」置灰并说明原因');
+  await click([...dlg.querySelectorAll('.seg-item')].find((b) => b.textContent === 'high'), 'high');
+  check(!saveBtn().disabled && why().hidden, '换到 high：「保存为默认」恢复可用');
+  await click([...dlg.querySelectorAll('.seg-item')].find((b) => b.textContent === 'max'), 'max');
+  check(saveBtn().disabled, '再选 max：重新置灰');
+  await click([...dlg.querySelectorAll('.seg-item')].find((b) => b.textContent === 'xhigh'), 'xhigh');
+  // 后端：CLI 回报 "CLAUDE_CODE_EFFORT_LEVEL=max overrides this session — …" → 409 effort_env_locked
+  const origEffort = actions.applyEffort, origApplied = actions.onApplied;
+  const LOCK_MSG = 'effort 被环境变量 CLAUDE_CODE_EFFORT_LEVEL=max 锁定：本会话实际仍是 max。清除该变量（例如 ~/.zshrc 里的 export）后重启会话即可调整';
+  actions.applyEffort = async (_s, body) => { record('effort', body); const e = new Error(LOCK_MSG); e.code = 'effort_env_locked'; e.status = 409; throw e; };
+  await click([...dlg.querySelectorAll('button')].find((b) => b.textContent === '仅本会话（s）'), '仅本会话（锁定）');
+  await sleep(50);
+  const errEl = dlg.querySelector('.field-err');
+  check(dlg.open && errEl.textContent.startsWith('没有生效：') && errEl.textContent.includes('实际仍是 max') && !/null/.test(errEl.textContent), '锁定：弹窗留着，显示「没有生效」+ 中文说明（不显示 null）');
+  let toastText = null;
+  actions.applyEffort = async (_s, body) => { record('effort', body); return { ok: true, result: null, state: {}, code: 'result_unknown', warning: '结果未知，请查看终端面板' }; };
+  actions.onApplied = (_s, r, scope) => { toastText = appliedToast(r, scope).text; };
+  await click([...dlg.querySelectorAll('button')].find((b) => b.textContent === '仅本会话（s）'), '仅本会话（结果未知）');
+  await sleep(50);
+  check(toastText === '结果未知，请查看终端面板' && !document.querySelector('dialog.modal[open]'), '结果未知：弹窗关闭，提示「结果未知，请查看终端面板」，没有 null');
+  actions.applyEffort = origEffort; actions.onApplied = origApplied;
+  const ef = calls.slice(n0).filter((c) => c.op === 'effort');
+  check(ef.length === 2 && ef.every((c) => c.body.level === 'xhigh' && c.body.scope === 'session' && c.gesture), '两次 POST effort 都来自点击（xhigh / 仅本会话）');
+  // 切换模型弹窗里也提示锁定
+  await click($('fx-model-btn'), '切换模型（锁定）');
+  await sleep(600);
+  dlg = document.querySelector('dialog.modal[open]');
+  check(!!dlg && !!dlg.querySelector('.effort-lock-note') && dlg.querySelector('.effort-lock-note').textContent.includes('CLAUDE_CODE_EFFORT_LEVEL'), '切换模型弹窗里也提示 effort 被锁定');
+  if (dlg) await click([...dlg.querySelectorAll('button')].find((b) => b.textContent.startsWith('取消')), '取消');
+  await sleep(300);
+  // 解除锁定（重启后）：恢复普通外观
+  pushMeta({ effort: 'low', effort_locked: null });
+  show('stream:ready');
+  await raf();
+  check(!$('fx-effort-btn').classList.contains('is-locked') && !$('fx-effort-btn').querySelector('svg.cb-lock') && $('fx-effort-btn').textContent.trim() === 'low', '没有锁定时胶囊恢复普通显示');
+  check(calls.slice(n0).every((c) => c.gesture), '本节所有请求都来自点击');
+}
+
 async function composerBarChecks() {
   const bar = document.querySelector('.fx .composer-bar');
   const ta = $('fx-input');
@@ -1862,6 +2084,155 @@ async function contextChecks() {
   check(calls.length === nCalls, '/context 卡片不发任何请求、不按任何键');
   pushTranscript(transcriptEntries(), true);
   await raf(); flushNow(s);
+}
+
+// ---------- 子代理被停止（subagents.js 托盘 + render.js 的 Agent 卡 / 通知行） ----------
+// 形状照 fixtures/subagent_stop/absorbed（服务器真实样本脱敏）：主会话回复中途调 TaskStop，killed 通知被 CLI 吸收为
+// attachment/queued_command（没有 user 条目）；agent 只转发精简版（node_agent.note_attachment）。摘要是后端给的（Python 单测覆盖判定）。
+const SS_AID = 'a8d153a165a587509', SS_TU = 'toolu_01YBHwjpKR3o53b7jLGihQZd';
+const SS_NOTE = '<task-notification>\n<task-id>' + SS_AID + '</task-id>\n<tool-use-id>' + SS_TU + '</tool-use-id>\n<output-file>/tmp/claude-1000/x/tasks/' + SS_AID + '.output</output-file>\n<status>killed</status>\n<summary>Agent "搭建沙盒" was stopped by Claude</summary>\n<note>A task-notification fires each time this agent stops with no live background children of its own.</note>\n</task-notification>';
+function ssEntries() {
+  const t0 = Date.parse('2026-11-25T02:40:33Z');
+  const ts = (sec) => new Date(t0 + sec * 1000).toISOString();
+  const launched = 'Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: ' + SS_AID + ' (internal ID - do not mention to user.)\nThe agent is working in the background. You will be notified automatically when it completes.';
+  return [
+    { type: 'user', uuid: 'ss-u1', timestamp: ts(0), origin: { kind: 'human' }, promptSource: 'typed', message: { role: 'user', content: '派一个执行者搭建沙盒' } },
+    { type: 'assistant', uuid: 'ss-a1', timestamp: ts(27), message: { role: 'assistant', content: [{ type: 'tool_use', id: SS_TU, name: 'Agent', input: { description: '搭建沙盒', prompt: '搭建一个小沙盒并汇报。', subagent_type: 'executor', run_in_background: true } }] } },
+    { type: 'user', uuid: 'ss-u2', timestamp: ts(27.3), toolUseResult: { isAsync: true, status: 'async_launched', agentId: SS_AID, description: '搭建沙盒' }, message: { role: 'user', content: [{ tool_use_id: SS_TU, type: 'tool_result', content: [{ type: 'text', text: launched }] }] } },
+    { type: 'user', uuid: 'ss-u3', timestamp: ts(230), origin: { kind: 'human' }, promptSource: 'typed', message: { role: 'user', content: '中断所有subagent' } },
+    { type: 'assistant', uuid: 'ss-a2', timestamp: ts(235.5), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_ss_stop', name: 'TaskStop', input: { task_id: SS_AID } }] } },
+    { type: 'user', uuid: 'ss-u4', timestamp: ts(235.6), message: { role: 'user', content: [{ tool_use_id: 'toolu_ss_stop', type: 'tool_result', content: '{"message":"Successfully stopped task: ' + SS_AID + ' (搭建沙盒)","task_id":"' + SS_AID + '","task_type":"local_agent"}' }] } },
+    { type: 'attachment', uuid: 'ss-at1', parentUuid: 'ss-u4', timestamp: ts(235.7), isSidechain: false, attachment: { type: 'queued_command', commandMode: 'task-notification', prompt: SS_NOTE, origin: { kind: 'task-notification' } } },
+    { type: 'assistant', uuid: 'ss-a3', timestamp: ts(247), message: { role: 'assistant', content: [{ type: 'text', text: '执行者已中断，现在没有子代理在运行。' }] } },
+  ];
+}
+function ssSummary(status) {
+  const t0 = Date.parse('2026-11-25T02:41:00Z') / 1000;
+  const sum = { agent_id: SS_AID, tool_use_id: SS_TU, description: '搭建沙盒', agent_type: 'executor', model: 'claude-opus-5-5', background: true,
+    status, raw_status: status === 'killed' ? 'killed' : null, started_at: t0, last_activity: t0 + 208, tool_uses: 1,
+    last_action: 'Bash: mkdir -p sandbox && ls sandbox', entries: 4, notifications: status === 'killed' ? 1 : 0, has_transcript: true };
+  if (status !== 'running') Object.assign(sum, { ended_at: t0 + 208.7, duration_ms: 208700 });
+  return { type: 'subagent', agent_id: SS_AID, gen: 1, from: 4, total: 4, entries: [], reset: false, summary: sum };
+}
+let fxSaUI = null;
+async function subStopChecks() {
+  const nCalls = calls.length;
+  let fetches = 0;
+  const origFetch = window.fetch;
+  window.fetch = (...a) => { fetches++; return origFetch(...a); };
+  const prevOn = state.onSubagent;
+  try {
+    if (!fxSaUI) {
+      fxSaUI = new SubagentUI({ api: async () => { throw new Error('回放页不应请求子代理详情'); }, toast: (t) => log('（toast）' + t) });
+      const inner = document.querySelector('.composer .composer-inner');
+      inner.insertBefore(fxSaUI.tray, inner.firstChild);
+    }
+    state.onSubagent = (ss, aid, added, reset) => { if (prevOn) prevOn(ss, aid, added, reset); fxSaUI.onUpdate(ss, aid, added, reset); };
+    s.subagents.clear();
+    fxSaUI.setSession(s);
+    const ents = ssEntries();
+    const cut = ents.findIndex((e) => e.type === 'attachment');
+    pushTranscript(ents.slice(0, cut - 2), true);   // 派出子代理、用户说"中断所有subagent"
+    applyEnvelope(state, env('subagent', ssSummary('running')));
+    await raf(); flushNow(s);
+    const tray = fxSaUI.tray;
+    const card = () => qa('.k-tool').find((el) => el.querySelector('.sa-card-row'));
+    check(!tray.hidden && tray.querySelectorAll('.sa-item').length === 1 && /1 个运行中/.test(tray.textContent) && /搭建沙盒/.test(tray.textContent),
+      '运行中：输入框上方托盘列出 1 个子代理');
+    check(!!card() && card().querySelector('.sa-card-row').classList.contains('st-running') && /子代理运行中/.test(card().textContent), 'Agent 卡：子代理运行中');
+    // TaskStop：子代理文件末尾的中断标记 → 后端摘要立即变 killed（通知还没到）
+    pushTranscript(ents.slice(cut - 2, cut), false);
+    applyEnvelope(state, env('subagent', ssSummary('killed')));
+    await raf(); flushNow(s);
+    check(tray.hidden && !tray.querySelector('.sa-item'), '被停止后托盘立即移除（没有运行中的子代理 → 托盘隐藏）');
+    const row = card() && card().querySelector('.sa-card-row');
+    check(!!row && row.classList.contains('st-killed') && card().classList.contains('st-interrupted') && /子代理已终止/.test(card().textContent),
+      'Agent 卡：子代理已终止（' + (row ? row.textContent : '无') + '）');
+    check(!/运行中/.test(card().textContent), 'Agent 卡不再显示运行中 / 最近动作');
+    check(!qa('.k-subnote').length, '通知到达前没有结束通知行');
+    // 回复中途吸收的 attachment 通知 → 结束通知行
+    const nItems = s.items.length;
+    pushTranscript(ents.slice(cut), false);
+    await raf(); flushNow(s);
+    const notes = qa('.k-subnote');
+    check(notes.length === 1 && notes[0].classList.contains('st-killed') && /子代理「搭建沙盒」已终止/.test(notes[0].textContent),
+      'attachment 通知渲染成结束通知行「子代理「搭建沙盒」已终止」：' + (notes[0] ? notes[0].textContent : '无'));
+    check(s.items.length === nItems + 2 && !qa('.k-user').some((el) => /task-notification/.test(el.textContent)), '通知不显示成用户消息（只多了通知行与回复）');
+    check(!!notes[0] && !notes[0].querySelector('.sa-note-tog') && !!notes[0].querySelector('.st-warn'), '通知行：停止图标、没有结果可展开（被停止的通知不带 <result>）');
+    // 其它 attachment：排队的用户消息（commandMode=prompt）/ 未知类型不渲染；纯文本通知 → 系统消息
+    const n2 = s.items.length;
+    pushTranscript([
+      { type: 'attachment', uuid: 'ss-at2', timestamp: ents[cut].timestamp, attachment: { type: 'queued_command', commandMode: 'prompt', prompt: '中断所有会话', origin: { kind: 'human' } } },
+      { type: 'attachment', uuid: 'ss-at3', timestamp: ents[cut].timestamp, attachment: { type: 'skill_listing', content: SS_NOTE } },
+    ], false);
+    await raf(); flushNow(s);
+    check(s.items.length === n2, '非通知的 attachment 不渲染');
+    pushTranscript([{ type: 'attachment', uuid: 'ss-at4', timestamp: ents[cut].timestamp, attachment: { type: 'queued_command', commandMode: 'task-notification', prompt: 'Background agent "第三次数数" was stopped by the user.' } }], false);
+    await raf(); flushNow(s);
+    check(s.items.length === n2 + 1 && qa('.k-hint').some((el) => /系统消息：Background agent "第三次数数" was stopped by the user\./.test(el.textContent)),
+      '纯文本的停止通知（Ctrl+X Ctrl+K / Ctrl+C）显示为系统消息');
+    // 侧栏：主会话空闲且没有运行中的子代理 → 不再「子代理运行中」
+    const subRunning = [...s.subagents.values()].filter((a) => a.summary && a.summary.status === 'running').length;   // 同 app.js runningSubagents
+    const idleMeta = { state: 'idle', link: 'ready' };
+    check(subRunning === 0 && sessionStatus({ meta: idleMeta, subRunning })[1] === '空闲'
+      && sessionStatus({ meta: idleMeta, subRunning: 1 })[1] === '子代理运行中',
+      '侧栏：停止后不再「子代理运行中」（' + sessionStatus({ meta: idleMeta, subRunning })[1] + '）');
+    check(calls.length === nCalls && fetches === 0, '整个过程不发任何请求 / 按键');
+  } finally {
+    window.fetch = origFetch;
+    state.onSubagent = prevOn;
+    if (fxSaUI) fxSaUI.setSession(null);
+  }
+}
+
+// ---------- 删除的会话不复活（render.js：applyEnvelope / forgetSession / createsSession，纯状态，不挂 DOM） ----------
+function removedChecks() {
+  const removedCalls = [];
+  const st = createState({ actions: {}, onRemoved: (sid) => removedCalls.push(sid) });
+  const SA_ = 'sdeleted00001', SB_ = 'ssametitle002';
+  let g = 100;
+  const ev = (sid, kind, data) => ({ gseq: ++g, sid, ts: Date.now() / 1000, kind, data });
+  const meta = (sid, m, extra) => ev(sid, 'app', { type: 'meta', meta: { sid, ...m }, ...(extra || {}) });
+  // 两个同名（同一句首条输入）、不同 key 的会话
+  ensureSession(st, SA_, { title: '这是我导师想的一个idea', state: 'exited', api_key_name: 'demouser_d' });
+  ensureSession(st, SB_, { title: '这是我导师想的一个idea', state: 'idle', api_key_name: 'demouser' });
+  applyEnvelope(st, ev(SB_, 'subagent', { type: 'subagent', agent_id: 'aB', gen: 1, from: 0, total: 0, entries: [], summary: { agent_id: 'aB', status: 'running' } }));
+  applyEnvelope(st, ev(SA_, 'transcript', { type: 'transcript', entries: [{ type: 'user', uuid: 'uA', timestamp: '2026-11-25T02:40:00Z', message: { role: 'user', content: 'A 的消息' } }], reset: true }));
+  const a = st.sessions.get(SA_), b = st.sessions.get(SB_);
+  check(a !== b && a.items.length === 1 && b.items.length === 0 && b.subagents.size === 1 && a.subagents.size === 0,
+    '同名会话按 sid 各自接收事件（A 的条目不进 B、B 的子代理不进 A）');
+  // 本页删除 A，之后才到的事件（exited meta / 子代理 / 屏幕 / transcript / exit）都不能把它加回来
+  forgetSession(st, SA_);
+  for (const e of [meta(SA_, { title: '这是我导师想的一个idea', state: 'exited' }),
+    ev(SA_, 'subagent', { type: 'subagent', agent_id: 'aA', gen: 1, from: 0, total: 0, entries: [], summary: { agent_id: 'aA', status: 'killed' } }),
+    ev(SA_, 'screen', { type: 'screen', state: { busy: false }, text: '' }),
+    ev(SA_, 'transcript', { type: 'transcript', entries: [], reset: true }),
+    ev(SA_, 'app', { type: 'exit', exit_status: 0 }),
+    meta(SA_, { state: 'idle' }, { added: true })]) applyEnvelope(st, e);
+  check(!st.sessions.has(SA_) && st.sessions.has(SB_) && st.sessions.get(SB_).meta.api_key_name === 'demouser',
+    '删除后迟到的事件（含 added）都丢弃，不复活；同名的另一个会话不受影响');
+  // 未知 sid：只有新建会话的那条 meta（data.added）能创建
+  applyEnvelope(st, meta('sunknown00003', { state: 'exited', title: 'x' }));
+  applyEnvelope(st, ev('sunknown00003', 'subagent', { type: 'subagent', agent_id: 'q', summary: { status: 'running' } }));
+  check(!st.sessions.has('sunknown00003'), '未知 sid 的普通事件不创建会话');
+  applyEnvelope(st, meta('snew000000004', { state: 'starting', title: '新会话' }, { added: true }));
+  check(st.sessions.has('snew000000004') && st.sessions.get('snew000000004').meta.title === '新会话' && createsSession(meta('x', {}, { added: true })) && !createsSession(meta('x', {})),
+    '新建会话（data.added，例如在别的窗口新建）照常出现');
+  // 别的窗口删除：后端推 app/removed → 回调界面清理并记住，之后的事件也不复活；暂存（hold）中也立即生效
+  const bs = st.sessions.get(SB_);
+  bs.hold = true;
+  applyEnvelope(st, ev(SB_, 'app', { type: 'removed' }));
+  check(!st.sessions.has(SB_) && removedCalls.join() === SB_ && st.removed.has(SB_) && bs.held.length === 0, 'app/removed：立即移除（暂存中的会话也一样）并通知界面');
+  applyEnvelope(st, meta(SB_, { state: 'idle' }));
+  applyEnvelope(st, ev(SB_, 'subagent', { type: 'subagent', agent_id: 'aB', summary: { status: 'running' } }));
+  check(!st.sessions.has(SB_), 'removed 之后再到的事件同样丢弃');
+  applyEnvelope(st, ev('sother0000005', 'app', { type: 'removed' }));
+  check(removedCalls.length === 1 && st.removed.has('sother0000005'), '未知 sid 的 removed：只记住，不回调');
+  // 重连回放（同一批 gseq 再来一遍，含更早的 meta）：已删除的仍不复活；lastGseq 照常前进
+  const before = st.lastGseq;
+  applyEnvelope(st, { ...meta(SA_, { state: 'exited' }), gseq: 5 });
+  applyEnvelope(st, meta(SA_, { state: 'exited' }));
+  check(!st.sessions.has(SA_) && st.lastGseq > before && st.lastGseq === g, '重连回放不复活已删除的会话（lastGseq 照常前进）');
 }
 
 // ---------- dmg 版自动更新（update.js） ----------

@@ -185,7 +185,8 @@ class CCRServer:
             base = pathlib.Path(getattr(config_store, "path", ccr_config.DEFAULT_DATA_DIR / "config.json")).parent
             api_keys = ccr_api_keys.ApiKeyStore(base / "api_keys.json")
         self.api_keys = api_keys
-        self.usage = ccr_usage.UsageService(api_keys)   # 各 key 近 7 天用量（本地直接查网关，缓存 5 分钟）
+        # 各 key 近 7 天用量（本地直接查网关，缓存 5 分钟）；没有自己 base_url 的 key 用设置里的默认 base_url
+        self.usage = ccr_usage.UsageService(api_keys, get_default_base=lambda: config_store.get().get("default_base_url"))
         # 可视化：大图片引用的服务端 LRU；本机会话的文件预览（/preview/<cap>/…，只读）
         self.blobs = ccr_blobs.BlobCache()
         data_dir = getattr(manager, "data_dir", None) or pathlib.Path(
@@ -1099,7 +1100,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if method == "GET" and kid is None:
                 keys = [dict(k, in_use=len(in_use(k["id"]))) for k in store.list_public()]
-                return self._send_json(200, {"keys": keys})
+                # default_base_url：设置里的默认 base_url（没有自己 base_url 的 key 用它；"" = 没设置），前端据此显示地址
+                return self._send_json(200, {"keys": keys, "default_base_url": self.app.usage.default_base() or ""})
             if method == "POST" and kid is None:
                 body = self._read_json(64 * 1024)
                 pub = store.add(body.get("name"), body.get("key"), body.get("base_url"),

@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.332
+▝▜██████▀  Haiku 5.5 with low effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/proj
+
+
+❯ 这是界面测试。请用 Agent 工具派两个后台子代理（run_in_background 设为 true，model 用 haiku，subagent_type 用                                                                                          
+  general-purpose），描述分别是「数数甲」「数数乙」。每个子代理的任务都是：不使用任何工具，从 1 数到 800，每个数字单独一行。派完后直接回复「已派出」即可。                                              
+
+⏺ 2 background agents launched (↓ to manage)
+   ├ 数数甲
+   └ 数数乙          
+           
+⏺ 已派出             
+
+✻ Waiting for 2 background agents to finish
+
+› Message from @general-purpose (ctrl+o to expand)
+
+⏺
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✳ Polishing… (1s · ↓ 106 tokens · thinking with low effort)
+  ⎿  Tip: Drag and drop images into your terminal                                                                                                                                                     
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                                                                                                                       
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: 2% | ⚙ 5 tok/s | 💰 $0.00328097 | 5h: 1.0M tok, $1.00 | 7d: 9.0M tok, $9.00 | 14:26                                                                             
+  ⏵⏵ auto mode on (shift+tab to cycle) · /tasks to see subagents · esc to interrupt · ↓ to manage
+                                                                                                                                                                                                        
+  ⏺ main                                                                                                                                                                                              
+  ◯ general-purpose  数数甲                                                                                                                                                        8s · ↑ 13.0k tokens

@@ -32,6 +32,19 @@ export function toast(text, level = 'info', ms = 4200) {
 }
 
 // ---------- 通用 modal ----------
+/** 最上层的已打开对话框（嵌套的对话框挂在下层对话框里面，文档顺序在后） */
+export function topDialog() {
+  const ds = document.querySelectorAll('dialog.modal[open]');
+  return ds.length ? ds[ds.length - 1] : null;
+}
+
+/**
+ * 同一时刻只有一个真正的模态对话框（showModal）。已有对话框打开时（如在「新建会话」里打开「管理 API key」，
+ * 再在里面打开「编辑」），新对话框挂在最上层对话框**里面**、用非模态 show() 打开，下层对话框的内容设 inert。
+ * 原因：原生窗口（WKWebView）里叠放多个 showModal() 的对话框时，上层对话框的输入框可能打不进字
+ * （朋友在 dmg 版里遇到：API key 管理弹窗的 base_url 等输入框无法输入）。嵌套的对话框是当前模态对话框的后代，
+ * 不受"模态对话框之外都是 inert"影响；Esc 只关闭最上层；下层关闭时先关掉嵌套在里面的（各自的 onClose 照常调用）。
+ */
 export function modal({ title, body, actions, wide, onClose }) {
   const dlg = h('dialog', { class: 'modal' + (wide ? ' wide' : '') });
   const close = h('button', { class: 'icon-btn', type: 'button', title: '关闭（Esc）', tabindex: '-1' }, icon('x'));
@@ -40,12 +53,48 @@ export function modal({ title, body, actions, wide, onClose }) {
     h('div', { class: 'modal-body' }, body),
     actions ? h('div', { class: 'modal-actions' }, actions) : null);
   dlg.appendChild(form);
+  const host = topDialog();
+  const hostForm = host ? host.querySelector(':scope > .modal-form') : null;
   close.addEventListener('click', () => dlg.close(''));
-  dlg.addEventListener('close', () => { if (onClose) onClose(dlg.returnValue); dlg.remove(); });
+  dlg.addEventListener('close', () => {
+    for (const inner of [...dlg.querySelectorAll(':scope > dialog.modal[open]')]) inner.close('');
+    if (hostForm) hostForm.inert = false;
+    if (onClose) onClose(dlg.returnValue);
+    dlg.remove();
+    // 回到下层对话框：焦点还没在它里面时放回它的第一个可用控件（不会自动回去）
+    const a = document.activeElement;
+    if (host && host.open && !(a && a !== document.body && host.contains(a))) {
+      const f = hostForm && hostForm.querySelector('input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]):not([tabindex="-1"])');
+      if (f) f.focus();
+    }
+  });
   // 阻止 <form method=dialog> 的默认提交（由各对话框自行处理）
   form.addEventListener('submit', (e) => e.preventDefault());
-  document.body.appendChild(dlg);
-  dlg.showModal();
+  if (host) {
+    dlg.classList.add('nested');
+    host.appendChild(dlg);
+    if (hostForm) hostForm.inert = true;
+    dlg.show();
+  } else {
+    // Esc（浏览器把它交给唯一的模态对话框 = 最底层）：有嵌套的对话框时只关最上层那个。
+    // keydown 里处理并 preventDefault；万一浏览器仍发 cancel，同一次按键不再多关一层
+    let escAt = -1;
+    dlg.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || e.isComposing || e.keyCode === 229) return;
+      const top = topDialog();
+      if (!top || top === dlg) return;
+      e.preventDefault();
+      escAt = e.timeStamp;
+      top.close('');
+    });
+    dlg.addEventListener('cancel', (e) => {
+      const top = topDialog();
+      if (escAt >= 0 && e.timeStamp - escAt < 100) { e.preventDefault(); escAt = -1; return; }
+      if (top && top !== dlg) { e.preventDefault(); top.close(''); }
+    });
+    document.body.appendChild(dlg);
+    dlg.showModal();
+  }
   return dlg;
 }
 

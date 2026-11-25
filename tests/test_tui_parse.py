@@ -900,3 +900,133 @@ class TestContextCmd(unittest.TestCase):
     def test_old_fixtures_have_no_context_usage(self):
         for text in _old_frames():
             self.assertIsNone(parse_screen(text)["context_usage"])
+
+
+# ============================================================================ CLI 2.1.332（macOS 真机，fixtures/cli_2_1_332/）
+def C332(name):
+    return parse_screen((FIX / "cli_2_1_332" / (name + ".txt")).read_text(encoding="utf-8"))
+
+
+class TestCli2_1_332(unittest.TestCase):
+    """/effort、/model 的新结果文案（含 CLAUDE_CODE_EFFORT_LEVEL 锁定）、子代理列表 ⏺ / stopped / 焦点模式、模式行新后缀。"""
+
+    def test_effort_normal(self):
+        d = C332("effort_panel")["dialog"]
+        self.assertEqual((d["kind"], d["level"]), ("effort", "low"))
+        self.assertIn("s to use this session only", d["hints"])
+        r = C332("effort_set")
+        self.assertEqual(r["last_result"], "Set effort level to medium (this session only): Balanced approach with "
+                                           "standard implementation and testing")
+        self.assertEqual(r["cmd_result"]["effort"], "medium")
+        self.assertIsNone(r["cmd_result"]["effort_locked"])
+
+    def test_effort_env_locked(self):
+        d = C332("locked_effort_panel")["dialog"]
+        self.assertEqual((d["kind"], d["level"]), ("effort", "max"))
+        self.assertEqual(d["hints"], "←/→ to adjust · Enter to use this session only · Esc to cancel")
+        self.assertIn("Enter to save", C332("locked_effort_xhigh")["dialog"]["hints"])
+        r = C332("locked_effort_result")
+        self.assertIsNone(r["dialog"])
+        self.assertEqual(r["last_result"],
+                         "CLAUDE_CODE_EFFORT_LEVEL=max overrides this session — clear it and xhigh takes over")
+        self.assertEqual(r["cmd_result"]["effort"], "max")       # 实际档位 = 锁定的那一档
+        self.assertEqual(r["cmd_result"]["effort_locked"],
+                         {"level": "max", "source": "CLAUDE_CODE_EFFORT_LEVEL", "wanted": "xhigh"})
+
+    def test_model_results(self):
+        r = C332("model_set")
+        self.assertEqual(r["last_result"], "Set model to Haiku 5.5 for this session only")
+        self.assertEqual((r["cmd_result"]["model"], r["cmd_result"]["effort"]), ("Haiku 5.5", None))
+        r = C332("model_set_with_effort")
+        self.assertEqual((r["cmd_result"]["model"], r["cmd_result"]["effort"]), ("Haiku 5.5", "high"))
+        r = C332("locked_model_result")
+        self.assertEqual(r["cmd_result"]["model"], "Haiku 5.5")
+        self.assertEqual(r["cmd_result"]["effort_locked"]["level"], "max")
+        d = C332("locked_model_panel")["dialog"]
+        self.assertEqual((d["kind"], d["effort"]["level"]), ("model", "max"))
+        self.assertEqual(C332("locked_model_xhigh")["dialog"]["effort"]["level"], "xhigh")
+
+    def test_parse_cmd_result_variants(self):
+        p = tui_parse.parse_cmd_result
+        cases = {
+            "Set model to `Opus 5.5` for this session only · effort stays max (set by CLAUDE_CODE_EFFORT_LEVEL); "
+            "xhigh isn't saved": ("Opus 5.5", "max", "max"),
+            "Set model to Opus 5.5 and saved as your default": ("Opus 5.5", None, None),
+            "Set model to `Opus 5.5` and saved as your default · effort stays max (set by CLAUDE_CODE_EFFORT_LEVEL)":
+                ("Opus 5.5", "max", "max"),
+            "Set model to Sonnet 5.5 with high effort (this session only)": ("Sonnet 5.5", "high", None),
+            "Kept model as `Haiku 5.5`": ("Haiku 5.5", None, None),
+            "Kept model as **Haiku 5.5**": ("Haiku 5.5", None, None),
+            "Set model to Fable 5.2 (1M context)": ("Fable 5.2", None, None),
+            "Set effort level to xhigh": (None, "xhigh", None),
+            "\x1b[1mSet effort level to low\x1b[22m (this session only)": (None, "low", None),
+            "CLAUDE_CODE_EFFORT_LEVEL=high overrides this session — clear it and low takes over": (None, "high", "high"),
+            "Cancelled": (None, None, None),
+        }
+        for text, (model, effort, locked) in cases.items():
+            r = p(text)
+            self.assertEqual((r["model"], r["effort"], (r["effort_locked"] or {}).get("level")), (model, effort, locked),
+                             text)
+        for bad in (None, "", "  ", 5):
+            self.assertIsNone(p(bad))
+
+    def test_clean_model_name(self):
+        c = tui_parse.clean_model_name
+        self.assertEqual(c("Haiku 5.5 for this session only · effort stays max (set by CLAUDE_CODE_EFFORT_LEVEL); "
+                           "low isn't saved"), "Haiku 5.5")
+        self.assertEqual(c("Opus 5.5 for this session only"), "Opus 5.5")
+        self.assertEqual(c("`Opus 5.5`"), "Opus 5.5")
+        self.assertEqual(c("Sonnet 5.5 with high effort"), "Sonnet 5.5")
+        for same in ("Opus 5.5", "Haiku 5.5", "claude-fable-5-1[1m]", "Fable 5.2 (1M)"):
+            self.assertEqual(c(same), same)
+        self.assertIsNone(c("  "))
+        self.assertIsNone(c(None))
+
+    def test_mode_line_suffixes(self):
+        for name, suffix in (("idle_start", "← for agents"), ("agents_resume", "↓ to resume subagent"),
+                             ("agents_running", "/tasks to see subagents")):
+            r = C332(name)
+            self.assertEqual(r["mode"], "auto", name)
+            self.assertIn(suffix, r["mode_line"], name)
+            self.assertFalse(r["agents_focus"], name)
+        r = C332("agents_tasks_hint")
+        self.assertTrue(r["busy"])
+        self.assertIsNone(r["hints"]["shells"])
+
+    def test_agents_mac_dot_and_stopped(self):
+        r = C332("agents_running")
+        self.assertTrue(r["input"]["visible"])
+        self.assertEqual([a["name"] for a in r["agents_panel"]], ["main", "general-purpose", "general-purpose"])
+        self.assertTrue(r["agents_panel"][0]["current"])
+        self.assertEqual(r["agents_panel"][1]["desc"], "长数甲")
+        self.assertEqual(r["agents_panel"][1]["info"], "6s · ↑ 11.4k tokens")
+        self.assertNotIn("main", r["status_line"])
+        r = C332("agents_resume")
+        a = r["agents_panel"][2]
+        self.assertEqual((a["desc"], a["info"], a["state"]), ("长数乙", "stopped · 22s · ↑ 14.7k tokens", "stopped"))
+        self.assertEqual(r["status_line"].count("\n"), 0)
+
+    def test_agents_focus(self):
+        for name, hint, sel in (("agents_focus_main", "↑/↓ to select", 0),
+                                ("agents_focus_row", "enter to view · x to stop · ctrl+x ctrl+k to stop all agents", 1),
+                                ("agents_focus_stopped", "enter to view · x to clear", 1),
+                                ("agents_focus_stopped2", "enter to view · x to clear", 2)):
+            r = C332(name)
+            self.assertTrue(r["agents_focus"], name)
+            self.assertEqual(r["agents_hint"], hint, name)
+            self.assertIsNone(r["mode"], name)               # 看不出权限模式，不能误判成 manual
+            self.assertIsNone(r["mode_line"], name)
+            self.assertIsNone(r["dialog"], name)
+            self.assertTrue(r["input"]["visible"], name)
+            self.assertEqual([a["selected"] for a in r["agents_panel"]], [i == sel for i in range(3)], name)
+            self.assertNotIn("general-purpose", r["status_line"], name)
+            self.assertNotIn("enter to view", r["status_line"], name)
+            self.assertNotIn("to select", r["status_line"], name)
+        self.assertEqual(C332("agents_focus_stopped")["agents_panel"][1]["state"], "stopped")
+
+    def test_all_frames_sane(self):
+        for p in sorted((FIX / "cli_2_1_332").glob("*.txt")):
+            r = parse_screen(p.read_text(encoding="utf-8"))
+            if r["dialog"] is None:
+                self.assertTrue(r["input"]["visible"], p.name)
+                self.assertNotIn("⏺", r["status_line"] or "", p.name)

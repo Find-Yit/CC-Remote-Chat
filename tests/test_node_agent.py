@@ -1002,6 +1002,30 @@ class GuardUnitTests(unittest.TestCase):
         self.assertEqual(node_agent.PANEL_HEAD_RE.pattern, tui_parse._PANEL_HEAD_RE.pattern)
         self.assertEqual(node_agent.PANEL_CLOSE_RE.pattern, tui_parse._PANEL_CLOSE_RE.pattern)
 
+    def test_input_box_matches_tui_parse_cli_2_1_332(self):
+        """CLI 2.1.332（macOS）：子代理列表圆点是 ⏺、焦点在列表上时选中行前有 "❯ "。agent 的 find_input_box 与
+        tui_parse 对每一帧给出同样的结论（guard input_box 才不会误拒 / 误放），两份子代理行正则一致。"""
+        from ccr import tui_parse
+        texts = [p.read_text(encoding="utf-8") for p in sorted((ROOT / "fixtures" / "cli_2_1_332").glob("*.txt"))]
+        frames = (ROOT / "fixtures" / "subagent_sample" / "screen_frames.txt").read_text(encoding="utf-8")
+        texts += [x for x in re.split(r"^=== t=[0-9.]+\n", frames, flags=re.M) if x.strip()]
+        boxes = 0
+        for t in texts:
+            lines = node_agent.screen_lines(t)
+            self.assertEqual(lines, tui_parse.screen_lines(t))
+            got = node_agent.find_input_box(lines) is not None
+            self.assertEqual(got, tui_parse.parse_screen(t)["input"]["visible"], t[-400:])
+            boxes += got
+        self.assertGreater(boxes, 40)
+        self.assertEqual(node_agent.G_AGENT_ROW_RE.pattern, tui_parse._FOOTER_AGENT_ROW_RE.pattern)
+        # 焦点在列表上、两行状态栏（"⏺ main"、"❯ ◯ …" 是子代理行，不占状态栏/模式行的 4 行额度）：仍是输入框
+        foc = (ROOT / "fixtures" / "cli_2_1_332" / "agents_focus_row.txt").read_text(encoding="utf-8")
+        self.assertIsNone(node_agent.check_guard(foc, {"input_box": True}))
+        extra = foc.replace("\n  enter to view", "\n  第二行状态栏 · 12:00\n  enter to view", 1)
+        self.assertNotEqual(extra, foc)
+        self.assertIsNone(node_agent.check_guard(extra, {"input_box": True}))
+        self.assertTrue(tui_parse.parse_screen(extra)["input"]["visible"])
+
     def test_guards_with_diff_panel(self):
         """右侧 diff 面板打开时：对话框画在左栏（上横线是 "───│───"），tail / lines / input_box / hint 都按裁后的行复核。"""
         from ccr import session as S

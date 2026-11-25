@@ -532,8 +532,34 @@ def refify_entry(d, ref_base):
     return d
 
 
+def note_attachment(d):
+    """主 transcript 的 attachment 条目 → 精简版；只认 CLI 在回复中途吸收的子代理/后台任务通知
+    （`attachment.type == "queued_command"` 且 `commandMode` 或 `origin.kind` 为 task-notification，CLI 2.1.332 实测：
+    这种通知不再另写 user 条目），其它 attachment（环境、技能清单、排队的用户消息…）一律返回 None。
+    只保留 type/uuid/parentUuid/timestamp/isSidechain 与 attachment 的 type/commandMode/origin.kind/prompt。"""
+    a = d.get("attachment")
+    if not isinstance(a, dict) or a.get("type") != "queued_command":
+        return None
+    origin = a.get("origin") if isinstance(a.get("origin"), dict) else {}
+    kind = origin.get("kind") if isinstance(origin.get("kind"), str) else None
+    if a.get("commandMode") != "task-notification" and kind != "task-notification":
+        return None
+    prompt = a.get("prompt")
+    if isinstance(prompt, list):   # 防御：内容块形式只取文字
+        prompt = "\n".join(str(b.get("text") or "") for b in prompt if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    out = {k: d[k] for k in ("type", "uuid", "parentUuid", "timestamp", "isSidechain") if k in d}
+    att = {"type": "queued_command", "commandMode": "task-notification", "prompt": prompt}
+    if kind:
+        att["origin"] = {"kind": kind[:64]}
+    out["attachment"] = att
+    return out
+
+
 def filter_entry(line, types=TRANSCRIPT_TYPES, sidechain=False, max_bytes=None, ref=None):
     """解析一行 transcript；只保留 types 里的类型（主 transcript 另外跳过 isSidechain）。
+    主 transcript（types 为默认值）另外转发回复中途吸收的子代理通知（attachment，见 note_attachment）。
 
     给了 ref=(kind, 标识, 该行字节偏移) 时先把大图片换成引用（refify_entry），再截断：
     字符串字段超过 MAX_STR 截断并加 "truncated":true；给了 max_bytes 时（子代理），
@@ -542,7 +568,12 @@ def filter_entry(line, types=TRANSCRIPT_TYPES, sidechain=False, max_bytes=None, 
         d = json.loads(line.decode("utf-8", "replace"))
     except ValueError:
         return None
-    if not isinstance(d, dict) or d.get("type") not in types or (d.get("isSidechain") and not sidechain):
+    if (isinstance(d, dict) and d.get("type") == "attachment" and types is TRANSCRIPT_TYPES
+            and not d.get("isSidechain")):
+        d = note_attachment(d)
+        if d is None:
+            return None
+    elif not isinstance(d, dict) or d.get("type") not in types or (d.get("isSidechain") and not sidechain):
         return None
     if ref is not None:
         d = refify_entry(d, ref)
@@ -1323,7 +1354,7 @@ G_RULE_RE = re.compile(r"^─{20,}(?: [^─\n]{1,200} ─{1,8})?\s*$")   # 与 t
 G_TOP_RE = re.compile(r"^▔{20,}\s*$")
 G_OPT_RE = re.compile(r"^\s*(❯\s*)?\d{1,2}\.\s+\S")
 G_DIALOG_RE = re.compile(r"Esc to cancel|Enter to select|Enter to confirm|Do you want to")
-G_AGENT_ROW_RE = re.compile(r"^\s*[●◯○◉◐]\s+\S")
+G_AGENT_ROW_RE = re.compile(r"^\s*(?:❯\s+)?[●◯○◉◐⏺]\s+\S")   # 与 tui_parse._FOOTER_AGENT_ROW_RE 相同（2.1.332：⏺、焦点行 "❯ "）
 G_POPUP_RE = re.compile(r"^\s{2,4}(❯\s)?\s*(/[\w:.\-]+)(?:\s{2,}.*)?$")
 G_HINT_RE = re.compile(r"^\s{10,}\S")
 POPUP_CMD_RE = re.compile(r"/[\w:.\-]{1,64}\Z")

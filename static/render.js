@@ -48,7 +48,24 @@ export function createState(opts = {}) {
     onModelInfo: opts.onModelInfo || null,
     onSubagent: opts.onSubagent || null,
     onFlush: opts.onFlush || null,   // 条目写进 DOM / 补渲染之后（左侧 prompt 小格子据此重建，见 minimap.js）
+    onRemoved: opts.onRemoved || null,   // 后端推来 app/removed（会话在别处被删除）：(sid) => 移除界面
+    removed: new Set(),   // 本页已删除的 sid（sid 是随机的、不会复用）：之后到达的任何事件都不能把它"复活"
   };
+}
+
+/** 从 state 里移除会话并记住它已删除（之后到达的该 sid 的事件一律丢弃） */
+export function forgetSession(state, sid) {
+  state.removed.add(sid);
+  const s = state.sessions.get(sid);
+  state.sessions.delete(sid);
+  return s || null;
+}
+
+/** 未知 sid 的信封能否创建会话：只有后端新建会话时的那条 meta（data.added）可以；
+ *  其它（迟到的 exited meta / subagent / screen / transcript…）一律丢弃。bootstrap 与新建接口的返回另走 ensureSession。 */
+export function createsSession(env) {
+  const d = env && env.data;
+  return !!d && env.kind === 'app' && d.type === 'meta' && d.added === true;
 }
 
 export function ensureSession(state, sid, meta) {
@@ -89,6 +106,14 @@ export function ensureSession(state, sid, meta) {
 export function applyEnvelope(state, env) {
   if (!env || typeof env !== 'object' || !env.sid) return null;
   if (typeof env.gseq === 'number' && env.gseq > state.lastGseq) state.lastGseq = env.gseq;
+  if (env.kind === 'app' && env.data && env.data.type === 'removed') {
+    // 会话已在后端删除（可能是别的窗口删的）：不经暂存，立即移除
+    if (state.sessions.has(env.sid) && state.onRemoved) state.onRemoved(env.sid);   // 先让界面清理（视图、定时器…）
+    forgetSession(state, env.sid);
+    return null;
+  }
+  if (state.removed.has(env.sid)) return null;
+  if (!state.sessions.has(env.sid) && !createsSession(env)) return null;
   const s = ensureSession(state, env.sid, null);
   if (s.hold) { s.held.push(env); return s; }
   applyToSession(s, env);
@@ -351,6 +376,7 @@ export function fmtElapsed(sec) {
 
 function setModelInfo(s, key, value, src) {
   if (!value) return;
+  if (key === 'effort' && !EFFORT_LEVELS.includes(value)) return;   // 只认五个档位（状态栏里的 "effort:null" 之类不显示）
   const mi = s.modelInfo;
   if (mi[key] === value && mi[key + 'Src'] === src) return;
   mi[key] = value;
@@ -361,7 +387,9 @@ function setModelInfo(s, key, value, src) {
 const STATUS_MODEL_RE = /\[([^\[\]·]+?)\s*·[^\[\]]*?effort:\s*([a-z]+)\s*\]/i;
 const BANNER_RE = /^[^\n]*?\s{2,}([A-Z][^\n]*?) with ([a-z]+) effort(?: ·|\s*$)/m;
 const SPINNER_EFFORT_RE = /thinking with ([a-z]+) effort/i;
-const SET_MODEL_RE = /(?:Set model to|Kept model as)\s+`?\**([^`*\n(]+?)\**`?(?:\s*\(|\s*$|\s*·|\s+with\b)/i;
+// 只取模型名本身：CLI 2.1.332 是 "Set model to Haiku 5.5 for this session only[ with high effort | · effort stays max …]"，
+// transcript 里名字带反引号（"Kept model as `Haiku 5.5`"）；与 ccr.tui_parse.parse_cmd_result 一致
+const SET_MODEL_RE = /(?:Set model to|Kept model as)\s+(?:`([^`\n]+)`|\*\*([^*\n]+)\*\*|([^\n]+?))(?=\s+for this session\b|\s+and saved\b|\s+with\s+\S+\s+effort\b|\s+\(|\s+·|\s*;|\s*$)/im;
 const SET_EFFORT_RE = /effort(?: level)?(?: to| as|:)\s+`?\**([a-z]+)/i;
 
 function inferFromScreen(s, st, text) {
@@ -433,7 +461,7 @@ function addCommand(s, c, ts, level) {
 function noteCommandOutput(s, out) {
   out = stripAnsi(out);
   const m = out.match(SET_MODEL_RE);
-  if (m) setModelInfo(s, 'model', m[1].trim(), 'command');
+  if (m) setModelInfo(s, 'model', (m[1] || m[2] || m[3] || '').trim(), 'command');
   const e = out.match(SET_EFFORT_RE);
   if (e && /^(low|medium|high|xhigh|max)$/i.test(e[1])) setModelInfo(s, 'effort', e[1].toLowerCase(), 'command');
 }
@@ -476,6 +504,7 @@ export function applyTranscript(s, entries, reset, sessionId) {
       if (e.type === 'assistant') { onAssistant(s, e, ts); assistantSeen = true; }
       else if (e.type === 'user') { if (onUser(s, e, ts)) assistantSeen = true; }
       else if (e.type === 'system') onSystem(s, e, ts);
+      else if (e.type === 'attachment') onAttachment(s, e, ts);
     } catch (err) {
       addItem(s, 'hint', { level: 'warn', text: 'transcript 条目渲染出错：' + (err && err.message) });
     }
@@ -603,6 +632,20 @@ function onUser(s, e, ts) {
     addItem(s, 'user', { text: texts.join('\n\n'), imageBlocks: images, ts, truncated: !!e.truncated });
   }
   return ended;
+}
+
+/** 回复中途被 CLI 吸收的通知（attachment / queued_command / commandMode=task-notification；CLI 2.1.332 实测不再另写
+ *  user 条目，agent 只转发这一种 attachment）：与 user 条目形式的通知同样处理 */
+function onAttachment(s, e, ts) {
+  const a = e.attachment && typeof e.attachment === 'object' ? e.attachment : null;
+  if (!a || a.type !== 'queued_command') return;
+  const kind = a.origin && typeof a.origin === 'object' ? a.origin.kind : null;
+  if (a.commandMode !== 'task-notification' && kind !== 'task-notification') return;
+  const raw = typeof a.prompt === 'string' ? a.prompt : resultText(a.prompt);
+  const note = parseTaskNotification(raw);
+  if (note) { addSubnote(s, note, ts); return; }
+  const text = stripReminders(raw).trim();
+  if (text) addItem(s, 'hint', { level: 'info', text: '系统消息：' + truncate(text.split('\n')[0], 160), detail: text, ts });
 }
 
 /** 子代理结束通知：挂到对应 Agent 卡上（卡片状态/结果），并在时间线上留一条小系统行 */

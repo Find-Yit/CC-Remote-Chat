@@ -618,6 +618,298 @@ class FakeTuiAgentTests(unittest.TestCase):
         notes = [SA.parse_notification(e["message"]["content"]) for e in self.transcript() if SA.notification_text(e)]
         self.assertEqual([x["status"] for x in notes], ["killed"])
 
+    def sub_tracker(self, sub):
+        t = SA.Tracker()
+        t.absorb_main([e for e in (NA.filter_entry(json.dumps(x).encode()) for x in self.transcript()) if e])
+        raw = pathlib.Path(sub.jsonl).read_bytes().split(b"\n")
+        t.apply_event(sub.aid, json.loads(pathlib.Path(sub.metap).read_text(encoding="utf-8")),
+                      [e for e in (NA.filter_entry(x, NA.SUBAGENT_TYPES, True, NA.MAX_SUB_ENTRY_BYTES)
+                                   for x in raw if x.strip()) if e], True)
+        return t
+
+    def test_ctrl_x_ctrl_k_stops_subagent(self):
+        a = self.app
+        a.on_text("/agent")
+        a.on_key("Enter")
+        self.run_turn(a, until=lambda: bool(a.agents))
+        sub = next(iter(a.agents.values()))
+        a.on_key("C-x")
+        a.on_key("C-k")
+        self.assertIn(fake_tui.KILL_HINT, "\n".join(a.frame()))
+        self.assertEqual(len(a.agents), 1)    # 第一次只提示
+        a.on_key("C-x")
+        a.on_key("C-k")
+        self.assertEqual(a.agents, {})
+        meta = json.loads(pathlib.Path(sub.metap).read_text(encoding="utf-8"))
+        self.assertEqual((meta.get("finished"), meta.get("stoppedByUser")), (False, True))
+        self.run_turn(a)
+        frame = "\n".join(a.frame())
+        self.assertIn("● Background agents stopped", frame)
+        raw = [json.loads(x) for x in pathlib.Path(sub.jsonl).read_text(encoding="utf-8").splitlines() if x]
+        convo = [x for x in raw if x["type"] in ("user", "assistant")]
+        self.assertTrue(SA.is_interrupt_marker(convo[-1]["message"]["content"]))   # 停止后不再写子代理条目
+        tr = self.transcript()
+        self.assertTrue(any(e.get("subtype") == "agents_killed" for e in tr))
+        plain = [e for e in tr if e.get("type") == "user" and e.get("origin", {}).get("kind") == "task-notification"]
+        self.assertEqual([e["message"]["content"] for e in plain],
+                         ['Background agent "%s" was stopped by the user.' % fake_tui.AGENT_DESC])
+        self.assertFalse(any(SA.notification_text(e) for e in tr))
+        self.assertEqual(self.sub_tracker(sub).summary(sub.aid)["status"], "killed")
+
+    def test_agentstop_absorbed_attachment(self):
+        a = self.app
+        a.on_text("/agentstop")
+        a.on_key("Enter")
+        self.run_turn(a)
+        self.assertEqual(a.agents, {})
+        frame = "\n".join(a.frame())
+        self.assertIn("Stop Task", frame)
+        tr = self.transcript()
+        tu = [b["name"] for e in tr if e.get("type") == "assistant" for b in e["message"]["content"]
+              if b.get("type") == "tool_use"]
+        self.assertEqual(tu, ["Agent", "TaskStop"])
+        self.assertFalse(any(e.get("type") == "user" and SA.notification_text(e) for e in tr))
+        att = [e for e in tr if e.get("type") == "attachment" and SA.notification_text(e)]
+        self.assertEqual(len(att), 1)
+        sub = FakeSubFiles(self.home)
+        meta = json.loads(pathlib.Path(sub.metap).read_text(encoding="utf-8"))
+        self.assertFalse(meta.get("finished") or meta.get("stoppedByUser"))
+        t = self.sub_tracker(sub)
+        s = t.summary(sub.aid)
+        self.assertEqual((s["status"], s["raw_status"], s["summary"]),
+                         ("killed", "killed", 'Agent "%s" was stopped by Claude' % fake_tui.AGENT_DESC))
+
+
+class FakeSubFiles(object):
+    """fake 会话里唯一一个子代理的文件路径（/agentstop 结束后 app.agents 已清空）。"""
+    def __init__(self, home):
+        metas = list(pathlib.Path(home).glob(".claude/projects/*/*/subagents/agent-*.meta.json"))
+        assert len(metas) == 1, metas
+        self.metap = str(metas[0])
+        self.jsonl = self.metap[:-len(".meta.json")] + ".jsonl"
+        self.aid = metas[0].name[len("agent-"):-len(".meta.json")]
+
+
+# ============================================================================ 被中断 / 被停止的子代理（CLI 2.1.332 实测）
+# fixtures/subagent_stop/：本机 2.1.332 真机录制（只保留 user/assistant/system/queue-operation 与通知 attachment，
+# 去掉 thinking 签名与 hook 信息），同一会话里四个后台子代理分别被这样停止：
+#   慢慢数数   Ctrl+X Ctrl+K 两次 → meta.stoppedByUser、子代理末尾中断标记、system agents_killed、纯文本通知（无 task-id）
+#   再数一次   Claude 调 TaskStop（本轮刚好结束）→ 中断标记；killed 通知 3 秒后才作为 user 条目出现
+#   第三次数数 空闲时 Ctrl+C → 同 Ctrl+X Ctrl+K，但纯文本通知是"被动"的（下一条用户消息时才以 attachment 送达）
+#   第四次数数 子代理列表里按 x → meta.stoppedByUser + 中断标记 + killed 通知（"was stopped by user"）
+# fixtures/subagent_stop/absorbed/：服务器上的真实样本（脱敏改写）——主会话回复中途 TaskStop，killed 通知被吸收为
+#   attachment/queued_command，**没有** user 条目；子代理 meta 没有 finished / stoppedByUser，只有末尾的中断标记。
+STOP = pathlib.Path(__file__).resolve().parent.parent / "fixtures" / "subagent_stop"
+STOP_MAIN = "9d61c899-4e9a-4d4b-b33c-03d3d2708ec9"
+ABS_MAIN = "4c4bf040-0000-4000-8000-000000000001"
+S_KK, S_TS, S_CC, S_X = "a5083efeea30bdfd0", "a463eec73b10b26d4", "a27061ff901fbfbd5", "a7d061856955cf1d7"
+S_ABS = "a8d153a165a587509"
+
+
+def lines_of(path, *a, **kw):
+    out = []
+    for line in pathlib.Path(path).read_bytes().split(b"\n"):
+        if line.strip():
+            e = NA.filter_entry(line, *a, **kw)
+            if e is not None:
+                out.append(e)
+    return out
+
+
+def stop_sub(root, aid):
+    return (json.loads((root / "subagents" / ("agent-%s.meta.json" % aid)).read_text(encoding="utf-8")),
+            lines_of(root / "subagents" / ("agent-%s.jsonl" % aid), NA.SUBAGENT_TYPES, sidechain=True,
+                     max_bytes=NA.MAX_SUB_ENTRY_BYTES))
+
+
+def marker(uid, ts="2026-11-22T12:00:09Z", text="[Request interrupted by user for tool use]"):
+    return {"type": "user", "uuid": uid, "timestamp": ts, "message": {"role": "user", "content": [
+        {"type": "text", "text": text}]}}
+
+
+def asst(uid, ts, text="继续"):
+    return {"type": "assistant", "uuid": uid, "timestamp": ts, "message": {"content": [{"type": "text", "text": text}]}}
+
+
+class StoppedSubagentTests(unittest.TestCase):
+    def tracker(self, root, main, aids):
+        t = SA.Tracker()
+        t.absorb_main(lines_of(root / main))
+        for aid in aids:
+            meta, ents = stop_sub(root, aid)
+            t.apply_event(aid, meta, ents, True)
+        return t
+
+    def test_fixture_all_stops_are_killed(self):
+        t = self.tracker(STOP, "main_9d61c899.jsonl", (S_KK, S_TS, S_CC, S_X))
+        got = {s["agent_id"]: (s["status"], s["raw_status"], s["notifications"]) for s in t.summaries()}
+        self.assertEqual(got, {S_KK: ("killed", None, 0), S_TS: ("killed", "killed", 1), S_CC: ("killed", None, 0),
+                               S_X: ("killed", "killed", 1)})
+        self.assertEqual(t.counts(), {"running": 0, "total": 4})
+        s = t.summary(S_KK)
+        self.assertIsNone(s["result"])
+        self.assertTrue(s["ended_at"] >= s["started_at"])
+
+    def test_fixture_meta_and_markers(self):
+        """fixture 本身的形状（防止以后重录时丢了要点）。"""
+        for aid, stopped in ((S_KK, True), (S_TS, False), (S_CC, True), (S_X, True)):
+            meta, ents = stop_sub(STOP, aid)
+            self.assertNotIn("finished", meta)
+            self.assertEqual(meta.get("stoppedByUser", False), stopped, aid)
+            self.assertTrue(SA.is_interrupt_marker(ents[-1]["message"]["content"]), aid)
+        raw = [json.loads(x) for x in (STOP / "main_9d61c899.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(sum(1 for e in raw if e.get("subtype") == "agents_killed"), 2)
+        plain = [e for e in raw if e.get("type") == "user" and e.get("origin", {}).get("kind") == "task-notification"
+                 and isinstance(e["message"]["content"], str) and "<task-notification>" not in e["message"]["content"]]
+        self.assertEqual([e["message"]["content"] for e in plain], ['Background agent "慢慢数数" was stopped by the user.'])
+
+    def test_absorbed_taskstop_attachment(self):
+        root = STOP / "absorbed"
+        main = "main_%s.jsonl" % ABS_MAIN
+        ents = lines_of(root / main)
+        atts = [e for e in ents if e["type"] == "attachment"]
+        # 只转发通知那一条（排队的用户消息 commandMode=prompt 不转发），且只剩精简字段
+        self.assertEqual(len(atts), 1)
+        self.assertEqual(set(atts[0]), {"type", "uuid", "parentUuid", "timestamp", "isSidechain", "attachment"})
+        self.assertEqual(set(atts[0]["attachment"]), {"type", "commandMode", "prompt", "origin"})
+        self.assertTrue(atts[0]["attachment"]["prompt"].startswith("<task-notification>"))
+        self.assertTrue(SA.notification_text(atts[0]))
+        self.assertFalse(any(e["type"] == "user" and SA.notification_text(e) for e in ents))
+        t = self.tracker(root, main, (S_ABS,))
+        s = t.summary(S_ABS)
+        self.assertEqual((s["status"], s["raw_status"], s["summary"], s["notifications"]),
+                         ("killed", "killed", 'Agent "搭建沙盒" was stopped by Claude', 1))
+        # 只有子代理文件、还没读到主 transcript 的通知时，单靠末尾的中断标记也判为已终止
+        t2 = SA.Tracker()
+        t2.apply_event(S_ABS, *stop_sub(root, S_ABS), True)
+        self.assertEqual(t2.summary(S_ABS)["status"], "killed")
+        # 旧写法（没有通知、也没有中断标记）仍是运行中
+        meta, sub = stop_sub(root, S_ABS)
+        t3 = SA.Tracker()
+        t3.apply_event(S_ABS, meta, sub[:-1], True)
+        self.assertEqual(t3.summary(S_ABS)["status"], "running")
+
+    def test_live_user_stop_then_resume(self):
+        """实时顺序：meta.stoppedByUser 先到（立即已终止），之后的拒绝结果 / 中断标记不改变；被续跑后恢复运行中。"""
+        t = SA.Tracker()
+        meta = {"toolUseId": "tu1", "description": "x", "requestShape": "background"}
+        t.apply_event("ag1", meta, [{"type": "user", "uuid": "p", "timestamp": "2026-11-22T12:00:00Z",
+                                     "message": {"content": "做事"}},
+                                    {"type": "assistant", "uuid": "a", "timestamp": "2026-11-22T12:00:01Z",
+                                     "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                                              "input": {"command": "sleep 20"}}]}}], True)
+        self.assertEqual(t.summary("ag1")["status"], "running")
+        t.apply_event("ag1", dict(meta, stoppedByUser=True), [], False)
+        self.assertEqual(t.summary("ag1")["status"], "killed")
+        self.assertEqual(t.counts(), {"running": 0, "total": 1})
+        rej = {"type": "user", "uuid": "r", "timestamp": "2026-11-22T12:00:08Z", "toolUseResult": "User rejected tool use",
+               "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": fake_tui.REJECT_TEXT}]}}
+        t.apply_event("ag1", None, [rej], False)
+        self.assertEqual(t.summary("ag1")["status"], "killed")
+        t.apply_event("ag1", None, [marker("m")], False)
+        self.assertEqual(t.summary("ag1")["status"], "killed")
+        # 续跑（meta 里 stoppedByUser 仍在）：新的 user 消息 + assistant → 运行中
+        t.apply_event("ag1", None, [{"type": "user", "uuid": "u2", "timestamp": "2026-11-22T12:05:00Z",
+                                     "message": {"content": "接着做"}}], False)
+        self.assertEqual(t.summary("ag1")["status"], "running")   # 停止之后有了新的用户消息
+        t.apply_event("ag1", None, [asst("a2", "2026-11-22T12:05:01Z")], False)
+        self.assertEqual(t.summary("ag1")["status"], "running")
+        # 再次停止（只多一条中断标记）→ 已终止
+        t.apply_event("ag1", None, [marker("m2", "2026-11-22T12:06:00Z")], False)
+        self.assertEqual(t.summary("ag1")["status"], "killed")
+        # transcript reset 后整批重发：续跑过的子代理以最后一条中断标记为准
+        t.clear()
+        meta2 = dict(meta, stoppedByUser=True)
+        ents = [marker("m"), {"type": "user", "uuid": "u2", "message": {"content": "接着做"}},
+                asst("a2", "2026-11-22T12:05:01Z")]
+        t.apply_event("ag1", meta2, ents, True)
+        self.assertEqual(t.summary("ag1")["status"], "running")
+        t.clear()
+        t.apply_event("ag1", meta2, ents[:1], True)
+        self.assertEqual(t.summary("ag1")["status"], "killed")
+
+    def test_marker_precedence(self):
+        t = SA.Tracker()
+        t.apply_event("ag1", {"toolUseId": "tu1"}, [asst("a", "2026-11-22T12:00:01Z"), marker("m")], True)
+        self.assertEqual(t.summary("ag1")["status"], "killed")
+        # 被拒绝后又正常结束（finished）/ 有更新的完成通知 → 以它们为准
+        t.apply_event("ag1", {"toolUseId": "tu1", "finished": True}, [], False)
+        self.assertEqual(t.summary("ag1")["status"], "completed")
+        t2 = SA.Tracker()
+        t2.apply_event("ag2", {"toolUseId": "tu2"}, [asst("a", "2026-11-22T12:00:01Z"), marker("m")], True)
+        t2.absorb_main([note_entry("ag2", "tu2", "completed", ts="2026-11-22T12:00:10Z")])
+        self.assertEqual(t2.summary("ag2")["status"], "completed")
+        # 通知之后续跑、又被停止 → 已终止
+        t2.apply_event("ag2", None, [asst("a3", "2026-11-22T12:01:00Z"), marker("m3", "2026-11-22T12:01:05Z")], False)
+        self.assertEqual(t2.summary("ag2")["status"], "killed")
+        # 字符串形式与"[Request interrupted by user]"（等待 API 时被停）也算；普通文字不算
+        for c, want in (("[Request interrupted by user]", True), ([{"type": "text", "text": "[Request interrupted by user]"}], True),
+                        ([{"type": "text", "text": "请问 [Request interrupted by user] 是什么"}], False),
+                        ([{"type": "tool_result", "content": "[Request interrupted by user]"}], False), ("hi", False)):
+            self.assertEqual(SA.is_interrupt_marker(c), want, c)
+
+    def test_node_agent_attachment_filter(self):
+        mk = lambda a, **kw: json.dumps(dict({"type": "attachment", "uuid": "x", "attachment": a}, **kw)).encode()  # noqa: E731
+        note = "<task-notification>\n<task-id>ag1</task-id>\n<status>killed</status>\n</task-notification>"
+        ok = NA.filter_entry(mk({"type": "queued_command", "prompt": note, "commandMode": "task-notification",
+                                 "source_uuid": "s", "rendered": "x" * 100}, rendered=[{"content": "x" * 5000}]))
+        self.assertEqual(ok, {"type": "attachment", "uuid": "x", "attachment": {
+            "type": "queued_command", "commandMode": "task-notification", "prompt": note}})
+        # 只有 origin.kind 也算；纯文本通知（无 XML）同样转发（前端显示为系统消息）
+        self.assertIsNotNone(NA.filter_entry(mk({"type": "queued_command", "prompt": "Background agent \"x\" was stopped",
+                                                 "origin": {"kind": "task-notification"}})))
+        for bad in ({"type": "queued_command", "prompt": "排队的用户消息", "commandMode": "prompt", "origin": {"kind": "human"}},
+                    {"type": "queued_command", "prompt": "", "commandMode": "task-notification"},
+                    {"type": "skill_listing", "content": note}, {"type": "environment"}, "x"):
+            self.assertIsNone(NA.filter_entry(mk(bad)), bad)
+        self.assertIsNone(NA.filter_entry(mk({"type": "queued_command", "prompt": note, "commandMode": "task-notification"},
+                                             isSidechain=True)))
+        # 子代理 transcript 不转发 attachment
+        self.assertIsNone(NA.filter_entry(mk({"type": "queued_command", "prompt": note, "commandMode": "task-notification"}),
+                                          NA.SUBAGENT_TYPES, sidechain=True))
+        # 超长 prompt 截断
+        big = NA.filter_entry(mk({"type": "queued_command", "prompt": note + "y" * 30000, "commandMode": "task-notification"}))
+        self.assertTrue(big["truncated"])
+
+    def test_history_keeps_note_attachment(self):
+        lines = (STOP / "absorbed" / ("main_%s.jsonl" % ABS_MAIN)).read_bytes().split(b"\n")
+        r = H.read_lines(lines)
+        atts = [e for e in r["entries"] if e["type"] == "attachment"]
+        self.assertEqual(len(atts), 1)
+        self.assertEqual(set(atts[0]["attachment"]), {"type", "commandMode", "prompt", "origin"})
+        self.assertIn("<status>killed</status>", atts[0]["attachment"]["prompt"])
+        self.assertNotIn("rendered", atts[0])
+
+
+class SessionStoppedSubagentTests(SessionBase):
+    def test_stop_turns_working_off(self):
+        m = self.mgr()
+        sid = self.start(m)
+        feed = lambda ev: m._on_link_event("12345", dict(ev, sid=sid))  # noqa: E731
+        root = STOP / "absorbed"
+        ents = lines_of(root / ("main_%s.jsonl" % ABS_MAIN))
+        cut = next(i for i, e in enumerate(ents) if e["type"] == "attachment")
+        meta, sub = stop_sub(root, S_ABS)
+        feed({"ev": "transcript", "session_id": ABS_MAIN, "entries": ents[:cut], "reset": True})
+        feed({"ev": "subagent", "session_id": ABS_MAIN, "agent_id": S_ABS, "meta": meta, "entries": sub[:-1],
+              "reset": True})
+        self.assertEqual(m.get_meta(sid)["subagents"], {"running": 1, "total": 1})
+        self.assertTrue(m.get_meta(sid)["working"])
+        n0 = m.gseq
+        feed({"ev": "subagent", "session_id": ABS_MAIN, "agent_id": S_ABS, "meta": None, "entries": sub[-1:],
+              "reset": False})
+        self.assertEqual(m.get_meta(sid)["subagents"], {"running": 0, "total": 1})
+        self.assertFalse(m.get_meta(sid)["working"])
+        evs = [e for e in m.events_since(n0) if e["kind"] == "subagent"]
+        self.assertEqual(evs[-1]["data"]["summary"]["status"], "killed")
+        # 吸收进回复的 attachment 通知随 transcript 事件转发给前端，并补上通知信息
+        feed({"ev": "transcript", "session_id": ABS_MAIN, "entries": ents[cut:], "reset": False})
+        s = m.list_subagents(sid)["subagents"][0]
+        self.assertEqual((s["status"], s["raw_status"], s["notifications"]), ("killed", "killed", 1))
+        tr = [x for e in m.session_events(sid) if e["kind"] == "transcript" and e["gseq"] > n0
+              for x in e["data"]["entries"]]
+        self.assertEqual([x["type"] for x in tr if x["type"] == "attachment"], ["attachment"])
+
 
 # ============================================================================ history
 class HistorySubagentTests(unittest.TestCase):
@@ -698,6 +990,50 @@ class SubagentFakeEndToEnd(TS.TestIntegrationFake):
         tr = [x for e in js["events"] if e["kind"] == "transcript" for x in e["data"]["entries"]]
         self.assertTrue(any(SA.notification_text(x) for x in tr))
         self.wait_state(sid, ("idle",))
+        self.assertEqual(self.req("POST", "/api/sessions/%s/close" % sid)[0], 200)
+
+    def test_agentstop_via_sse(self):
+        """/agentstop：主会话 TaskStop 停掉子代理，通知只以 attachment 出现 → 摘要 running → killed，会话不再"在干活"。"""
+        st, boot, _, _ = self.req("GET", "/api/bootstrap")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=40)
+        conn.request("GET", "/api/stream?since=0&instance=" + boot["instance_id"],
+                     headers={"Host": self.host, "X-CCR-Token": self.tok})
+        r = conn.getresponse()
+        st, meta, _, raw = self.req("POST", "/api/sessions", {"title": "停止子代理"})
+        self.assertEqual(st, 200, raw)
+        sid = meta["sid"]
+        js = self.wait_state(sid, ("idle", "trust"))
+        if js["state"] == "trust":
+            d = self.req("GET", "/api/sessions/%s/screen" % sid)[1]["state"]["dialog"]
+            yes = next(o["index"] for o in d["options"] if o["label"].startswith("Yes"))
+            self.req("POST", "/api/sessions/%s/choose" % sid, {"index": yes})
+            self.wait_state(sid, ("idle",))
+        st, js, _, raw = self.req("POST", "/api/sessions/%s/message" % sid, {"text": "派个子代理再停掉 /agentstop"})
+        self.assertEqual(st, 200, raw)
+        statuses, atts = [], []
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            line = r.fp.readline()
+            if not line.startswith(b"data: "):
+                continue
+            ev = json.loads(line[6:])
+            if ev["sid"] != sid:
+                continue
+            if ev["kind"] == "transcript":
+                atts += [x for x in ev["data"]["entries"] if x.get("type") == "attachment"]
+            if ev["kind"] == "subagent":
+                statuses.append(ev["data"]["summary"]["status"])
+                if statuses[-1] == "killed" and atts:
+                    break
+        conn.close()
+        self.assertEqual(statuses[0], "running", statuses)
+        self.assertEqual(statuses[-1], "killed", statuses)
+        self.assertEqual(len(atts), 1)
+        self.assertIn("<status>killed</status>", atts[0]["attachment"]["prompt"])
+        self.wait_state(sid, ("idle",))
+        st, m2, _, _ = self.req("GET", "/api/sessions/%s" % sid)
+        sub = m2.get("subagents") or m2.get("meta", {}).get("subagents")
+        self.assertEqual(sub, {"running": 0, "total": 1})
         self.assertEqual(self.req("POST", "/api/sessions/%s/close" % sid)[0], 200)
 
 

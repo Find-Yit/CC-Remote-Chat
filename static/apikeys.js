@@ -1,5 +1,6 @@
 // API key 选择（--settings）：共享的 key/用量缓存、「API」下拉框、管理弹窗、"换 API 重启续接"弹窗。
-// 明文 key 只出现在"新增"的密码框里，提交后立即清空；其它地方只显示名称、掩码（sk-ab12…cd34）与 base_url。
+// 明文 key 只出现在"新增"的 key 输入框里（圆点遮挡），提交后立即清空；其它地方只显示名称、掩码（sk-ab12…cd34）与 base_url。
+// 地址：key 自己的 base_url → 设置里的默认 base_url（标注「默认」）→ 「默认地址（settings.json）」。
 // claude 只在启动时读取 key：换 API = 以 --resume 续接重启（同一个本地会话、同一段对话）。
 import { h, icon, spinner, fmtRelTime } from './dom.js';
 import { modal, toast, confirmDialog } from './dialogs.js';
@@ -14,7 +15,8 @@ export const SWITCH_COST_HINT = '换 key 后提示缓存可能失效：下一条
 const MANAGE = '__manage__';
 
 // ====================== 共享缓存（app.js 订阅变化以刷新会话头/列表标签） ======================
-const store = { keys: [], loaded: false, usage: {}, listeners: new Set() };
+// defaultBase = 设置里的默认 base_url（GET /api/api_keys 一并返回；"" = 没设置）
+const store = { keys: [], loaded: false, usage: {}, defaultBase: '', listeners: new Set() };
 
 export function onApiKeysChange(cb) { store.listeners.add(cb); return () => store.listeners.delete(cb); }
 function emit() { for (const cb of [...store.listeners]) { try { cb(); } catch (_) { /* 忽略 */ } } }
@@ -22,6 +24,7 @@ function emit() { for (const cb of [...store.listeners]) { try { cb(); } catch (
 export async function loadApiKeys(api) {
   const r = await api.get('/api/api_keys');
   store.keys = Array.isArray(r.keys) ? r.keys : [];
+  store.defaultBase = typeof r.default_base_url === 'string' ? r.default_base_url : '';
   store.loaded = true;
   emit();
   return store.keys;
@@ -36,6 +39,27 @@ export async function loadUsage(api, refresh = false) {
 }
 
 export function cachedKeys() { return store.keys; }
+/** 设置里改了默认 base_url：更新显示（用量由调用方重新拉取） */
+export function setDefaultBaseUrl(v) {
+  const nv = typeof v === 'string' ? v : '';
+  if (nv === store.defaultBase) return false;
+  store.defaultBase = nv;
+  emit();
+  return true;
+}
+
+/** key 实际用的地址：自己的 base_url → 设置里的默认 base_url → settings.json 的 ANTHROPIC_BASE_URL */
+export function baseInfo(k, defaultBase = store.defaultBase) {
+  if (k && k.base_url) return { kind: 'own', text: k.base_url, title: k.base_url };
+  if (defaultBase) return { kind: 'default', text: defaultBase + '（默认）', title: '设置里的默认 base_url：' + defaultBase };
+  return { kind: 'none', text: '默认地址（settings.json）', title: '那台机器 settings.json 的 ANTHROPIC_BASE_URL（服务器会话用服务器的，本机会话用本机的）' };
+}
+
+/** base_url 输入框下面的说明：留空时会用什么 */
+export function baseEmptyHint(defaultBase = store.defaultBase) {
+  return defaultBase ? `留空 = 用设置里的默认 base_url（${defaultBase}）`
+    : '留空 = 沿用 settings.json 的 ANTHROPIC_BASE_URL（也可以在「设置」里填写默认 base_url，用来查询用量）';
+}
 export function serverDefaultKey() { return store.keys.find((k) => k.is_server_default) || null; }
 function selectableKeys() { return store.keys.filter((k) => !k.is_server_default); }
 function usageOf(id) { return (id && store.usage[id]) || null; }
@@ -81,14 +105,14 @@ export function apiUsageTitle(meta) {
   if (!kid && isLocalMeta(m)) return 'API：本机默认（本机 ~/.claude/settings.json，不加 --settings）';
   const k = kid ? store.keys.find((x) => x.id === kid) : serverDefaultKey();
   const head = kid ? `API：${apiLabel(m)}` : 'API：服务器默认（settings.json，不加 --settings）';
-  const addr = k ? ` · ${k.base_url || '默认地址'}` : '';
+  const addr = k ? ` · ${baseInfo(k).text}` : '';
   const u = k ? usageOf(k.id) : null;
   return head + addr + (u ? '\n' + usageTitle(u) : '');
 }
 
 function keyOptionText(k) {
   const u = usageText(usageOf(k.id), { short: true });
-  return `${k.name} · ${k.masked} · ${k.base_url || '默认地址'}` + (u ? ` · ${u}` : '');
+  return `${k.name} · ${k.masked} · ${baseInfo(k).text}` + (u ? ` · ${u}` : '');
 }
 
 function defaultOptionText(local) {
@@ -155,11 +179,12 @@ export function apiKeySelect(api, { current = '', currentName = '', note = '', m
 }
 
 // ====================== 管理弹窗 ======================
-function editKeyDialog(api, k) {
+/** 编辑名称 / base_url；focusBase = 从「修改地址」打开：焦点直接放在 base_url 上 */
+function editKeyDialog(api, k, { focusBase = false } = {}) {
   return new Promise((resolve) => {
     let changed = false;
     const name = h('input', { class: 'input', type: 'text', 'aria-label': '名称', value: k.name, maxlength: '64', autocomplete: 'off', spellcheck: 'false' });
-    const base = h('input', { class: 'input mono', type: 'text', 'aria-label': 'base_url', value: k.base_url || '', placeholder: '留空 = 默认地址（settings.json 的 ANTHROPIC_BASE_URL）', autocomplete: 'off', spellcheck: 'false' });
+    const base = h('input', { class: 'input mono', type: 'text', name: 'api_key_base', 'aria-label': 'base_url', value: k.base_url || '', placeholder: 'https://…', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
     const err = h('div', { class: 'field-err' });
     const ok = h('button', { class: 'btn primary', type: 'button' }, '保存');
     const cancel = h('button', { class: 'btn ghost', type: 'button' }, '取消');
@@ -182,11 +207,12 @@ function editKeyDialog(api, k) {
     const body = h('div', { class: 'form-grid' },
       h('div', { class: 'field' }, h('label', { class: 'field-label' }, '名称'), name),
       h('div', { class: 'field' }, h('label', { class: 'field-label' }, 'base_url（可选）'), base,
+        h('div', { class: 'field-hint' }, baseEmptyHint()),
         h('div', { class: 'field-hint' }, k.is_server_default ? '服务器默认 key 的地址只用于查询用量（启动会话时不加 --settings）。' : '会写进 claude 所在机器（计算节点，或本机会话时的本机）上的 key 文件（ANTHROPIC_BASE_URL）。')),
       h('div', { class: 'muted small-text' }, 'key 本身不能修改；要换 key 请删除后重新添加。'),
       err);
     const dlg = modal({ title: '编辑「' + k.name + '」', body, actions: [cancel, ok], onClose: () => resolve(changed) });
-    name.focus();
+    if (focusBase) { base.focus(); base.select(); } else name.focus();
   });
 }
 
@@ -196,8 +222,12 @@ export function manageApiKeysDialog(api) {
     let lastAdded = null;
     const list = h('div', { class: 'apikey-list' }, h('div', { class: 'muted pad' }, spinner(), ' 正在读取…'));
     const name = h('input', { class: 'input', type: 'text', name: 'api_key_name', 'aria-label': '名称', placeholder: '名称，例如「work」', maxlength: '64', autocomplete: 'off', spellcheck: 'false' });
-    const key = h('input', { class: 'input mono', type: 'password', name: 'api_key_value', 'aria-label': 'API key', placeholder: 'sk-…（只保存在本机：本程序数据目录里的 api_keys.json）', autocomplete: 'new-password', spellcheck: 'false' });
-    const base = h('input', { class: 'input mono', type: 'text', name: 'api_key_base', 'aria-label': 'base_url', placeholder: 'base_url（可选，留空 = 默认地址）', autocomplete: 'off', spellcheck: 'false' });
+    // 不用 type=password（autocomplete=new-password 会让 WebKit / 密码管理器的"强密码"自动填充接管这一组输入框）：
+    // 普通文本框 + CSS 圆点遮挡，并关闭各类自动填充
+    const key = h('input', { class: 'input mono secret', type: 'text', name: 'api_key_value', 'aria-label': 'API key', placeholder: 'sk-…（只保存在本机：本程序数据目录里的 api_keys.json）',
+      autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', 'data-1p-ignore': 'true', 'data-lpignore': 'true', 'data-bwignore': 'true', 'data-form-type': 'other' });
+    const base = h('input', { class: 'input mono', type: 'text', name: 'api_key_base', 'aria-label': 'base_url', placeholder: 'https://…', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+    const baseHint = h('div', { class: 'field-hint' });
     const isDefault = h('input', { type: 'checkbox', name: 'api_key_is_default' });
     const add = h('button', { class: 'btn primary', type: 'button' }, icon('plus'), '保存');
     const err = h('div', { class: 'field-err' });
@@ -208,13 +238,18 @@ export function manageApiKeysDialog(api) {
     const render = () => {
       const keys = store.keys;
       const sd = serverDefaultKey();
+      baseHint.textContent = baseEmptyHint();
       isDefault.disabled = !!sd;
       isDefault.parentElement && (isDefault.parentElement.title = sd ? '已经有一条服务器默认 key（' + sd.name + '）' : '');
       if (!keys.length) { list.replaceChildren(h('div', { class: 'muted pad' }, '还没有保存的 API key（不选 = 使用 settings.json 里的 key：服务器会话用服务器的，本机会话用本机的）')); return; }
       list.replaceChildren(...keys.map((k) => {
         const ed = h('button', { class: 'btn ghost small', type: 'button', title: '修改名称 / base_url' }, icon('edit'), '编辑');
         const del = h('button', { class: 'btn danger-ghost small', type: 'button', title: '删除' }, icon('trash'), '删除');
-        ed.addEventListener('click', async () => { if (await editKeyDialog(api, k)) { await reload(); loadUsage(api).catch(() => {}); } });
+        const edited = async (focusBase) => { if (await editKeyDialog(api, k, { focusBase })) { await reload(); loadUsage(api).catch(() => {}); } };
+        ed.addEventListener('click', () => edited(false));
+        const bi = baseInfo(k);
+        const setBase = h('button', { class: 'link-btn apikey-setbase', type: 'button', title: '修改这个 key 的 base_url' }, '修改地址');
+        setBase.addEventListener('click', () => edited(true));
         del.addEventListener('click', async () => {
           if (!(await confirmDialog('删除 API key', `从本机删除「${k.name}」（${k.masked}）？`, { okText: '删除', danger: true }))) return;
           const path = '/api/api_keys/' + encodeURIComponent(k.id);
@@ -237,7 +272,8 @@ export function manageApiKeysDialog(api) {
               k.is_server_default ? h('span', { class: 'badge', title: '代表服务器 settings.json 里的 key：只用于显示名称与查询用量，选择"服务器默认"时不加 --settings' }, '服务器默认') : null,
               h('code', { class: 'apikey-mask' }, k.masked)),
             h('div', { class: 'apikey-line sub' },
-              h('span', { class: 'apikey-base mono', title: k.base_url || '服务器 settings.json 的 ANTHROPIC_BASE_URL' }, k.base_url || '默认地址'),
+              h('span', { class: 'apikey-base mono' + (bi.kind === 'own' ? '' : ' inherited'), title: bi.title }, bi.text),
+              setBase,
               h('span', { class: 'apikey-usage' + (u && u.error ? ' err' : ''), title: usageTitle(u) }, u ? usageText(u) : '用量查询中…'),
               k.in_use ? h('span', { class: 'chip compact', title: '引用这个 key 的本地会话（含已退出的）' }, k.in_use + ' 个会话在用') : null)),
           ed, del);
@@ -289,10 +325,13 @@ export function manageApiKeysDialog(api) {
     const body = h('div', { class: 'form-grid' },
       h('div', { class: 'row tools-row' }, h('span', { class: 'field-label' }, '已保存'), h('span', { class: 'spacer' }), usageNote, refreshBtn),
       list,
-      h('div', { class: 'field' }, h('label', { class: 'field-label' }, '新增 API key'),
-        h('div', { class: 'row' }, name), h('div', { class: 'row' }, key), h('div', { class: 'row' }, base, add),
+      // 每个输入框单独一行、有自己的标签（placeholder 只是示例，不会被当成已填的值）
+      h('div', { class: 'field apikey-add' }, h('div', { class: 'field-label' }, '新增 API key'),
+        h('label', { class: 'field' }, h('span', { class: 'field-sub' }, '名称'), name),
+        h('label', { class: 'field' }, h('span', { class: 'field-sub' }, 'API key'), key),
+        h('label', { class: 'field' }, h('span', { class: 'field-sub' }, 'base_url（可选）'), base, baseHint),
         h('label', { class: 'check' }, isDefault, '这是服务器默认 key（settings.json 里那个；只用于显示名称与查询用量，选择时不加 --settings）'),
-        err),
+        h('div', { class: 'row' }, err, h('span', { class: 'spacer' }), add)),
       h('div', { class: 'muted small-text' }, '选择某个 key 启动时，程序把它（及 base_url）写到 claude 所在机器（计算节点；本机会话 = 本机）的 ~/.cc-remote-chat/keys/（0600）并以 --settings 传给 claude，只覆盖 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL；其它设置仍取那台机器的 settings.json。用量由本机直接查询网关（GET <base_url>/v1/usage），缓存 5 分钟。'));
     const dlg = modal({ title: '管理 API key', body, actions: [done], wide: true, onClose: () => { key.value = ''; off(); resolve(lastAdded); } });
     name.focus();

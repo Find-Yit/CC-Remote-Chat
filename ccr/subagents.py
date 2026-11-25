@@ -8,8 +8,17 @@
   `<task-notification>…<status>completed</status>…<result>…</result><usage>…</usage></task-notification>`
   （条目带 `origin.kind == "task-notification"`、`promptSource == "system"`）。
 
+  CLI 2.1.332 实测：主会话回复中途到达的通知不写成 user 条目，而是 `type:"attachment"`、
+  `attachment.type == "queued_command"`、`commandMode == "task-notification"` 的条目（`prompt` 是同样的原文），
+  node agent 只转发这种 attachment 的精简版（见 node_agent.note_attachment）。
+
 状态：有 task-notification 时以其 status 为准（之后若又有新活动 = 被 SendMessage 续跑 → running）；
-否则 meta.finished 为真 → completed；否则 running。会话已退出时 running 视为 killed。
+否则 meta.finished 为真 → completed；否则 running。running 再按"被停止"的痕迹改判 killed（CLI 2.1.332 实测，
+这几种停止都**没有** finished，也不一定有通知）：
+- 子代理 jsonl 最后一条是 `[Request interrupted by user…]`（Claude 调 TaskStop、用户在 CLI 里停止，都会写这一条）；
+- meta.json 带 `stoppedByUser: true`（Ctrl+X Ctrl+K 两次 / 空闲时 Ctrl+C / 子代理列表里按 x），且停止之后
+  没有新活动（assistant 条目，或续跑时发给它的消息；被拒绝的工具结果不算）——被续跑则恢复 running。
+会话已退出时 running 视为 killed。
 """
 from __future__ import annotations
 
@@ -33,6 +42,8 @@ _TAG_RE = {k: re.compile(r"<%s>([\s\S]*?)</%s>" % (k, k)) for k in
            ("task-id", "tool-use-id", "status", "summary", "output-file", "subagent_tokens", "tool_uses",
             "duration_ms", "total_tokens")}
 _RESULT_RE = re.compile(r"<result>([\s\S]*)</result>")
+# 子代理被停止时 CLI 写进子代理 jsonl 的最后一条 user 条目（也用于主会话的 Esc 中断）
+INTERRUPT_RE = re.compile(r"^\s*\[Request interrupted by user\b")
 
 
 def iso_ts(v) -> Optional[float]:
@@ -106,8 +117,22 @@ def _content_text(content) -> str:
     return ""
 
 
+def _note_attachment_text(entry: dict) -> Optional[str]:
+    """回复中途被吸收的通知（attachment / queued_command / commandMode=task-notification）→ prompt 原文。"""
+    a = entry.get("attachment") if isinstance(entry.get("attachment"), dict) else {}
+    if a.get("type") != "queued_command":
+        return None
+    origin = a.get("origin") if isinstance(a.get("origin"), dict) else {}
+    if a.get("commandMode") != "task-notification" and origin.get("kind") != "task-notification":
+        return None
+    return _content_text(a.get("prompt")).strip()
+
+
 def notification_text(entry: dict) -> Optional[str]:
-    """主 transcript 里的 <task-notification> 用户条目 → 原文；其它返回 None。"""
+    """主 transcript 里的 <task-notification>（user 条目，或回复中途吸收的 attachment 条目）→ 原文；其它返回 None。"""
+    if isinstance(entry, dict) and entry.get("type") == "attachment":
+        text = _note_attachment_text(entry)
+        return text if text and text.startswith("<task-notification>") else None
     if not isinstance(entry, dict) or entry.get("type") != "user":
         return None
     msg = entry.get("message") if isinstance(entry.get("message"), dict) else {}
@@ -166,6 +191,23 @@ def parse_notification(text: str) -> Optional[dict]:
     }
 
 
+def is_interrupt_marker(content) -> bool:
+    """user 条目内容是否就是中断标记（字符串，或只有 text 块且第一块是标记）。"""
+    if isinstance(content, str):
+        return bool(INTERRUPT_RE.match(content))
+    if not isinstance(content, list):
+        return False
+    texts = [b for b in content if isinstance(b, dict)]
+    return (bool(texts) and all(b.get("type") == "text" for b in texts)
+            and bool(INTERRUPT_RE.match(_str(texts[0].get("text")))))
+
+
+def _only_tool_results(content) -> bool:
+    """user 条目只有 tool_result 块（停止时 CLI 会补写被拒绝的工具结果，这不算新活动）。"""
+    return (isinstance(content, list) and bool(content)
+            and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content))
+
+
 def _jlen(o) -> int:
     try:
         return len(json.dumps(o, ensure_ascii=False, separators=(",", ":")))
@@ -192,6 +234,10 @@ class Sub:
         self.prompt: Optional[str] = None
         self.last_text: Optional[str] = None
         self.uuids: set = set()
+        self.interrupted = False      # 最后一条是 "[Request interrupted by user…]"（被停止）
+        self.marker_total: Optional[int] = None   # 最近一条中断标记之后的条目总数
+        self.act_total = 0            # 最近一条"新活动"（assistant，或不只是工具结果的 user 条目）之后的条目总数
+        self.stop_seen: Optional[int] = None      # 首次看到 meta.stoppedByUser 时的条目总数
 
     @property
     def total(self) -> int:
@@ -215,7 +261,9 @@ class Sub:
                 self.last_ts = ts if self.last_ts is None else max(self.last_ts, ts)
             msg = e.get("message") if isinstance(e.get("message"), dict) else {}
             content = msg.get("content")
+            marker = False
             if e.get("type") == "user":
+                marker = is_interrupt_marker(content)
                 if self.prompt is None and not self.entries and self.base == 0:
                     t = _content_text(content)
                     if t.strip() and not (isinstance(content, list) and any(
@@ -240,6 +288,12 @@ class Sub:
             self.entries.append(e)
             self.sizes.append(size)
             self.nbytes += size
+            if e.get("type") in ("user", "assistant"):
+                self.interrupted = marker
+                if marker:
+                    self.marker_total = self.total
+                elif e.get("type") == "assistant" or not _only_tool_results(content):
+                    self.act_total = self.total
         drop = 0
         while (len(self.entries) - drop > MAX_ENTRIES or self.nbytes > MAX_BYTES) and drop < len(self.entries) - 1:
             self.nbytes -= self.sizes[drop]
@@ -353,7 +407,7 @@ class Tracker:
                         if aid:
                             changed.add(aid)
                 continue
-            if typ != "user":
+            if typ not in ("user", "attachment"):
                 continue
             text = notification_text(e)
             if text is not None:
@@ -375,7 +429,7 @@ class Tracker:
                 elif tid:
                     self.notes_tool[tid] = note
                 continue
-            if not isinstance(content, list):
+            if typ != "user" or not isinstance(content, list):
                 continue
             tur = e.get("toolUseResult") if isinstance(e.get("toolUseResult"), dict) else {}
             for b in content:
@@ -429,6 +483,13 @@ class Tracker:
         if isinstance(meta, dict):
             sub.meta = {k: v for k, v in meta.items() if isinstance(k, str)}
         new = sub.absorb(entries if isinstance(entries, list) else [])
+        if (sub.meta or {}).get("stoppedByUser") is True:
+            if sub.stop_seen is None:
+                # 实时：meta 刚变成 stoppedByUser → 停止点 = 现在；首次整批加载（reset）时现在 ≠ 停止时刻，
+                # 以最近一条中断标记为停止点（没有标记才用现在）
+                sub.stop_seen = sub.marker_total if reset and sub.marker_total is not None else sub.total
+        else:
+            sub.stop_seen = None
         if new and len(new) > len(sub.entries):   # 一批就超过缓存上限：只转发保留下来的部分
             new = new[-len(sub.entries):]
         start = sub.total - len(new)
@@ -459,6 +520,8 @@ class Tracker:
             st = "completed"
         else:
             st = "running"
+        if st == "running" and sub is not None and self._stopped(sub, meta):
+            return "killed"
         if st == "running":
             if exited:
                 return "killed"
@@ -466,6 +529,18 @@ class Tracker:
             if k is not None and (sub is None or sub.total <= k):
                 return "killed"
         return st
+
+    @staticmethod
+    def _stopped(sub: Sub, meta: dict) -> bool:
+        """没有 finished、没有更新的通知时，子代理文件里是否留下了"被停止"的痕迹（CLI 2.1.332 实测）。"""
+        if sub.interrupted:
+            return True   # 最后一条是中断标记（TaskStop / 用户停止；之后有新条目 = 被续跑，不再算）
+        if meta.get("stoppedByUser") is not True:
+            return False
+        # 用户停止：meta 先写、（被拒绝的工具结果 +）中断标记随后写；停止点（最近的中断标记 / 首次看到
+        # stoppedByUser 时，取较晚者）之后又有新活动（assistant，或续跑时发给它的消息）= 被续跑
+        marks = [x for x in (sub.marker_total, sub.stop_seen) if x is not None]
+        return not marks or sub.act_total <= max(marks)
 
     def summary(self, aid: str, exited: bool = False) -> Optional[dict]:
         sub = self.subs.get(aid)

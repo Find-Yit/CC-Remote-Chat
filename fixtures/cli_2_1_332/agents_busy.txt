@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.332
+▝▜██████▀  Haiku 5.5 with low effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/proj
+
+
+❯ 这是界面测试。请用 Agent 工具派两个后台子代理（run_in_background 设为 true，model 用 haiku，subagent_type 用                                                                                          
+  general-purpose），描述分别是「数数甲」「数数乙」。每个子代理的任务都是：不使用任何工具，从 1 数到 800，每个数字单独一行。派完后直接回复「已派出」即可。                                              
+
+⏺ 2 background agents launched (↓ to manage)
+   ├ 数数甲
+   └ 数数乙          
+           
+                     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✻ Wrangling… (4s · ↓ 418 tokens · thought for 1s)
+                                                                                                  tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯  
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: 2% | ⚙ — tok/s | 💰 $0 | 5h: 1.0M tok, $1.00 | 7d: 9.0M tok, $9.00 | 14:26                                                                                      
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ↓ to manage                                                                                                                                 
+
+  ⏺ main                                                                                                                                                                                                
+  ◯ general-purpose  数数甲                                                                                                                                                                         0s
+  ◯ general-purpose  数数乙                                                                                                                                                                         0s

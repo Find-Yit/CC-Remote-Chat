@@ -14,6 +14,44 @@ export function modeText(m) { return m ? (MODE_TEXT[m] ? `${MODE_TEXT[m]} · ${m
 // 保存为默认 = claude 自己写它所在机器的 ~/.claude/settings.json（本机会话 = 本机；本程序不写）
 const saveNote = (s) => '会写入' + (s && s.meta && s.meta.jobid === 'local' ? '本机' : '服务器') + ' ~/.claude/settings.json，和你在终端里按 Enter 一样';
 
+/**
+ * effort 被环境变量锁定（后端 meta.effort_locked，只从 CLI 的结果文案推断，见 ccr.tui_parse.parse_cmd_result）：
+ * 返回给用户看的说明；没有锁定 → ''。
+ */
+export function effortLockText(meta) {
+  const lk = meta && meta.effort_locked;
+  if (!lk || typeof lk !== 'object') return '';
+  const lv = EFFORT_LEVELS.includes(lk.level) ? lk.level : '?';
+  const src = typeof lk.source === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(lk.source) ? lk.source : 'CLAUDE_CODE_EFFORT_LEVEL';
+  return `effort 被环境变量 ${src}=${lv} 锁定：本会话实际仍是 ${lv}，在这里调整不会生效。清除该变量（例如 ~/.zshrc 里的 export）后重启会话即可调整。`;
+}
+
+/** 接口返回的结果原文（/model、/effort 之后 CLI 打印的那一行）：只接受非空字符串，绝不显示 null */
+export function resultText(r) {
+  return r && typeof r.result === 'string' && r.result.trim() ? r.result.replace(/`/g, '').trim() : '';
+}
+
+/**
+ * 切换模型 / 调整 effort 成功后的提示（纯函数）：CLI 回报原文（没有就不显示，绝不显示 null）+ 后端的提醒
+ * （effort 被环境变量锁定 / 结果未知 → warn）。返回 {text, level}。
+ */
+export function appliedToast(r, scope) {
+  const res = resultText(r);
+  const warn = r && typeof r.warning === 'string' && r.warning.trim() ? r.warning.trim() : '';
+  if (warn) return { text: (res ? res + ' · ' : '') + warn, level: 'warn' };
+  return { text: (res ? res + ' · ' : '') + (scope === 'save' ? '已保存为默认' : '仅本会话'), level: 'info' };
+}
+
+/** 「保存为默认」不可用的原因（'' = 可用）：/effort 面板在 max 档只有 "Enter to use this session only"（实测） */
+export function effortSaveBlocked(level) {
+  return level === 'max' ? 'max 档在 Claude Code 里只能「仅本会话」使用，不能保存为默认' : '';
+}
+
+function lockNote(meta) {
+  const t = effortLockText(meta);
+  return t ? h('div', { class: 'k-notice lv-warn effort-lock-note', role: 'note' }, icon('lock'), h('span', null, t)) : null;
+}
+
 function effortSeg(levels, value, onPick, defaultLevel) {
   const wrap = h('div', { class: 'seg', role: 'radiogroup', 'aria-label': 'effort' });
   const render = (v) => {
@@ -60,8 +98,9 @@ export function openModelModal({ s, actions, pending = null, onClosed }) {
   const scrollUp = h('button', { class: 'btn ghost small', type: 'button', title: '在终端面板里按 ↑（滚动可见列表）' }, icon('up'), '光标上移（看更多）');
   const scrollDown = h('button', { class: 'btn ghost small', type: 'button', title: '在终端面板里按 ↓（滚动可见列表）' }, icon('down'), '光标下移（看更多）');
   const scrollRow = h('div', { class: 'row model-scroll', hidden: true }, scrollUp, scrollDown, h('span', { class: 'muted small-text' }, '列表来自终端可见窗口；移动终端里的光标可滚出更多项（最终以你在这里选中的为准）'));
+  const saveWhy = h('div', { class: 'muted small-text save-why', hidden: true });
   const body = h('div', { class: 'form-grid model-modal' },
-    list, scrollRow, note, effWrap,
+    list, scrollRow, note, effWrap, lockNote(s.meta), saveWhy,
     h('div', { class: 'save-note' }, icon('shield'), h('span', null, '“保存为默认（Enter）”', saveNote(s), '。“仅本会话（s）”不写任何设置文件。')),
     err);
 
@@ -132,8 +171,14 @@ export function openModelModal({ s, actions, pending = null, onClosed }) {
     effSlot.replaceChildren(effortSeg(EFFORT_LEVELS, eff, (l) => { eff = l; }, def),
       e && e.label ? h('div', { class: 'muted small-text' }, '终端显示：' + String(e.label)) : null);
     const can = !busy && !loading && sel != null && !!(d && d.kind === 'model');
+    // 面板提示行里没有 "Enter to save" 时不能保存为默认（后端也会 409 save_unsupported）
+    const noSave = d && d.kind === 'model' && typeof d.hints === 'string' && d.hints && !d.hints.includes('Enter to save')
+      ? '终端面板的提示行里没有「Enter to save」，这次只能「仅本会话」' : '';
     primary.disabled = !can;
-    save.disabled = !can;
+    save.disabled = !can || !!noSave;
+    save.title = noSave;
+    saveWhy.textContent = noSave;
+    saveWhy.hidden = !noSave;
     status.replaceChildren(...(busy ? [spinner(), ' 正在切换…'] : loading ? [spinner(), ' 读取中…'] : !d || d.kind !== 'model' ? ['终端面板尚未打开'] : []));
   }
 
@@ -149,7 +194,7 @@ export function openModelModal({ s, actions, pending = null, onClosed }) {
       if (actions.onApplied) actions.onApplied(s, r, scope);
     }, (e) => {
       busy = false;
-      err.textContent = '切换失败：' + ((e && e.message) || e);
+      err.textContent = '切换失败：' + ((e && e.message) || '未知错误');
       render();
     });
   };
@@ -195,11 +240,22 @@ export function openEffortModal({ s, actions, current }) {
   const primary = h('button', { class: 'btn primary', type: 'button' }, '仅本会话（s）');
   const save = h('button', { class: 'btn', type: 'button' }, '保存为默认（Enter）');
   const cancel = h('button', { class: 'btn ghost', type: 'button' }, '取消');
+  const saveWhy = h('div', { class: 'muted small-text save-why' });
+  // max 档：CLI 的 /effort 面板只有 "Enter to use this session only"，不能保存为默认 → 置灰并说明
+  const sync = () => {
+    const why = effortSaveBlocked(lv);
+    save.disabled = busy || !!why;
+    save.title = why;
+    saveWhy.textContent = why;
+    saveWhy.hidden = !why;
+  };
   const body = h('div', { class: 'form-grid' },
     h('div', { class: 'field' }, h('label', { class: 'field-label' }, 'Effort（当前：' + (current || '未知') + '）'),
-      effortSeg(EFFORT_LEVELS, lv, (l) => { lv = l; })),
+      effortSeg(EFFORT_LEVELS, lv, (l) => { lv = l; sync(); })),
+    lockNote(s.meta),
     h('div', { class: 'muted small-text' }, '确认后会在终端输入 /effort，用 ←/→ 调到所选档位，再按 s 或 Enter。'),
     h('div', { class: 'save-note' }, icon('shield'), h('span', null, '“保存为默认（Enter）”', saveNote(s), '。')),
+    saveWhy,
     err);
   const dlg = modal({ title: '调整 effort', body, actions: [status, cancel, save, primary] });
   const go = (scope) => {
@@ -213,11 +269,14 @@ export function openEffortModal({ s, actions, current }) {
       if (actions.onApplied) actions.onApplied(s, r, scope);
     }, (e) => {
       busy = false;
-      primary.disabled = save.disabled = false;
+      primary.disabled = false;
+      sync();
       status.replaceChildren();
-      err.textContent = '调整失败：' + ((e && e.message) || e);
+      const msg = (e && e.message) || '未知错误';
+      err.textContent = (e && e.code === 'effort_env_locked' ? '没有生效：' : '调整失败：') + msg;
     });
   };
+  sync();
   primary.addEventListener('click', () => go('session'));
   save.addEventListener('click', () => go('save'));
   cancel.addEventListener('click', () => dlg.close());

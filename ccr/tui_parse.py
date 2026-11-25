@@ -27,8 +27,14 @@ _ECHO_RE = re.compile(r"^❯(?:[ \u00a0](.*))?$")
 _INTERRUPTED_RE = re.compile(r"⎿\s+Interrupted\b")
 _HINT_ABOVE_INPUT_RE = re.compile(r"^\s{10,}(ctrl|alt|shift|meta|esc|tab|option|cmd)\+?\S*\s.*$", re.I)
 _RIGHT_HINT_RE = re.compile(r"^\s{40,}\S")   # 输入框正上方右对齐的提示（"○ low · /effort"、"tmux focus-events off · …"）
-# 模式行下方的子代理列表："● main" / "◯ general-purpose  前台计算 1+1      2s · ↑ 14.3k tokens"
-_AGENT_ROW_RE = re.compile(r"^\s*([●◯○◉◐])\s+(\S.*)$")
+# 模式行下方的子代理列表："● main" / "◯ general-purpose  前台计算 1+1      2s · ↑ 14.3k tokens"；
+# CLI 2.1.332（macOS）圆点是 "⏺"，焦点在列表上时选中行前有 "❯ "（"❯ ◯ general-purpose  …"）
+_AGENT_ROW_RE = re.compile(r"^(?:\s*|(❯)\s+)([●◯○◉◐⏺])\s+(\S.*)$")
+# 子代理行最后一段：用时（"2s · ↑ 14.3k tokens"），已停止的前面多一个状态词（"stopped · 11s · ↓ 11.3k tokens"）
+_AGENT_INFO_RE = re.compile(r"^(?:([a-z]+)\s+·\s+)?\d+(?:\.\d+)?[smh]\b")
+# 焦点在子代理列表上时，模式行被换成列表的操作提示（CLI 2.1.332 实测）："↑/↓ to select"（光标在 main 上）、
+# "enter to view · x to stop · ctrl+x ctrl+k to stop all agents"、"enter to view · x to clear"（已停止的行）
+_AGENTS_FOCUS_RE = re.compile(r"^(?:↑/↓ to select|enter to view)\b")
 _POPUP_RE = re.compile(r"^\s{2,4}(❯\s)?\s*(/[\w:.\-]+)(?:\s{2,}(.*))?$")
 _MORE_RE = re.compile(r"^\s*([↑↓])\s*(\d+)\s+more\s*$")
 # /model 面板的 effort 行（实测）："  ○ Low effort ←/→ to adjust"、"  ◉ xHigh effort …"、"  ◈ Max effort …"；
@@ -36,7 +42,11 @@ _MORE_RE = re.compile(r"^\s*([↑↓])\s*(\d+)\s+more\s*$")
 _MODEL_EFFORT_RE = re.compile(
     r"^\s{0,4}(?:(\S)\s+)?(\S.*?)\s+effort(\s*\(default\))?(?:\s+←/→.*)?\s*$", re.I)
 _SET_MODEL_RE = re.compile(r"⎿\s+((?:Set model to|Kept model as)\b.*)$")
-_SET_EFFORT_RE = re.compile(r"⎿\s+((?:Set effort|Kept effort|Effort level)\b.*)$", re.I)
+# CLI 2.1.332：effort 被环境变量锁定时 /effort 的结果是 "CLAUDE_CODE_EFFORT_LEVEL=max overrides this session — …"
+_SET_EFFORT_RE = re.compile(r"⎿\s+((?:Set effort|Kept effort|Effort level)\b.*|[A-Z][A-Z0-9_]*=\S+ overrides this session\b.*)$",
+                            re.I)
+_RESULT_LINE_RE = re.compile(r"^\s*⎿\s+(\S.*)$")
+_RESULT_WORD_RE = re.compile(r"effort|model", re.I)
 _BANNER_RE = re.compile(r"^\S*\s+(.+?) with (\S+) effort\b")
 _STATUS_MODEL_RE = re.compile(r"\[([^\]·]+?)\s*·.*?effort:(\w+)\]")
 # 输入框正上方的 effort 提示（实测右对齐 "○ low · /effort"；也兼容只有两个空格缩进的写法）
@@ -246,7 +256,7 @@ def _level_word(word: str) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- 区域划分
-_FOOTER_AGENT_ROW_RE = re.compile(r"^\s*[●◯○◉◐]\s+\S")       # 模式行下方的子代理列表行
+_FOOTER_AGENT_ROW_RE = re.compile(r"^\s*(?:❯\s+)?[●◯○◉◐⏺]\s+\S")   # 模式行下方的子代理列表行（与 node_agent.G_AGENT_ROW_RE 一致）
 _DIALOG_MARK_RE = re.compile(r"Esc to cancel|Enter to select|Enter to confirm|Do you want to")
 MAX_FOOTER_LINES = 4   # 输入框下横线之后最多这么多行状态栏/模式行（不含子代理列表行）
 
@@ -668,10 +678,87 @@ def _parse_content(content: List[str], busy: bool, queued: Optional[List[Tuple[i
     tail = [l for l in content if l.strip()]
     if tail and _INTERRUPTED_RE.search(tail[-1]):
         out["interrupted"] = True
-    for l in reversed(content[(echo_idx or 0):]):
-        m = _SET_MODEL_RE.search(l) or _SET_EFFORT_RE.search(l)
-        if m:
-            out["last_result"] = m.group(1).strip()
+    # /model、/effort 的结果：回显之后的第一条 "⎿" 行就是 CLI 的回报原文（文案随版本变化，不只认已知开头；
+    # 但要提到 effort / model，"Cancelled" 之类不算结果）；其余情况沿用已知文案的匹配
+    cmd = (out["echo"] or "").split("\n", 1)[0].strip().split(" ", 1)[0]
+    if cmd in ("/model", "/effort"):
+        for l in content[echo_idx + 1:echo_idx + 1 + RESULT_SCAN_LINES]:
+            m = _RESULT_LINE_RE.match(l)
+            if m:
+                if _RESULT_WORD_RE.search(m.group(1)):
+                    out["last_result"] = m.group(1).strip()
+                break
+    if out["last_result"] is None:
+        for l in reversed(content[(echo_idx or 0):]):
+            m = _SET_MODEL_RE.search(l) or _SET_EFFORT_RE.search(l)
+            if m:
+                out["last_result"] = m.group(1).strip()
+                break
+    return out
+
+
+# ---------------------------------------------------------------- /model、/effort 的结果文案
+# CLI 2.1.332 实测（fixtures/cli_2_1_332/）：
+#   "Set effort level to medium (this session only): Balanced approach …"
+#   "Set model to Haiku 5.5 for this session only"、"… for this session only with high effort"
+#   effort 被环境变量锁定：/effort → "CLAUDE_CODE_EFFORT_LEVEL=max overrides this session — clear it and xhigh takes over"
+#                          /model  → "Set model to Haiku 5.5 for this session only · effort stays max (set by
+#                                     CLAUDE_CODE_EFFORT_LEVEL); xhigh isn't saved"
+#   更早的版本 / transcript：“Set model to Sonnet 5.5 with high effort (this session only)”、"Kept model as `Haiku 5.5`"
+RESULT_SCAN_LINES = 4   # 回显之后最多往下找这么多行
+_RES_MODEL_RE = re.compile(
+    r"^(?:Set model to|Kept model as)\s+(?:`([^`\n]+)`|\*\*([^*\n]+)\*\*|(.+?))"
+    r"(?=\s+for this session\b|\s+and saved\b|\s+with\s+\S+\s+effort\b|\s+\(|\s+·|\s*;|\s*$)")
+_RES_EFFORT_RE = re.compile(r"\beffort(?: level)? (?:to|as|at)\s+`?(\w+)`?|\bwith (\w+) effort\b", re.I)
+_RES_ENV_OVERRIDE_RE = re.compile(
+    r"\b([A-Z][A-Z0-9_]*EFFORT[A-Z0-9_]*)=(\w+) overrides this session\b(?:.*?\band (\w+) takes over\b)?")
+_RES_ENV_STAYS_RE = re.compile(
+    r"\beffort stays (\w+) \(set by ([A-Z][A-Z0-9_]*)\)(?:\s*;\s*(\w+) isn't saved\b)?")
+# 被模型名正则（旧版）误吞进来的后缀：清洗持久化的旧值
+_MODEL_TAIL_RE = re.compile(r"\s+(?:for this session\b|and saved\b|with\s+\S+\s+effort\b)|\s+·\s|\s*;")
+
+
+def clean_model_name(name: Optional[str]) -> Optional[str]:
+    """模型显示名清洗：去掉反引号 / 粗体标记，截掉 " for this session only"、" · effort stays …"、" with high effort"
+    之类的结果文案后缀（旧版解析把整句当成了模型名，sessions.json 里可能存着这样的值）。空 → None。"""
+    if not isinstance(name, str):
+        return None
+    t = name.strip().strip("`").strip()
+    if t.startswith("**") and t.endswith("**") and len(t) > 4:
+        t = t[2:-2].strip()
+    m = _MODEL_TAIL_RE.search(t)
+    if m:
+        t = t[:m.start()]
+    t = t.strip().strip("`").strip()
+    return t or None
+
+
+def parse_cmd_result(text: Optional[str]) -> Optional[Dict]:
+    """/model、/effort 结果原文 → {"text","model","effort","effort_locked"}；不是字符串 / 空 → None（绝不抛异常）。
+    model：模型显示名（只取名字本身，后缀一律不要）；effort：CLI 回报的**实际**档位（被环境变量锁定时是锁定的那一档）；
+    effort_locked：{"level": 实际档位, "source": 环境变量名, "wanted": 用户选的档位|None} | None。"""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    t = strip_ansi(text).strip()
+    out: Dict = {"text": t, "model": None, "effort": None, "effort_locked": None}
+    m = _RES_MODEL_RE.match(t)
+    if m:
+        out["model"] = clean_model_name(next((g for g in m.groups() if g), None))
+    lk = _RES_ENV_OVERRIDE_RE.search(t)
+    if lk:
+        level, src, wanted = _level_word(lk.group(2)), lk.group(1), lk.group(3)
+    else:
+        lk = _RES_ENV_STAYS_RE.search(t)
+        if lk:
+            level, src, wanted = _level_word(lk.group(1)), lk.group(2), lk.group(3)
+    if lk:
+        out["effort"] = level
+        out["effort_locked"] = {"level": level, "source": src, "wanted": _level_word(wanted) if wanted else None}
+        return out
+    for e in _RES_EFFORT_RE.finditer(t):
+        lv = _level_word(e.group(1) or e.group(2) or "")
+        if lv:
+            out["effort"] = lv
             break
     return out
 
@@ -917,7 +1004,7 @@ def parse_screen(text: str) -> Dict:
         "busy": False, "spinner": None, "mode": "manual", "mode_line": None,
         "status_line": None, "input": {"visible": False, "text": ""}, "live": None, "dialog": None,
         "echo": None, "turn_done": None, "interrupted": False, "popup": None, "last_result": None,
-        "model_hint": None,
+        "model_hint": None, "cmd_result": None, "agents_focus": False, "agents_hint": None,
         "hints": {"background": False, "send_now": False, "queued": [], "shells": None},
         "side_panel": panel,
     }
@@ -947,6 +1034,7 @@ def parse_screen(text: str) -> Dict:
     # 状态栏 + 模式行（模式行下方可能还有子代理列表 "● main" / "◯ general-purpose  描述   2s"）
     status = []
     agents = []
+    focus = False
     for l in footer:
         if not l.strip():
             continue
@@ -956,15 +1044,24 @@ def parse_screen(text: str) -> Dict:
             if mode is not None:
                 res["mode"] = mode
             continue
-        am = _AGENT_ROW_RE.match(l) if res["mode_line"] is not None else None
+        if not focus and res["mode_line"] is None and _AGENTS_FOCUS_RE.match(l.strip()):
+            # 焦点在子代理列表上：这一行顶替了模式行，此刻看不出权限模式（mode=None，调用方沿用上一次的值）
+            focus = True
+            res["agents_hint"] = l.strip()
+            res["mode"] = None
+            continue
+        am = _AGENT_ROW_RE.match(l) if (res["mode_line"] is not None or focus) else None
         if am:
-            parts = re.split(r"\s{2,}", am.group(2).strip())
+            parts = re.split(r"\s{2,}", am.group(3).strip())
             rest = parts[1:]
-            info = rest.pop() if rest and re.match(r"^\d+(?:\.\d+)?[smh]\b", rest[-1]) else ""
+            im = _AGENT_INFO_RE.match(rest[-1]) if rest else None
+            info = rest.pop() if im else ""
             agents.append({"name": parts[0], "desc": "  ".join(rest), "info": info,
-                           "current": am.group(1) == "●"})
+                           "state": im.group(1) if im else None,
+                           "current": am.group(2) in ("●", "⏺"), "selected": bool(am.group(1))})
         else:
             status.append(l.strip())
+    res["agents_focus"] = focus
     if status:
         res["status_line"] = "\n".join(status)
     res["agents_panel"] = agents or None
@@ -997,6 +1094,7 @@ def parse_screen(text: str) -> Dict:
             content = content[:k + 1]
     queued = _queued_blocks(content)
     res.update(_parse_content(content, res["busy"], queued))
+    res["cmd_result"] = parse_cmd_result(res["last_result"])
     # CLI 快捷键提示（对话框区域不算：有对话框时这些动作都不可用）
     res["hints"] = _parse_hints(content, res["mode_line"], res["turn_done"], queued)
     res["model_hint"] = _hint_model(lines, res["status_line"])

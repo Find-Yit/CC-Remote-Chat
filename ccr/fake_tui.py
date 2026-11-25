@@ -18,7 +18,12 @@ fixtures/tui_screens_*.ndjson（真实 Claude Code v2.1.330 的画面）。
   /agent 派一个"后台"子代理：写 Agent tool_use、"Async agent launched…agentId: …" 结果、
          <transcript 目录>/<sessionId>/subagents/agent-<id>.meta.json 与逐步写入的 agent-<id>.jsonl
          （几次工具调用，夹杂 api-request*/attachment 行），结束时 meta.finished=true 并写 <task-notification>；
-         屏幕上显示与真实 CLI 相同的子代理列表行（Esc 中断 → 子代理以 killed 结束）
+         屏幕上显示与真实 CLI 相同的子代理列表行（Esc 中断 → 子代理以 killed 结束）；子代理运行时
+         Ctrl+X Ctrl+K 按两次（3 秒内）= 仿 CLI 2.1.332 的"停止后台子代理"：meta 写 stoppedByUser:true（没有 finished）、
+         子代理 jsonl 末尾写 "[Request interrupted by user for tool use]"、主 transcript 写 system agents_killed 与
+         纯文本通知 'Background agent "…" was stopped by the user.'（没有 <task-notification>）
+  /agentstop 派一个后台子代理，跑几步后主会话调用 TaskStop 停掉它（仿 CLI 2.1.332：子代理只多一条中断标记、
+         meta 不变；killed 通知在回复中途被吸收，只写成 attachment/queued_command 条目，不写 user 条目）
 整条输入为以下命令时：/model 模型面板、/effort effort 面板、/clear 新会话、/exit 退出、
   /context 上下文用量（仿 CLI 2.1.331：屏幕上内联画方块网格 + 右列，transcript 写带 ANSI 的 <local-command-stdout>
   与 isMeta 的 Markdown 版；窗口默认 1,000,000，CCR_FAKE_CTX_WINDOW 可改）。
@@ -115,6 +120,8 @@ BG_SHELL_SECONDS = 45.0      # 转入后台的 shell 显示为"运行中"的时�
 QUEUED_HINT = "Queued · ctrl+x ctrl+s to send now"
 QUEUED_PLACEHOLDER = "Press up to edit queued messages"
 CHORD_WINDOW = 1.5
+KILL_CONFIRM_WINDOW = 3.0    # 真机：Ctrl+X Ctrl+K 两次之间最多 3 秒
+KILL_HINT = "Press ctrl+x ctrl+k again to stop background agents"
 
 PROBE_CMD = "touch /tmp/ccr_fake_probe"
 PROBE_DESC = "Create probe file in /tmp"
@@ -136,6 +143,7 @@ AGENT_NOTE = (
     "<status>%s</status>\n<summary>Agent \"%s\" %s</summary>\n<note>A task-notification fires each time this agent "
     "stops with no live background children of its own.</note>\n%s<usage><subagent_tokens>%d</subagent_tokens>"
     "<tool_uses>%d</tool_uses><duration_ms>%d</duration_ms></usage>\n</task-notification>")
+TASKSTOP_RESULT = '{"message":"Successfully stopped task: %s (%s)","task_id":"%s","task_type":"local_agent","command":"%s"}'
 REJECT_TEXT = ("The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a "
                "file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the "
                "user to tell you how to proceed.")
@@ -229,6 +237,7 @@ class FakeSubagent(object):
         self.result = None
         self.last_uuid = None
         self.done = False
+        self.stopped = None   # 被停止："user"（Ctrl+X Ctrl+K）/ "claude"（TaskStop）
         self.dir = os.path.join(os.path.dirname(app.tpath), app.session_id, "subagents")
         self.jsonl = os.path.join(self.dir, "agent-%s.jsonl" % self.aid)
         self.metap = os.path.join(self.dir, "agent-%s.meta.json" % self.aid)
@@ -338,6 +347,18 @@ class FakeSubagent(object):
             self.done = True
             self.meta["finished"] = True
             self.write_meta()
+
+    def stop(self, by):
+        """仿 CLI 2.1.332 停止子代理：不写 finished；用户停止时 meta 加 stoppedByUser；jsonl 末尾写中断标记。"""
+        if self.done or self.stopped:
+            return
+        self.stopped = by
+        if by == "user":
+            self.meta["stoppedByUser"] = True
+            self.write_meta()
+        self.entry("user", {"role": "user", "content": [{"type": "text",
+                                                         "text": "[Request interrupted by user for tool use]"}]},
+                   {"promptId": str(uuid.uuid4()), "rowSource": "harness"})
 
     def elapsed(self):
         return max(0, int(time.time() - self.started))
@@ -474,7 +495,8 @@ class FakeClaude(object):
         self.bg_running = False   # /bg 的命令正在前台运行（屏幕上有 ctrl+b 提示）
         self.bg_flag = False      # 用户按了 Ctrl+B：转入后台
         self.bg_until = []        # 转入后台的 shell 的结束时间（底栏 "N shell"）
-        self.cx_at = 0.0          # Ctrl+X 的时间（Ctrl+X Ctrl+S 和弦）
+        self.cx_at = 0.0          # Ctrl+X 的时间（Ctrl+X Ctrl+S / Ctrl+X Ctrl+K 和弦）
+        self.kill_at = 0.0        # 第一次 Ctrl+X Ctrl+K 的时间（再按一次才停止后台子代理）
         self.agents = {}  # 运行中的子代理 agent_id -> FakeSubagent（屏幕底部列表）
         self.status = None
         self.ctx_tokens = 0
@@ -808,6 +830,8 @@ class FakeClaude(object):
                 elif "\n" in self.input:
                     hint = "ctrl+g to edit in Vim"
                     sep = [" " * max(0, W - len(hint) - 2) + hint]
+                elif self.agents and time.time() - self.kill_at <= KILL_CONFIRM_WINDOW:
+                    sep = [" " * max(0, W - len(KILL_HINT) - 2) + KILL_HINT]
                 else:
                     sep = [""]
                 inp = []
@@ -1135,7 +1159,7 @@ class FakeClaude(object):
         self.write_tool_result(tid, REJECT_TEXT, True)
         self.write_user_text([{"type": "text", "text": "[Request interrupted by user for tool use]"}])
 
-    def turn_agent(self, msg):
+    def turn_agent(self, msg, task_stop=False):
         yield self.think
         sub = None
         ok = False
@@ -1160,11 +1184,31 @@ class FakeClaude(object):
             for d in self.stream(paras):
                 yield d
             self.write_assistant([{"type": "text", "text": paras[0]}])
+            if task_stop:
+                for d in self.agent_task_stop(sub):
+                    yield d
+                ok = True
+                return
             self.blank()
             self.add("", "", "✻ Waiting for 1 background agent to finish")
             mark = len(self.content) - 1
-            for d in sub.script():
+            steps = sub.script()
+            while not sub.stopped:   # 每一步之前先看是否已被停止（停止后不能再写子代理条目）
+                try:
+                    d = next(steps)
+                except StopIteration:
+                    break
                 yield d
+            if sub.stopped:   # 用户 Ctrl+X Ctrl+K 停掉了它（kill_agents 已写好文件）
+                ok = True
+                del self.content[mark]
+                self.add("● ", "  ", "Background agents stopped")
+                yield self.delay
+                paras = ["子代理「%s」已被停止，没有完成。" % AGENT_DESC]
+                for d in self.stream(paras):
+                    yield d
+                self.finish(paras[0])
+                return
             sub.finish()
             self.agents.pop(sub.aid, None)
             del self.content[mark]
@@ -1181,6 +1225,65 @@ class FakeClaude(object):
                 self.agents.pop(sub.aid, None)
                 sub.finish()
                 self.write_task_notification(sub, "killed")
+
+    def agent_task_stop(self, sub):
+        """/agentstop：子代理跑两步后，主会话调用 TaskStop（仿 CLI 2.1.332 的写法）。"""
+        steps = sub.script()
+        for _ in range(3):
+            yield next(steps)
+        steps.close()
+        tid = self.tool_use("TaskStop", {"task_id": sub.aid})
+        self.write_entry("user", {"role": "user", "content": [
+            {"tool_use_id": tid, "type": "tool_result", "content": TASKSTOP_RESULT % (sub.aid, sub.desc, sub.aid,
+                                                                                       sub.desc)}]},
+            {"promptId": str(uuid.uuid4()), "sourceToolAssistantUUID": self.last_uuid})
+        sub.stop("claude")
+        self.agents.pop(sub.aid, None)
+        self.blank()
+        self.add("● ", "  ", "Stop Task")
+        self.add("  ⎿  ", "     ", "%s · stopped" % sub.desc)
+        content = AGENT_NOTE % (sub.aid, sub.meta["toolUseId"], sub.output_file, "killed", sub.desc,
+                                "was stopped by Claude", "", 12000 + sub.tokens, sub.tool_uses,
+                                int((time.time() - sub.started) * 1000))
+        self.append_raw({"type": "queue-operation", "operation": "enqueue", "timestamp": now_iso(),
+                         "sessionId": self.session_id, "content": content})
+        att = self._base("attachment")
+        att["attachment"] = {"type": "queued_command", "prompt": content, "source_uuid": str(uuid.uuid4()),
+                             "commandMode": "task-notification",
+                             "origin": {"kind": "task-notification", "producer": "session-task"},
+                             "rowSource": "recorded", "timestamp": now_iso()}
+        att["rendered"] = [{"content": "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n" + content +
+                                       "\n</system-reminder>"}]
+        self.append_raw(att)
+        self.append_raw({"type": "queue-operation", "operation": "remove", "timestamp": now_iso(),
+                         "sessionId": self.session_id, "content": content, "reason": "absorbed_mid_turn"})
+        yield self.delay
+        paras = ["已停止子代理「%s」，它没有完成。" % sub.desc]
+        for d in self.stream(paras):
+            yield d
+        self.finish(paras[0])
+
+    def kill_agents(self):
+        """Ctrl+X Ctrl+K 两次：停止全部后台子代理（仿 CLI 2.1.332，见 turn_agent / FakeSubagent.stop）。"""
+        subs = [x for x in self.agents.values() if not x.done and not x.stopped]
+        if not subs:
+            return
+        for sub in subs:
+            sub.stop("user")
+            self.agents.pop(sub.aid, None)
+        names = [x.desc for x in subs]
+        text = ('Background agent "%s" was stopped by the user.' % names[0] if len(names) == 1 else
+                "%d background agents were stopped by the user: %s." % (len(names), ", ".join('"%s"' % n for n in names)))
+        self.append_raw({"type": "queue-operation", "operation": "enqueue", "timestamp": now_iso(),
+                         "sessionId": self.session_id, "content": text})
+        e = self._base("system")
+        e.update({"subtype": "agents_killed", "isMeta": False})
+        self.append_raw(e)
+        self.last_uuid = e["uuid"]
+        self.write_entry("user", {"role": "user", "content": text}, {
+            "promptId": str(uuid.uuid4()), "origin": {"kind": "task-notification"}, "promptSource": "system",
+            "rowSource": "harness", "turnOrigin": "task_notification", "queueSkipAttachments": True})
+        self.turn_due = 0.0
 
     def write_task_notification(self, sub, status):
         verb = "finished" if status == "completed" else "was stopped"
@@ -1345,6 +1448,8 @@ class FakeClaude(object):
             gen = self.turn_long(text)
         elif "/md" in text:
             gen = self.turn_md(text)
+        elif "/agentstop" in text:
+            gen = self.turn_agent(text, task_stop=True)
         elif "/agent" in text:
             gen = self.turn_agent(text)
         elif "/html" in text:
@@ -1545,6 +1650,15 @@ class FakeClaude(object):
                 self.cx_at = 0.0
                 self.send_now()
             return
+        if k == "C-k":
+            if time.time() - self.cx_at <= CHORD_WINDOW and self.agents:
+                self.cx_at = 0.0
+                if time.time() - self.kill_at <= KILL_CONFIRM_WINDOW:
+                    self.kill_at = 0.0
+                    self.kill_agents()
+                else:
+                    self.kill_at = time.time()
+            return
         pop = self.popup()
         if pop and k in ("Up", "Down"):
             self.popup_cursor = (self.popup_cursor + (1 if k == "Down" else -1)) % len(pop)
@@ -1709,7 +1823,7 @@ class FakeClaude(object):
     SEQ = {b"\x1b[A": "Up", b"\x1b[B": "Down", b"\x1b[C": "Right", b"\x1b[D": "Left", b"\x1b[Z": "BTab",
            b"\x1bOA": "Up", b"\x1bOB": "Down", b"\x1bOC": "Right", b"\x1bOD": "Left"}
     CTRL = {b"\r": "Enter", b"\n": "Enter", b"\x7f": "BSpace", b"\x08": "BSpace", b"\t": "Tab",
-            b"\x03": "C-c", b"\x15": "C-u", b"\x02": "C-b", b"\x18": "C-x", b"\x13": "C-s"}
+            b"\x03": "C-c", b"\x15": "C-u", b"\x02": "C-b", b"\x18": "C-x", b"\x13": "C-s", b"\x0b": "C-k"}
 
     def feed(self, buf, final=False):
         """解析输入字节，返回未消费的剩余部分。final=True 时单独的 ESC 视为 Escape 键。"""

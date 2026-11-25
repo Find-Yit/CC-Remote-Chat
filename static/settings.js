@@ -1,9 +1,10 @@
-// 设置弹窗（侧栏品牌行的齿轮按钮）：服务器 SSH 主机、提示音。
+// 设置弹窗（侧栏品牌行的齿轮按钮）：服务器 SSH 主机、提示音、默认 base_url（API key 用量）。
 // 声音由本地后端用 /usr/bin/afplay 播放（与 Claude Code CLI 的 Stop hook 同一个声音，默认 Blow）；浏览器不播放。
 // 设置存 app 的 config.json（POST /api/config，后端白名单校验）；「试听」= POST /api/notify/test。
 import { h, icon, spinner } from './dom.js';
 import { modal, toast } from './dialogs.js';
 import { updateSettingsField } from './update.js';
+import { BASE_URL_RE, setDefaultBaseUrl, loadUsage } from './apikeys.js';
 
 // dmg 版自动更新：app.js 在后端开启了自动更新时调用（之后设置弹窗多一节「更新」）；没调用时与以前完全相同
 let updateStore = null;
@@ -40,6 +41,11 @@ export function settingsDialog(api, { config, onSaved }) {
     });
     hostInput.addEventListener('change', saveHost);
     const done = h('button', { class: 'btn primary', type: 'button' }, '完成');
+    // 默认 base_url：只存在本程序的 config.json（不读写 ~/.claude）；没有单独 base_url 的已保存 API key 用它
+    const baseUrl = h('input', { class: 'input mono', type: 'text', name: 'default_base_url', 'aria-label': '默认 base_url', value: cfg.default_base_url || '',
+      placeholder: 'https://…', autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false' });
+    const baseSave = h('button', { class: 'btn ghost', type: 'button' }, '保存');
+    const baseErr = h('div', { class: 'field-err' });
 
     const syncDisabled = () => {
       const off = !enabled.box.checked;
@@ -66,6 +72,20 @@ export function settingsDialog(api, { config, onSaved }) {
       c.box.addEventListener('change', () => { syncDisabled(); save({ [c.box.name]: c.box.checked }); });
     }
     sound.addEventListener('change', () => save({ notify_sound: sound.value }));
+    const saveBase = async () => {
+      const v = baseUrl.value.trim();
+      baseErr.textContent = '';
+      if (v === (cfg.default_base_url || '')) return;
+      if (v && (v.length > 200 || !BASE_URL_RE.test(v))) { baseErr.textContent = 'base_url 格式不正确（形如 http://host:port 或 https://host/path）'; return; }
+      await save({ default_base_url: v });
+      if ((cfg.default_base_url || '') === v) {
+        setDefaultBaseUrl(v);
+        loadUsage(api).catch(() => {});   // 地址变了，后端用量缓存自动失效
+      }
+    };
+    baseSave.addEventListener('click', saveBase);
+    baseUrl.addEventListener('change', saveBase);
+    baseUrl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); saveBase(); } });
     test.addEventListener('click', async () => {
       test.disabled = true;
       try {
@@ -86,6 +106,12 @@ export function settingsDialog(api, { config, onSaved }) {
         h('div', { class: 'field-hint' }, '/System/Library/Sounds 里的系统声音；默认 Blow')),
       h('div', { class: 'muted small-text' }, '声音由本机后端用 /usr/bin/afplay 播放（服务器会话也在这台 Mac 上响）。app 启动或重连后的首次状态同步不响；同一时刻多个会话最多响一次。'),
       localNote,
+      h('div', { class: 'field' }, h('label', { class: 'field-label' }, '默认 base_url（API key）'),
+        h('div', { class: 'row' }, baseUrl, baseSave),
+        h('div', { class: 'field-hint' }, '已保存的 API key 没有单独填写 base_url 时用这个地址：查询近 7 天用量（GET <base_url>/v1/usage），'
+          + '以及选这样的 key 启动会话时写进 key 文件（ANTHROPIC_BASE_URL）。留空 = 不设置：没有地址的 key 沿用 settings.json 的 ANTHROPIC_BASE_URL。'
+          + '只保存在本程序的 config.json，不读写 ~/.claude；选「默认（settings.json）」启动的会话不受影响。'),
+        baseErr),
       h('div', { class: 'row' }, status));
     // dmg 版自动更新（只有后端开启时 update 才不为 null）
     const upd = update ? updateSettingsField(api, update, { onError: (e) => toast('操作失败：' + e.message, 'error') }) : null;

@@ -35,6 +35,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "notify_on_done": True,
     "notify_on_attention": True,
     "notify_sound": "Blow",
+    # 默认 base_url（只存在本程序的 config.json，不读写 ~/.claude）：没有单独 base_url 的已保存 API key
+    # 用它查询近 7 天用量（ccr/usage.py），选这样的 key 启动会话时也写进 key 文件的 ANTHROPIC_BASE_URL；
+    # 空 = 不设置（与以前完全一致）。格式与 api_keys.BASE_URL_RE 相同（计算节点 agent 用同一个正则校验）
+    "default_base_url": "",
 }
 
 PERMISSION_MODES = ["manual", "acceptEdits", "auto", "plan", "bypassPermissions", "dontAsk"]
@@ -134,6 +138,9 @@ def _validate_field(key: str, value: Any) -> Any:
         return _notify().validate_sound(value)
     if key == "extra_srun_args":
         return validate_extra_srun_args(value)
+    if key == "default_base_url":
+        from . import api_keys as ccr_api_keys   # 延迟导入：api_keys 依赖本模块
+        return ccr_api_keys.validate_base_url(value) or ""
     raise ValueError("未知配置项：%s" % str(key)[:60])
 
 

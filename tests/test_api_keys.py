@@ -183,7 +183,7 @@ class ServerApiTests(TS.Base):
     def test_crud_and_never_returns_plaintext(self):
         logs = _CaptureLogs(self)
         st, js, _, raw = self.req("GET", "/api/api_keys")
-        self.assertEqual((st, js), (200, {"keys": []}))
+        self.assertEqual((st, js), (200, {"keys": [], "default_base_url": ""}))
         st, js, _, raw = self.req("POST", "/api/api_keys", {"name": "key B", "key": KEY_B})
         self.assertEqual(st, 200, raw)
         kid = js["api_key"]["id"]
@@ -221,7 +221,7 @@ class ServerApiTests(TS.Base):
         st, js, _, _ = self.req("DELETE", "/api/api_keys/" + kid)
         self.assertEqual((st, js["ok"]), (200, True))
         self.assertErr(self.req("DELETE", "/api/api_keys/" + kid), 404)
-        self.assertEqual(self.req("GET", "/api/api_keys")[1], {"keys": []})
+        self.assertEqual(self.req("GET", "/api/api_keys")[1], {"keys": [], "default_base_url": ""})
         self.assertNotIn(KEY_B, logs.text())
 
     def test_create_and_restart_pass_api_key_id(self):
@@ -1059,6 +1059,157 @@ class UsageTests(unittest.TestCase):
             self.assertEqual((st, js.get("code")), (409, "server_default_exists"))
         finally:
             tst.doCleanups()
+
+
+# ============================================================================ 设置里的默认 base_url（config.json）
+from ccr import config as C  # noqa: E402
+
+DEF_BASE = "http://127.0.0.1:1/gw"   # 测试只用本机地址
+
+
+class DefaultBaseUrlConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ccr-defbase-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = pathlib.Path(self.tmp, "config.json")
+
+    def test_default_empty_validate_save(self):
+        self.assertEqual(C.DEFAULT_CONFIG["default_base_url"], "")
+        st = C.ConfigStore(self.path)
+        self.assertEqual(st.get()["default_base_url"], "")
+        self.assertEqual(st.update({"default_base_url": "  " + DEF_BASE + "  "})["default_base_url"], DEF_BASE)
+        self.assertEqual(json.loads(self.path.read_text())["default_base_url"], DEF_BASE)
+        self.assertEqual(C.ConfigStore(self.path).get()["default_base_url"], DEF_BASE)   # 重启后仍在
+        for bad in ("ftp://x", "http://x/?q=1", "http://x y", "https://" + "a" * 200, 5, ["x"]):
+            with self.assertRaises(ValueError) as cm:
+                st.update({"default_base_url": bad})
+            self.assertIn("default_base_url", str(cm.exception))
+        self.assertEqual(st.get()["default_base_url"], DEF_BASE)                       # 不合法的不保存
+        for empty in ("", None, "   "):
+            self.assertEqual(st.update({"default_base_url": empty})["default_base_url"], "")
+        # 常见网关地址都能填：端口、路径、结尾斜杠、域名
+        for u in ("https://api.example.com", "http://10.0.0.2:8080/", "https://gw.example.org/anthropic"):
+            self.assertEqual(st.update({"default_base_url": u})["default_base_url"], u)
+        # 文件里写坏了：忽略这一项（= 没设置）
+        self.path.write_text(json.dumps({"default_base_url": "javascript:alert(1)"}))
+        self.assertEqual(C.ConfigStore(self.path).get()["default_base_url"], "")
+        self.assertIn("default_base_url", C.public_config(st.get()))
+
+
+class DefaultBaseUrlUsageTests(UsageTests):
+    """没有自己 base_url 的 key 用设置里的默认 base_url 查询用量；key 自己的优先；不填 = 与以前一致。"""
+
+    def setUp(self):
+        super().setUp()
+        self.default = ""
+        self.svc = U.UsageService(self.store, timeout=0.6, opener=self.svc._opener, get_default_base=lambda: self.default)
+
+    def test_default_base_used_and_key_base_wins(self):
+        a = self.store.add("a", KEY_A)["id"]                          # 没有地址
+        own = self.store.add("own", KEY_B, "http://127.0.0.1:9")["id"]   # 自己的地址（连不上）优先
+        r = self.svc.get_all()
+        self.assertIn("没有 base_url", r[a]["error"])                  # 没设置：与以前一致，不查询
+        self.assertIsNone(r[a]["base_url"])
+        self.assertEqual(self.gw.requests, [])
+        self.default = self.gw.url
+        r = self.svc.get_all()                                         # 地址变了：缓存失效，马上重查
+        self.assertIsNone(r[a]["error"], r[a])
+        self.assertEqual(r[a]["base_url"], self.gw.url)
+        self.assertGreater(r[a]["week_usd"], 1.0)
+        self.assertEqual([x["auth"] for x in self.gw.requests], ["Bearer " + KEY_A])
+        self.assertEqual(r[own]["base_url"], "http://127.0.0.1:9")
+        self.assertIn("连接失败", r[own]["error"])
+        n = len(self.gw.requests)
+        self.svc.get_all()                                             # 缓存照旧
+        self.assertEqual(len(self.gw.requests), n)
+        blob = json.dumps(r, ensure_ascii=False) + self.logs.text()
+        for k in (KEY_A, KEY_B):
+            self.assertNotIn(k, blob)
+
+    def test_default_base_before_server_default_entry_and_invalid_ignored(self):
+        self.store.add("默认", KEY_C, "http://127.0.0.1:9", is_server_default=True)
+        b = self.store.add("b", KEY_B)["id"]
+        self.default = self.gw.url
+        self.assertEqual(self.svc.get_all()[b]["base_url"], self.gw.url)      # 设置里的默认优先于服务器默认条目
+        self.default = "not a url"                                            # 不合法 = 没设置 → 服务器默认条目的地址
+        self.assertEqual(self.svc.default_base(), None)
+        self.assertEqual(self.svc.get_all()[b]["base_url"], "http://127.0.0.1:9")
+        self.svc._get_default_base = lambda: (_ for _ in ()).throw(RuntimeError("x"))   # 读取出错也只当没设置
+        self.assertIsNone(self.svc.default_base())
+
+    def test_version_guard_with_default_base(self):
+        self.gw.version_guard = True
+        self.default = self.gw.url
+        kid = self.store.add("x", KEY_A)["id"]
+        r = self.svc.get_all()[kid]
+        self.assertIsNone(r["error"], r)
+        self.assertEqual(self.svc.ua_version, "2.1.999")
+
+
+class DefaultBaseUrlSessionTests(TSS.Base):
+    def test_launch_uses_default_base_only_when_key_has_none(self):
+        logs = _CaptureLogs(self)
+        m = self.mgr()
+        a = m.api_keys.add("a", KEY_A)["id"]
+        own = m.api_keys.add("own", KEY_B, "http://127.0.0.1:2/own")["id"]
+        d = m.api_keys.add("默认", KEY_C, is_server_default=True)["id"]
+        # 没设置：与以前一致（不带 base_url，key 文件里没有 ANTHROPIC_BASE_URL）
+        self.start(m, api_key_id=a)
+        st = self.rem.ops("start")[0]
+        self.assertEqual(st["api_key"], KEY_A)
+        self.assertNotIn("base_url", st)
+        self.cfg["default_base_url"] = DEF_BASE
+        sid = self.start(m, api_key_id=a, resume=TSS.UUID2)
+        self.assertEqual(self.rem.ops("start")[1]["base_url"], DEF_BASE)
+        self.start(m, api_key_id=own, resume="33333333-3333-4333-8333-333333333333")                       # key 自己的地址优先
+        self.assertEqual(self.rem.ops("start")[2]["base_url"], "http://127.0.0.1:2/own")
+        self.start(m, api_key_id=d, resume="44444444-4444-4444-8444-444444444444")   # 服务器默认条目：仍不加 --settings
+        st = self.rem.ops("start")[3]
+        self.assertNotIn("api_key", st)
+        self.assertNotIn("base_url", st)
+        m.restart(sid)                                                        # 重启 / 续接同样用默认地址
+        self.assertTrue(TSS.wait_until(lambda: len(self.rem.ops("start")) == 5 and m.get_meta(sid)["state"] == "idle"))
+        self.assertEqual(self.rem.ops("start")[4]["base_url"], DEF_BASE)
+        self.cfg["default_base_url"] = "bad"                                  # 不合法 = 没设置
+        m.restart(sid)
+        self.assertTrue(TSS.wait_until(lambda: len(self.rem.ops("start")) == 6 and m.get_meta(sid)["state"] == "idle"))
+        self.assertNotIn("base_url", self.rem.ops("start")[5])
+        for st in self.rem.ops("start"):
+            self.assertNotIn("--settings", st["args"])                        # 参数白名单不变（--settings 由 agent 追加）
+        blob = json.dumps(m.list_sessions(), ensure_ascii=False) + logs.text()
+        for k in (KEY_A, KEY_B, KEY_C):
+            self.assertNotIn(k, blob)
+
+
+class DefaultBaseUrlServerTests(TS.Base):
+    def test_config_and_api_keys_and_usage(self):
+        gw = _FakeGateway()
+        self.addCleanup(gw.close)
+        logs = _CaptureLogs(self)
+        self.srv.usage._opener = __import__("urllib.request").request.build_opener(
+            __import__("urllib.request").request.ProxyHandler({}))
+        kid = self.srv.api_keys.add("a", KEY_A)["id"]
+        st, js, _, _ = self.req("GET", "/api/api_keys")
+        self.assertEqual(js["default_base_url"], "")
+        st, js, _, raw = self.req("GET", "/api/api_keys/usage")
+        self.assertIn("没有 base_url", js["usage"][kid]["error"])
+        st, js, _, raw = self.req("POST", "/api/config", {"default_base_url": "ftp://x"})
+        self.assertEqual(st, 400)
+        self.assertIn("default_base_url", js["error"])
+        st, js, _, raw = self.req("POST", "/api/config", {"default_base_url": gw.url})
+        self.assertEqual((st, js["default_base_url"]), (200, gw.url), raw)
+        st, js, _, _ = self.req("GET", "/api/config")
+        self.assertEqual(js["default_base_url"], gw.url)
+        st, js, _, raw = self.req("GET", "/api/api_keys")
+        self.assertEqual(js["default_base_url"], gw.url)
+        self.assertIsNone(js["keys"][0]["base_url"])                         # key 本身的 base_url 不变
+        st, js, _, raw = self.req("GET", "/api/api_keys/usage")
+        self.assertIsNone(js["usage"][kid]["error"], js)
+        self.assertEqual(js["usage"][kid]["base_url"], gw.url)
+        self.assertEqual(gw.requests[-1]["auth"], "Bearer " + KEY_A)
+        self.assertNotIn(KEY_A.encode(), raw)
+        self.assertNotIn(KEY_A, self.cfg_path.read_text() + logs.text())
+        self.assertEqual(self.req("POST", "/api/config", {"default_base_url": ""})[1]["default_base_url"], "")
 
 
 if __name__ == "__main__":

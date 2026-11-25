@@ -23,6 +23,7 @@ export class ComposerControls {
    * o = null（没有活动会话）或 {
    *   sid, model, effort,                    // 胶囊上显示的文字
    *   why,                                   // 模型/effort 不可用的原因（'' = 可用）
+   *   effortLock,                            // effort 被环境变量锁定的说明（'' = 没锁定）：胶囊右半带锁、tooltip 说明
    *   mode, cycle, modeBlocked,              // 当前模式、本次启动的 Shift+Tab 循环、模式不能切换的原因
    *   onModel(), onEffort(), onPickMode(id, needsRestart), onCycle()
    * }
@@ -37,7 +38,7 @@ export class ComposerControls {
       }
       return;
     }
-    const capKey = JSON.stringify([o.sid, o.model, o.effort, o.why || '']);
+    const capKey = JSON.stringify([o.sid, o.model, o.effort, o.why || '', o.effortLock || '']);
     const modeKey = JSON.stringify([o.sid, o.mode || '', (o.cycle || []).join(','), o.modeBlocked || '']);
     if (capKey !== this.capKey) {
       this.capKey = capKey;
@@ -74,8 +75,11 @@ export class ComposerControls {
       title: why || '模型：' + o.model + '\n点击切换模型（在终端里打开 /model 面板）', 'aria-label': '模型 ' + o.model + '，切换模型' },
     icon('spark'), h('span', { class: 'cb-label' }, o.model));
     model.addEventListener('click', () => { const c = this.opts; if (c && c.onModel) c.onModel(); });
-    const effort = h('button', { class: 'cb-btn cb-effort', type: 'button', id: this.ids.effort || null, disabled: !!why,
-      title: why || 'effort：' + o.effort + '\n点击调整 effort（在终端里打开 /effort 面板）', 'aria-label': 'effort ' + o.effort + '，调整 effort' },
+    const lock = o.effortLock || '';
+    const effort = h('button', { class: 'cb-btn cb-effort' + (lock ? ' is-locked' : ''), type: 'button', id: this.ids.effort || null, disabled: !!why,
+      title: why || (lock ? lock + '\n点击查看 / 调整 effort' : 'effort：' + o.effort + '\n点击调整 effort（在终端里打开 /effort 面板）'),
+      'aria-label': 'effort ' + o.effort + (lock ? '（被环境变量锁定）' : '') + '，调整 effort' },
+    lock ? icon('lock', 'cb-lock') : null,
     h('span', { class: 'cb-label' }, isDefaultEffort ? 'effort 默认' : o.effort));
     effort.addEventListener('click', () => { const c = this.opts; if (c && c.onEffort) c.onEffort(); });
     return h('span', { class: 'cb-capsule' + (why ? ' is-disabled' : ''), role: 'group', 'aria-label': '模型与 effort' },

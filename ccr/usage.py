@@ -1,6 +1,7 @@
 """API key 用量查询（可选；兼容 sub2api 等网关的 GET <base_url>/v1/usage，Authorization: Bearer <key>）。
 
-- 请求从本地 Mac 直接发往 base_url（base_url 为空的条目用"服务器默认"条目的 base_url；也没有就不查询）。
+- 请求从本地 Mac 直接发往 base_url。条目自己没填 base_url 时依次用：设置里的默认 base_url（config.json 的
+  default_base_url）→ "服务器默认"条目的 base_url；都没有就不查询。
 - 明文 key 只在本进程里用来拼请求头；**绝不**返回给前端、不写日志，错误信息里出现 key 也会被换成掩码。
 - 7 天用量 = daily_usage 里 date ≥ 今天−6 天 的 actual_cost 之和（缺失用 cost）；"今天" = daily_usage 最大日期
   与本地日期中较大者（按网关返回的 YYYY-MM-DD 字符串比较）。另给今日用量与余额 remaining（次要信息）。
@@ -70,8 +71,9 @@ def summarize(data, local_today: Optional[str] = None) -> dict:
 
 
 class UsageService:
-    def __init__(self, store, ttl: float = TTL, timeout: float = TIMEOUT, opener=None):
+    def __init__(self, store, ttl: float = TTL, timeout: float = TIMEOUT, opener=None, get_default_base=None):
         self.store = store
+        self._get_default_base = get_default_base   # () -> 设置里的默认 base_url（"" / None = 没设置）
         self.ttl = ttl
         self.timeout = timeout
         self._opener = opener or urllib.request.build_opener()
@@ -83,7 +85,7 @@ class UsageService:
     def get_all(self, refresh: bool = False) -> dict:
         """{id: {week_usd, today_usd, remaining_usd, unit, fetched_at, error, base_url}}；过期/refresh 的并发重查。"""
         creds = self.store.all_credentials()
-        default_base = next((c["base_url"] for c in creds if c["is_server_default"]), None)
+        default_base = self.default_base() or next((c["base_url"] for c in creds if c["is_server_default"]), None)
         now = time.time()
         out, todo = {}, []
         with self._lock:
@@ -116,6 +118,15 @@ class UsageService:
             out[kid] = dict(results.get(kid) or self._err(base, "查询超时"))
         return out
 
+    def default_base(self) -> Optional[str]:
+        """设置里的默认 base_url（读取失败或不合法 = 没设置）。"""
+        if not callable(self._get_default_base):
+            return None
+        try:
+            return ccr_api_keys.validate_base_url(self._get_default_base())
+        except Exception:  # noqa: BLE001
+            return None
+
     # ------------------------------------------------------------ 内部
     @staticmethod
     def _err(base, msg) -> dict:
@@ -124,7 +135,7 @@ class UsageService:
 
     def _fetch(self, key: str, base: Optional[str]) -> dict:
         if not base:
-            return self._err(None, "没有 base_url（服务器默认条目也没填写地址），无法查询")
+            return self._err(None, "没有 base_url（可以在「设置」里填写默认 base_url），无法查询")
         mask = ccr_api_keys.mask_key(key)
 
         def clean(s):   # 万一网关回显了请求头：把明文 key 换成掩码

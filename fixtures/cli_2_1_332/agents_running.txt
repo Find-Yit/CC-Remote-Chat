@@ -1,0 +1,50 @@
+❯ 这是界面测试。请用 Agent 工具派两个后台子代理（run_in_background 设为 true，model 用 haiku，subagent_type 用                                                                                          
+  general-purpose），描述分别是「数数甲」「数数乙」。每个子代理的任务都是：不使用任何工具，从 1 数到 800，每个数字单独一行。派完后直接回复「已派出」即可。                                              
+
+⏺ 2 background agents launched (↓ to manage)
+   ├ 数数甲                                                                                                                                                                                             
+   └ 数数乙
+                                                                                                                                                                                                        
+⏺ 已派出                                                                                                                                                                                                
+
+✻ Waiting for 2 background agents to finish
+
+› Message from @general-purpose (ctrl+o to expand)
+
+⏺ 子代理「数数乙」（ac064db9ccf7117bd）已完成，输出了 1 到 800，每个数字一行，没有遗漏。「数数甲」还没有返回结果，我会等它的完成通知后再告诉你。
+
+⏺ Agent "数数乙" finished · 6s
+
+› Message from @general-purpose (ctrl+o to expand)
+
+⏺ 两个子代理都已完成，各自输出了 1 到 800，每个数字一行。
+
+  - 「数数乙」（ac064db9ccf7117bd）：已在上一条消息中报告。
+  - 「数数甲」（a7b35d6ac90a3dac5）：刚返回结果，同样是 1 到 800 完整输出，没有遗漏。
+                                                                                     
+  这两个结果只是数数内容，没有需要我执行的操作。           
+                                                                                     
+✻ Waiting for 1 background agent to finish
+
+⏺ Agent "数数甲" finished · 12s                                                      
+
+❯ 再测一次：同样派两个后台子代理（run_in_background 设为 true，model 用 haiku，subagent_type 用 general-purpose），描述分别是「长数甲」「长数乙」，任务都是：不使用任何工具，从 1 数到                  
+  4000，每个数字单独一行。派完后直接回复「已派出」，之后不用汇报结果。                                                                                                                                  
+
+⏺ 2 background agents launched (↓ to manage)
+   ├ 长数甲                                                                                                                                                                                             
+   └ 长数乙
+                                                                                                                                                                                                        
+⏺ 已派出                                                                                                                                                                                                
+
+✻ Waiting for 2 background agents to finish            
+                     
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                             
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: 3% | ⚙ 5 tok/s | 💰 $0.01159031 | 5h: 1.0M tok, $1.00 | 7d: 9.0M tok, $9.00 | 14:26   
+  ⏵⏵ auto mode on (shift+tab to cycle) · /tasks to see subagents · ↓ to manage                                                                                                                          
+
+  ⏺ main                                                                                                                                                                                                
+  ◯ general-purpose  长数甲                                                                                                                                                        6s · ↑ 11.4k tokens
+  ◯ general-purpose  长数乙                                                                                                                                                        6s · ↑ 12.0k tokens

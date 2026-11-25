@@ -2,14 +2,14 @@
 import { Api, EventStream, takeLoginCode } from './api.js';
 import { h, icon, spinner, fmtRelTime, fmtSize, basename, truncate } from './dom.js';
 import {
-  createState, ensureSession, applyEnvelope, applyToSession, releaseHold, applyHistory, applyScreen, mountSession,
+  createState, ensureSession, forgetSession, applyEnvelope, applyToSession, releaseHold, applyHistory, applyScreen, mountSession,
   addLocalNotice, scrollToBottom, refreshTail, currentDialog, setModelList, revealItem,
 } from './render.js';
 import { toast, confirmDialog, promptDialog, jobsPopover, newSessionDialog, JOBID_RE, isLocalMeta, targetQuery } from './dialogs.js';
-import { openModelModal, openEffortModal, TermPanel } from './tui.js';
+import { openModelModal, openEffortModal, TermPanel, effortLockText, appliedToast } from './tui.js';
 import { SubagentUI } from './subagents.js';
 import { StatsBar } from './stats.js';
-import { apiLabel, apiUsageTitle, restartApiDialog, loadApiKeys, loadUsage, onApiKeysChange } from './apikeys.js';
+import { apiLabel, apiUsageTitle, restartApiDialog, loadApiKeys, loadUsage, onApiKeysChange, setDefaultBaseUrl } from './apikeys.js';
 import { initViz } from './viz.js';           // 可视化（§10）：图片引用 / 灯箱 / 文件 chip / 右侧预览面板
 import { PreviewPanel } from './preview.js';
 import { HintBar, installChords, screenHints } from './hotkeys.js';
@@ -81,7 +81,8 @@ const actions = {
   applyModel: (s, body) => api.post(sp(s, '/model'), body),
   applyEffort: (s, body) => withClearRetry((extra) => api.post(sp(s, '/effort'), { ...body, ...extra })),
   openSubagent: (s, aid) => { if (saUI) saUI.open(s, aid); },
-  onApplied: (s, r, scope) => toast((r && typeof r.result === 'string' && r.result ? r.result.replace(/`/g, '') + ' · ' : '') + (scope === 'save' ? '已保存为默认' : '仅本会话')),
+  // 结果以 CLI 的回报为准：原文（没有就不显示，绝不显示 null）+ 后端的提醒（effort 被环境变量锁定 / 结果未知）
+  onApplied: (s, r, scope) => { const t = appliedToast(r, scope); toast(t.text, t.level, t.level === 'warn' ? 9000 : undefined); },
 };
 
 /**
@@ -141,6 +142,7 @@ const state = createState({
   onModelInfo: () => scheduleUI(),
   onSubagent: (s, aid, added, reset) => { if (saUI) saUI.onUpdate(s, aid, added, reset); if (pvPanel) pvPanel.onSessionUpdate(s); scheduleUI(); },
   onFlush: minimapFlush,
+  onRemoved: (sid) => dropSession(sid),   // 会话在别的窗口被删除（后端推 app/removed）
 });
 
 // ====================== 启动 / 登录 / 重置 ======================
@@ -227,7 +229,7 @@ async function loadAll() {
   state.lastGseq = typeof b.gseq === 'number' ? b.gseq : 0;
 
   for (const meta of Array.isArray(b.sessions) ? b.sessions : []) {
-    if (!meta || !meta.sid) continue;
+    if (!meta || !meta.sid || state.removed.has(meta.sid)) continue;   // 本页已删除的（bootstrap 可能取于删除完成之前）
     const s = ensureSession(state, meta.sid, meta);
     s.hold = true; // 回放完成前暂存 SSE 事件
   }
@@ -241,7 +243,11 @@ async function loadAll() {
     onStatus: (st) => setConn(st),
     beforeReconnect,
     onReset: () => resetAll('服务已重启或部分实时事件无法回放'),
-    onConfig: (c) => { config = c; applyConfigUI(); },
+    onConfig: (c) => {
+      config = c; applyConfigUI();
+      // 别的窗口改了设置里的默认 base_url：更新 key 的地址显示与用量
+      if (setDefaultBaseUrl(c.default_base_url || '')) loadUsage(api).catch(() => {});
+    },
     onUpdate: (u) => setUpdate(u),
   });
   stream.start();
@@ -529,6 +535,8 @@ function modelLabel(s) {
 
 function effortLabel(s) {
   const l = s.meta.launch || {};
+  const lk = s.meta.effort_locked;
+  if (lk && lk.level) return lk.level;   // 被环境变量锁定：CLI 实际用的档位
   return s.modelInfo.effort || s.meta.effort || l.effort || '默认';
 }
 
@@ -861,10 +869,10 @@ function renderComposerControls() {
   const modeBlocked = dead ? '会话已退出' : dialog ? '请先处理当前对话框' : m.link === 'down' ? '与' + placeOf(m) + '的连接已断开' : '';
   const cycleMode = () => api.post(sp(s, '/mode/cycle')).catch((e) => toast('切换权限模式失败：' + e.message, 'error'));
   composerCtl.update({
-    sid: s.sid, model: modelLabel(s), effort: effortLabel(s), why,
+    sid: s.sid, model: modelLabel(s), effort: effortLabel(s), why, effortLock: effortLockText(m),
     mode: currentMode(s), cycle: cycleOf(m), modeBlocked,
     onModel: () => openModelFor(s, true),
-    onEffort: () => openEffortModal({ s, actions, current: s.modelInfo.effort || (s.meta.launch && s.meta.launch.effort) || '' }),
+    onEffort: () => openEffortModal({ s, actions, current: (m.effort_locked && m.effort_locked.level) || s.modelInfo.effort || (s.meta.launch && s.meta.launch.effort) || '' }),
     onPickMode: (id, needsRestart) => pickMode(s, id, needsRestart),
     onCycle: cycleMode,
   });
@@ -1177,7 +1185,7 @@ function dropSession(sid) {
   if (s && s.view) s.view.root.remove();
   if (s) clearTimeout(s.draft.timer);
   if (modelCtrl && modelCtrl.sid === sid) closeModelModal();
-  state.sessions.delete(sid);
+  forgetSession(state, sid);   // 记住已删除：之后迟到的该 sid 事件（exited meta、子代理…）不会把它加回侧栏
   drafts.delete(sid);
   sentPending.delete(sid);
   updateDocTitle();

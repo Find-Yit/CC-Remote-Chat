@@ -19,6 +19,7 @@ import collections
 import contextlib
 import hashlib
 import importlib
+import inspect
 import itertools
 import json
 import logging
@@ -33,6 +34,7 @@ from typing import Callable, Optional
 
 from . import api_keys as ccr_api_keys
 from . import notify as ccr_notify
+from . import opprogress as ccr_op
 from . import remote, stats, subagents, titles, tui_parse
 
 log = logging.getLogger("ccr.session")
@@ -238,6 +240,9 @@ class _Session:
         # app 停止期间可能完成的回复：持久化时还在 busy → 重新附着后第一次稳定看到 idle 时补记 done_at（不响）
         self.done_pending = False
         self.done_pending_since: Optional[float] = None   # 满足条件的起点（monotonic）；None = 当前不满足
+        # 重启 / 续接 / 新建 / 换 API 重启的阶段进度（meta.op，见 ccr.opprogress）；只在内存里，不落盘
+        self.op: Optional[dict] = None
+        self.op_timer: Optional[threading.Timer] = None
         self.events: "collections.deque[dict]" = collections.deque(maxlen=max_events)
         self.truncated = False
         self.last_meta = None
@@ -274,6 +279,7 @@ class _Session:
             "api_key_name": self.api_key_name, "api_key_missing": self.api_key_missing,
             # 本次启动后 Shift+Tab 能循环到的模式；不在里面的（如没带跳过权限时的 bypass、dontAsk）需要重启才能切换
             "mode_cycle": mode_cycle(self.launch, self.modes_seen),
+            "op": ccr_op.public(self.op),
         }
 
     def live(self) -> bool:
@@ -534,6 +540,11 @@ class SessionManager:
         self.keeper_timeout = 120.0
         self.connect_grace = 8.0         # link 正在连接时，用户操作最多等这么久
         self.resume_done_delay = 3.0     # app 停止期间完成的回复：重新附着后 idle 稳定这么久才补记"新回复"
+        # 阶段进度（meta.op）：就绪后短暂显示"已就绪"；失败/仍未就绪的提示保留一段时间（新的操作会替换它）
+        self.ready_timeout = 90.0        # watch 之后这么久仍没出现输入框/对话框 → op 记为 stalled（不再转圈）
+        self.op_done_linger = 3.0
+        self.op_fail_linger = 600.0
+        self._op_ids = itertools.count(1)
         self.sub_queue_size = 20000
         # 持久化
         self._persist_lock = threading.Lock()
@@ -795,6 +806,7 @@ class SessionManager:
     def _emit_meta(self, s: _Session, force=False) -> None:
         with s.lock:
             self._notify_locked(s)
+            self._op_track_locked(s)
             m = s.meta()
             cmp = dict(m)
             cmp.pop("last_activity", None)
@@ -804,12 +816,167 @@ class SessionManager:
             self._app(s, {"type": "meta", "meta": m})
             # 生成中每秒都会变的 tok_s_live / updated_at 不值得重写 sessions.json（其余变化照常落盘）
             pk = dict(cmp)
+            pk.pop("op", None)   # 阶段进度只在内存里（不为它重写 sessions.json）
             if pk.get("stats"):
                 pk["stats"] = {k: v for k, v in pk["stats"].items() if k not in ("tok_s_live", "updated_at")}
             persist = force or pk != s.last_persist
             s.last_persist = pk
         if persist:
             self._dirty.set()
+
+    # ================================================================ 阶段进度（meta.op，ccr.opprogress）
+    # 只在本应用这侧报告"做到哪一步"（经现有的 meta 推送）；不改变 claude 的启动参数、环境、按键。
+    def _op_host(self) -> str:
+        h = (self._get_config() or {}).get("host")
+        return h if isinstance(h, str) and h else "服务器"
+
+    @staticmethod
+    def _op_live(s: _Session, op_id=None) -> Optional[dict]:
+        """调用方持有 s.lock。进行中的 op（op_id 给定时必须是同一个）。"""
+        op = s.op
+        if op is None or op.get("state") != ccr_op.RUNNING:
+            return None
+        if op_id is not None and op.get("id") != op_id:
+            return None
+        return op
+
+    def _op_timer_locked(self, s: _Session, delay: Optional[float], fn, *args) -> None:
+        if s.op_timer is not None:
+            s.op_timer.cancel()
+            s.op_timer = None
+        if delay is None:
+            return
+        t = threading.Timer(max(0.0, delay), fn, args)
+        t.daemon = True
+        s.op_timer = t
+        t.start()
+
+    def _op_begin_locked(self, s: _Session, kind: str, ids: list, jobid: str, resume=None,
+                         started_at=None, detail=None) -> dict:
+        self._op_timer_locked(s, None, None)
+        s.op = ccr_op.new_op(next(self._op_ids), kind, ids, local=remote.is_local(jobid), host=self._op_host(),
+                             jobid=jobid, resume=resume, started_at=started_at, detail=detail)
+        return s.op
+
+    def _op_link_ids(self, jobid: str) -> list:
+        with self._lock:
+            link = self._links.get(jobid)
+        st = None if link is None else self._link_state(jobid)
+        return ccr_op.link_phases(remote.is_local(jobid), st)
+
+    def _op_phase(self, s: _Session, op_id, pid: str, detail=None) -> None:
+        with s.lock:
+            op = self._op_live(s, op_id)
+            changed = op is not None and ccr_op.set_phase(op, pid, detail=detail)
+            if changed and pid == "ready":
+                self._op_timer_locked(s, self.ready_timeout, self._op_ready_timeout, s, op["id"])
+        if changed:
+            self._emit_meta(s)
+
+    def _op_note(self, s: _Session, detail: Optional[str], op_id=None) -> None:
+        """更新当前阶段的补充说明（没有进行中的 op 时什么都不做：close/remove 也走同样的代码）。"""
+        with s.lock:
+            op = self._op_live(s, op_id)
+            if op is None or op.get("detail") == detail:
+                return
+            op["detail"] = detail
+        self._emit_meta(s)
+
+    def _op_finish(self, s: _Session, op_id, state: str, error=None, code=None, detail=None) -> None:
+        with s.lock:
+            op = self._op_live(s, op_id)
+            if op is None:
+                return
+            ccr_op.finish(op, state, error=error, code=code, detail=detail)
+            self._op_finish_timer_locked(s, op)
+        self._emit_meta(s)
+
+    def _op_finish_timer_locked(self, s: _Session, op: dict) -> None:
+        st = op.get("state")
+        linger = self.op_done_linger if st == "done" else self.op_fail_linger if st in ("failed", "stalled") else None
+        self._op_timer_locked(s, linger, self._op_expire, s, op["id"])
+
+    def _op_clear(self, s: _Session, op_id=None) -> None:
+        with s.lock:
+            if s.op is None or (op_id is not None and s.op.get("id") != op_id):
+                return
+            s.op = None
+            self._op_timer_locked(s, None, None)
+        self._emit_meta(s)
+
+    def _op_expire(self, s: _Session, op_id) -> None:
+        with s.lock:
+            op = s.op
+            if op is None or op.get("id") != op_id or op.get("state") == ccr_op.RUNNING:
+                return
+            s.op = None
+            s.op_timer = None
+        self._emit_meta(s)
+
+    def _op_ready_timeout(self, s: _Session, op_id) -> None:
+        with s.lock:
+            op = self._op_live(s, op_id)
+            if op is None or op.get("phase") != "ready":
+                return
+            s.op_timer = None
+        self._op_finish(s, op_id, "stalled",
+                        detail="claude 已启动，但 %d 秒后仍未出现输入框；请打开终端面板看看它停在哪里"
+                               % int(self.ready_timeout))
+
+    def _op_track_locked(self, s: _Session) -> None:
+        """调用方持有 s.lock（_emit_meta 里）：等待就绪阶段根据会话状态收尾。
+        出现输入框（idle/busy）或其它对话框（waiting）= 就绪；信任框 = 结束进度并提示用户确认（绝不自动回答）。"""
+        op = s.op
+        if op is None:
+            return
+        if op.get("state") == ccr_op.RUNNING and op.get("phase") == "ready":
+            if s.state in ("idle", "busy", "waiting"):
+                ccr_op.finish(op, "done", detail="claude 已启动，正在等待你处理对话框" if s.state == "waiting" else None)
+            elif s.state == "trust":
+                ccr_op.finish(op, "trust", detail="等待你在上方确认信任目录")
+            else:
+                return
+            self._op_finish_timer_locked(s, op)
+        elif op.get("state") == "trust" and s.state != "trust":
+            s.op = None
+            self._op_timer_locked(s, None, None)
+
+    def _op_sync_link(self, s: _Session, op_id, jobid: str, st: Optional[str]) -> None:
+        """等待连接时按 link 状态推进 probe → connect，连不上时写明第几次失败、原因（link 会自动退避重连）。"""
+        if op_id is None:
+            return
+        with self._lock:
+            err = self._link_err.get(jobid)
+        local = remote.is_local(jobid)
+        changed = False
+        with s.lock:
+            op = self._op_live(s, op_id)
+            if op is None or st not in ("down", "connecting"):
+                return
+            n = int(op.get("retries") or 0)   # 失败次数由 _on_link_state 计（每次 link 报告 down + 原因）
+            why = ccr_op.short_reason(op.get("_last_err"), host=self._op_host(), jobid=jobid, local=local) if n else ""
+            if st == "connecting":
+                pid, detail = "connect", ("第 %d 次连接失败（%s），正在重试…" % (n, why) if n else None)
+            elif err or local or op.get("phase") == "connect":
+                pid, detail = "connect", ("第 %d 次连接失败（%s），稍后自动重试" % (n, why) if n else None)
+            else:
+                pid, detail = "probe", None
+            changed = ccr_op.set_phase(op, pid, detail=detail) or changed
+        if changed:
+            self._emit_meta(s)
+
+    def _op_fail_from(self, s: _Session, op_id, e, jobid: str, timeout: float = 0) -> str:
+        """阶段失败：op 写清原因（短句），返回给用户看的那句话（同时用于 s.error / 提示）。"""
+        raw = str(e) or type(e).__name__
+        with s.lock:
+            op = self._op_live(s, op_id)
+            pid = op.get("phase") if op else None
+        code = getattr(e, "api_code", None)
+        text = ccr_op.describe_failure(pid, raw, host=self._op_host(), jobid=jobid, local=remote.is_local(jobid),
+                                       timeout=timeout if pid in ("probe", "connect") else 0, code=code)
+        self._op_finish(s, op_id, "failed", error=text,
+                        code="job_ended" if (code == "job_ended" or "作业已结束" in text) else code)
+        return text
 
     # ================================================================ 查询
     def _get(self, sid) -> _Session:
@@ -955,6 +1122,12 @@ class SessionManager:
             with s.lock:
                 was_live = s.live() and not s.starting
                 s.link = "ended"
+                op = self._op_live(s)
+                op_id = op["id"] if op is not None and op.get("jobid") == jobid else None
+            if op_id is not None:   # 正在这个作业上重启/续接：进度里写明作业已结束（之后的启动失败不再覆盖）
+                self._op_finish(s, op_id, "failed", code="job_ended",
+                                error=ccr_op.describe_failure(None, err or "", host=self._op_host(), jobid=jobid,
+                                                              local=False, code="job_ended"))
             if was_live:
                 self._mark_exited(s, None)
                 with s.lock:
@@ -976,7 +1149,7 @@ class SessionManager:
                 s.link = st
             self._emit_meta(s)
 
-    def _wait_link(self, jobid: str, timeout: float):
+    def _wait_link(self, jobid: str, timeout: float, s: Optional[_Session] = None, op_id=None):
         link = self._ensure_link(jobid)
         with self._lock:
             ev = self._link_ready.get(jobid)
@@ -985,9 +1158,13 @@ class SessionManager:
             if self._shutdown:
                 raise OpError("服务正在关闭")
             st = getattr(link, "state", None)
+            if s is not None:
+                self._op_sync_link(s, op_id, jobid, st)
             if st == "ready":
                 return link
-            if st == "ended":
+            with self._lock:
+                gone = jobid in self._ended_jobs   # link 已因作业结束被关闭/移除（state 可能已不是 ended）
+            if st == "ended" or gone:
                 raise OpError("作业 %s 已结束，请在新的作业上启动/续接" % jobid, code="job_ended")
             if ev is not None:
                 ev.wait(min(0.5, max(0.01, deadline - time.monotonic())))
@@ -1020,6 +1197,10 @@ class SessionManager:
         for s in ss:
             with s.lock:
                 s.link = state if state in ("connecting", "ready", "down") else "connecting"
+                op = self._op_live(s)
+                if op is not None and state == "down" and err and op.get("jobid") == jobid:
+                    op["retries"] = int(op.get("retries") or 0) + 1   # 正在重启/续接时又一次连接失败（link 会退避重连）
+                    op["_last_err"] = err
             self._emit_meta(s)
         if state == "ready" and not self._shutdown:
             threading.Thread(target=self._reattach, args=(jobid,), name="ccr-reattach-" + jobid,
@@ -1322,6 +1503,17 @@ class SessionManager:
                                           "点「重启」将以新会话启动（目录、模型、API 不变）")
             s.exited = True
             s.exit_status = exit_status if isinstance(exit_status, int) else None
+            # 新启动的 claude 在启动/等待就绪阶段就退出了：进度里写明（旧 claude 在 stop 阶段退出是预期的）
+            op = self._op_live(s)
+            op_id = None
+            if op is not None and op.get("phase") in ("start", "ready"):
+                op_id = op["id"]
+                if retry_fresh:
+                    op["detail"] = "这个会话还没有任何对话，无法 --resume 续接，正在改为以新会话启动…"
+                else:
+                    ccr_op.finish(op, "failed", error="claude 启动后就退出了%s，可打开终端面板查看它的输出"
+                                  % ("（退出码 %d）" % s.exit_status if s.exit_status is not None else ""))
+                    self._op_finish_timer_locked(s, op)
             s.status = None
             s.claude_pid = None
             s.dialog_kind = None
@@ -1334,15 +1526,16 @@ class SessionManager:
         self._app(s, {"type": "exit", "exit_status": s.exit_status})
         self._emit_meta(s)
         if retry_fresh:
-            threading.Thread(target=self._restart_fresh_after_noconv, args=(s,), name="ccr-fresh-" + s.sid,
+            threading.Thread(target=self._restart_fresh_after_noconv, args=(s, op_id), name="ccr-fresh-" + s.sid,
                              daemon=True).start()
 
-    def _restart_fresh_after_noconv(self, s: _Session) -> None:
+    def _restart_fresh_after_noconv(self, s: _Session, op_id=None) -> None:
         """--resume 报 No conversation found（会话还没有任何对话）：自动以新会话重启一次
-        （restart 会因 tx_noconv 不带 --resume；目录/模型/权限/API 沿用）。只会发生一次，没有可丢的历史。"""
+        （restart 会因 tx_noconv 不带 --resume；目录/模型/权限/API 沿用）。只会发生一次，没有可丢的历史。
+        op_id：正在进行的重启/续接进度，接着用它（不当成"已在进行"而跳过）。"""
         time.sleep(0.5)
         try:
-            self.restart(s.sid)
+            self.restart(s.sid, _cont=op_id)
             self._notice(s, "info", "这个会话还没有任何对话，无法 --resume 续接，已改为以新会话启动（目录、模型、API 不变）")
         except Exception as e:  # noqa: BLE001
             msg = str(e) or type(e).__name__
@@ -1684,6 +1877,7 @@ class SessionManager:
         s.attached = True
         s.starting = True
         s.state = "starting"
+        op = self._op_begin_locked(s, "create", self._op_link_ids(j) + ["keeper", "start", "ready"], j, resume=r)
         s.oplock.acquire()   # 由启动线程释放
         try:
             with self._lock:
@@ -1692,7 +1886,7 @@ class SessionManager:
             with s.lock:
                 s.link = self._link_state(j)
             self._emit_meta(s, force=True)
-            threading.Thread(target=self._start_worker, args=(s, args, key), name="ccr-start-" + sid,
+            threading.Thread(target=self._start_worker, args=(s, args, key, op["id"]), name="ccr-start-" + sid,
                              daemon=True).start()
         except BaseException:
             with s.lock:
@@ -1704,17 +1898,32 @@ class SessionManager:
             raise
         return self.get_meta(sid)
 
-    def _start_worker(self, s: _Session, args: list, cred=None) -> None:
+    def _ensure_keeper(self, link, s: _Session, op_id) -> None:
+        """link.ensure_keeper；支持 progress 回调的（ccr.agent_link.AgentLink）把子步骤写进进度说明。"""
+        fn = link.ensure_keeper
+        try:
+            accepts = "progress" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts:
+            fn(timeout=self.keeper_timeout, progress=lambda text: self._op_note(s, text, op_id))
+        else:
+            fn(timeout=self.keeper_timeout)
+
+    def _start_worker(self, s: _Session, args: list, cred=None, op_id=None) -> None:
         """调用方已为本线程获取 s.oplock；结束时释放。
         cred = (明文 key, base_url|None)：只作为 start 请求的 api_key/base_url 字段经 agent 的 stdin 发出
-        （agent 写 0600 文件并追加 --settings）；None = 服务器默认，与以前完全一致。"""
+        （agent 写 0600 文件并追加 --settings）；None = 服务器默认，与以前完全一致。
+        op_id：阶段进度（连接 → keeper → 启动 claude → 等待就绪），失败时写明原因。"""
         started = False
+        jobid = s.jobid
         try:
-            self._wait_link(s.jobid, self.link_timeout)
+            self._wait_link(jobid, self.link_timeout, s=s, op_id=op_id)
+            self._op_phase(s, op_id, "keeper")
             with self._lock:
-                link = self._links.get(s.jobid)
+                link = self._links.get(jobid)
             try:
-                link.ensure_keeper(timeout=self.keeper_timeout)
+                self._ensure_keeper(link, s, op_id)
             except OpError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -1726,7 +1935,8 @@ class SessionManager:
                 params["api_key"] = cred[0]
                 if cred[1]:
                     params["base_url"] = cred[1]
-            res = self._req(s.jobid, "start", timeout=60, **params)
+            self._op_phase(s, op_id, "start")
+            res = self._req(jobid, "start", timeout=60, **params)
             started = True
             pp = res.get("pane_pid") if isinstance(res, dict) else None
             with s.lock:
@@ -1734,16 +1944,19 @@ class SessionManager:
                 s.starting = False
                 s.error = None
             self.notifier.reset(s.sid)   # 启动后的首帧只作提示音基线
-            self._req(s.jobid, "watch", sid=s.sid, on=True, timeout=20)
+            self._req(jobid, "watch", sid=s.sid, on=True, timeout=20)
+            self._op_phase(s, op_id, "ready")
         except Exception as e:  # noqa: BLE001
             msg = str(e) or type(e).__name__
+            # 给用户看的是一句话的原因（ssh 超时 / 作业已结束 / srun 报错…），原始报错只进日志
+            text = self._op_fail_from(s, op_id, e, jobid, timeout=self.link_timeout)
             with s.lock:
                 s.starting = False
                 if not started:
                     s.attached = False
-                    s.error = "启动失败：%s" % msg
+                    s.error = "启动失败：%s" % text
                 self._derive_locked(s)
-            self._notice(s, "error", ("启动失败：%s" if not started else "监视会话失败：%s") % msg)
+            self._notice(s, "error", ("启动失败：%s" if not started else "监视会话失败：%s") % text)
             log.warning("启动会话 %s 失败：%s", s.sid, msg)
         finally:
             with s.lock:
@@ -2387,6 +2600,8 @@ class SessionManager:
                 if ev is not None:
                     ev.wait(self.connect_grace)
             if self._link_state(jobid) != "ready":
+                self._op_note(s, "与%s的连接已断开，正在核实%s…" % (_place(jobid), "本机 agent" if remote.is_local(jobid)
+                                                                else "作业状态（squeue）"))
                 ended = self._job_ended(jobid)
                 if ended:
                     self._force_local_exit(s, "")   # _on_job_ended 已发过提示
@@ -2419,12 +2634,16 @@ class SessionManager:
                         except OpError:
                             pass
                         # /exit 同样先确认补全列表高亮的就是 /exit，再带守卫按 Enter
+                        self._op_note(s, "在终端里输入 /exit…")
                         self._submit_text(s, "/exit", slash="/exit")
+                        self._op_note(s, "等待 claude 退出（最多 %d 秒）…" % int(self.exit_timeout))
                         exited = self._wait_exit(s, self.exit_timeout)
                 except OpError as e:
                     if isinstance(e, LinkNotReady):
                         raise
                     log.info("关闭会话 %s：/exit 失败（%s），改为 kill", s.sid, e)
+            if not exited:
+                self._op_note(s, "claude 没有按时退出，正在结束旧的 tmux 会话…")
             self._req(jobid, "kill", sid=s.sid, timeout=20)
             if not exited:
                 self._notice(s, "info", "claude 未在 %d 秒内退出，已结束 tmux 会话" % int(self.exit_timeout))
@@ -2472,7 +2691,7 @@ class SessionManager:
         self._emit_meta(s)
         return {"ok": True}
 
-    def restart(self, sid, jobid=None, force: bool = False, api_key_id=_KEEP, mode=None) -> dict:
+    def restart(self, sid, jobid=None, force: bool = False, api_key_id=_KEEP, mode=None, _cont=None) -> dict:
         """关闭旧会话（若仍在）→ 在（新）作业上 start，带 --resume <claude_session_id>，沿用 launch 参数
         （会话里改过的模型/effort/权限模式用当前值，见 _carry_launch_locked）。
         旧作业已结束时不需要连上旧作业：直接在新作业上续接；不给新作业则 409 job_ended。
@@ -2481,7 +2700,11 @@ class SessionManager:
         本机会话只能在本机重启、服务器会话只能换到服务器作业（transcript 在各自机器上，--resume 跨机器找不到）：
         跨运行位置 → 409 target_mismatch（什么都不动）。
         mode：覆盖权限启动参数（模式选择栏里"需重启"的模式，SPEC §13）：bypassPermissions → --dangerously-skip-permissions；
-        其它（dontAsk 等）→ --permission-mode <mode>（去掉跳过权限）。在"会话里改过的模型/effort/模式沿用当前值"之后应用。"""
+        其它（dontAsk 等）→ --permission-mode <mode>（去掉跳过权限）。在"会话里改过的模型/effort/模式沿用当前值"之后应用。
+
+        阶段进度：一进来就在 meta.op 里报告（停止旧 claude → 连接 → keeper → 启动 → 等待就绪），经 SSE 推给前端。
+        幂等：同一会话已有进行中的重启/续接/新建时不再启动第二次，直接返回当前进度（meta 带 op_reused=true）。
+        _cont：内部用（--resume 报 No conversation found 后自动改为新会话启动），接着用这个进度。"""
         s = self._get(sid)
         if mode is not None and (not isinstance(mode, str) or mode not in PERMISSION_MODES):
             raise ValueError("mode 不合法（可选：%s）" % "/".join(PERMISSION_MODES))
@@ -2493,82 +2716,140 @@ class SessionManager:
                           code="target_mismatch")
         change_key = api_key_id is not _KEEP
         new_kid = ccr_api_keys.validate_id_opt(api_key_id) if change_key else None
-        if not s.oplock.acquire(timeout=60):
-            raise OpError("该会话正在执行其它操作，请稍候再试", code="op_in_progress")
+        # "服务器默认"条目视同 null（在 s.lock 之外查 api_keys，避免与它的变更回调交叉加锁）
+        switching = change_key and self._norm_kid(new_kid) != self._norm_kid((s.launch or {}).get("api_key_id"))
+        with s.lock:   # 检查与登记在同一把锁里：并发的重复请求只有一个会真正执行
+            cur = self._op_live(s)
+            if cur is not None and not (_cont is not None and cur.get("id") == _cont):
+                reused = True
+            else:
+                reused = False
+                target = new_job or s.jobid
+                live = s.live()
+                if cur is not None:   # 接着自动重试（_cont）：沿用种类与开始时间
+                    kind, started = cur.get("kind"), cur.get("started_at")
+                elif new_job is not None and new_job != s.jobid:
+                    kind, started = "resume_new_job", None
+                elif mode is not None:
+                    kind, started = "mode", None
+                elif switching:
+                    kind, started = "switch_api", None
+                else:
+                    kind, started = ("restart" if live else "reconnect"), None
+                ids = (["stop"] if live else []) + self._op_link_ids(target) + ["keeper", "start", "ready"]
+                op = self._op_begin_locked(s, kind, ids, target, resume=s.claude_session_id, started_at=started,
+                                           detail=cur.get("detail") if cur is not None else None)
+                op_id = op["id"]
+        if reused:
+            log.info("会话 %s 已有进行中的重启/续接/启动，不重复执行", sid)
+            return dict(self.get_meta(sid), op_reused=True)
+        self._emit_meta(s)   # 点下去立刻有反馈（进度经 SSE 推送；HTTP 响应在停止旧会话之后才返回）
         handed_off = False
         try:
-            old_job = s.jobid
-            same = new_job is None or new_job == old_job
-            if same and self._link_state(old_job) == "ended":
-                raise OpError("作业 %s 已结束，请选择新的作业来续接本会话" % old_job, code="job_ended")
-            with s.lock:   # 关闭旧会话之前：先确定新 launch 并取到 key（key 被删时什么都不动）
-                carry = self._carry_launch_locked(s)
-                if change_key:
-                    carry["api_key_id"] = new_kid
-                if mode == "bypassPermissions":
-                    carry["skip_permissions"], carry["permission_mode"] = True, None
-                elif mode is not None:
-                    carry["skip_permissions"], carry["permission_mode"] = False, mode
-                name_hint = s.api_key_name
-            carry["api_key_id"] = self._norm_kid(carry.get("api_key_id"))
-            key, key_name = self._resolve_api_key(carry.get("api_key_id"), name_hint, restart=True)
+            if not s.oplock.acquire(timeout=0.05):
+                self._op_note(s, "等待该会话当前的操作结束…", op_id)
+                if not s.oplock.acquire(timeout=60):
+                    raise OpError("该会话正在执行其它操作（例如发送消息、切换模型），请稍候再试", code="op_in_progress")
             try:
-                self._close_session(s, force=bool(force), linger=same)
-            except OpError as e:
-                if not force:
-                    raise
-                log.warning("强制重启会话 %s：%s", sid, e)
-                self._force_local_exit(s, "已强制结束本地会话（%s），%s的 claude 可能仍在运行"
-                                       % (e, "本机 tmux 里" if remote.is_local(old_job) else "旧作业里"))
-            if same and self._link_state(old_job) == "ended":
-                raise OpError("作业 %s 已结束，请选择新的作业来续接本会话" % old_job, code="job_ended")
-            with s.lock:
-                cid = s.claude_session_id
-                launch = carry
-                # 还没有任何对话（新会话只执行过 /model 等，或实测 --resume 报 No conversation found）：
-                # --resume 会直接失败退出，改为以新会话启动（同目录/模型/权限/新 key，没有可丢的历史）
-                fresh = bool(cid) and (cid in s.tx_noconv or (cid in s.tx_loaded and cid not in s.tx_conv))
-            resume_id = None if fresh else cid
-            if fresh:
-                log.info("会话 %s（claude %s）还没有对话，重启时以新会话启动（不带 --resume）", sid, cid)
-            self._check_unique_resume(resume_id, me=s)
-            args = self._build_args(launch, resume_id)
-            with s.lock:
-                if new_job:
-                    s.jobid = new_job
-                s.launch = launch
-                s.api_key_name, s.api_key_missing = key_name, False
-                s.seen_base = {}
-                s.modes_seen = set()
-                s.pane_pid = None
-                s.exited = False
-                s.exit_status = None
-                s.exit_evt = threading.Event()
-                s.attached = True
-                s.starting = True
-                s.error = None
-                s.status = None
-                s.claude_pid = None
-                s.screen_text = s.screen_state = None
-                s.screen_pub_text = None
-                s.model_rows = None
-                s.tracker.stop()   # 新进程：进行中的一轮作废；上下文/花费沿用最后已知值，直到新屏幕到达
-                self._stats_update_locked(s)
-                s.dialog_kind = None
-                s.state = "starting"
-            self._ensure_link(s.jobid)
-            with s.lock:
-                s.link = self._link_state(s.jobid)
-            self._emit_meta(s)
-            threading.Thread(target=self._start_worker, args=(s, args, key), name="ccr-start-" + s.sid,
-                             daemon=True).start()
-            handed_off = True
-            if not same:
-                self._maybe_stop_keeper(old_job)   # 旧作业已无会话：停 keeper、关 link（连不上时只关 link）
-        finally:
-            if not handed_off:
-                s.oplock.release()
+                old_job = s.jobid
+                same = new_job is None or new_job == old_job
+                if same and self._link_state(old_job) == "ended":
+                    raise OpError("作业 %s 已结束，请选择新的作业来续接本会话" % old_job, code="job_ended")
+                with s.lock:   # 关闭旧会话之前：先确定新 launch 并取到 key（key 被删时什么都不动）
+                    carry = self._carry_launch_locked(s)
+                    if change_key:
+                        carry["api_key_id"] = new_kid
+                    if mode == "bypassPermissions":
+                        carry["skip_permissions"], carry["permission_mode"] = True, None
+                    elif mode is not None:
+                        carry["skip_permissions"], carry["permission_mode"] = False, mode
+                    name_hint = s.api_key_name
+                carry["api_key_id"] = self._norm_kid(carry.get("api_key_id"))
+                key, key_name = self._resolve_api_key(carry.get("api_key_id"), name_hint, restart=True)
+                try:
+                    # linger：同作业马上要重启，保留 keeper/link；换作业时旧作业的清理放到后台（见下）
+                    self._close_session(s, force=bool(force), linger=True)
+                except OpError as e:
+                    if not force:
+                        raise
+                    log.warning("强制重启会话 %s：%s", sid, e)
+                    self._force_local_exit(s, "已强制结束本地会话（%s），%s的 claude 可能仍在运行"
+                                           % (e, "本机 tmux 里" if remote.is_local(old_job) else "旧作业里"))
+                if not same:
+                    # 旧作业已无会话：停 keeper、关 link（连不上 / 已结束时只关 link）。放到后台：旧作业可能已经
+                    # 没有响应（例如正在被 Slurm 回收），不能让它拖住这次续接
+                    threading.Thread(target=self._stop_old_job_quiet, args=(old_job,), name="ccr-oldjob-" + old_job,
+                                     daemon=True).start()
+                if same and self._link_state(old_job) == "ended":
+                    raise OpError("作业 %s 已结束，请选择新的作业来续接本会话" % old_job, code="job_ended")
+                with s.lock:
+                    cid = s.claude_session_id
+                    launch = carry
+                    # 还没有任何对话（新会话只执行过 /model 等，或实测 --resume 报 No conversation found）：
+                    # --resume 会直接失败退出，改为以新会话启动（同目录/模型/权限/新 key，没有可丢的历史）
+                    fresh = bool(cid) and (cid in s.tx_noconv or (cid in s.tx_loaded and cid not in s.tx_conv))
+                resume_id = None if fresh else cid
+                if fresh:
+                    log.info("会话 %s（claude %s）还没有对话，重启时以新会话启动（不带 --resume）", sid, cid)
+                self._check_unique_resume(resume_id, me=s)
+                args = self._build_args(launch, resume_id)
+                target = new_job or old_job
+                with s.lock:
+                    if new_job:
+                        s.jobid = new_job
+                    s.launch = launch
+                    s.api_key_name, s.api_key_missing = key_name, False
+                    s.seen_base = {}
+                    s.modes_seen = set()
+                    s.pane_pid = None
+                    s.exited = False
+                    s.exit_status = None
+                    s.exit_evt = threading.Event()
+                    s.attached = True
+                    s.starting = True
+                    s.error = None
+                    s.status = None
+                    s.claude_pid = None
+                    s.screen_text = s.screen_state = None
+                    s.screen_pub_text = None
+                    s.model_rows = None
+                    s.tracker.stop()   # 新进程：进行中的一轮作废；上下文/花费沿用最后已知值，直到新屏幕到达
+                    self._stats_update_locked(s)
+                    s.dialog_kind = None
+                    s.state = "starting"
+                    op = self._op_live(s, op_id)
+                    if op is not None:
+                        ccr_op.relabel_start(op, resume_id)
+                        nxt = (self._op_link_ids(target) or ["keeper"])[0]
+                        ccr_op.set_phase(op, nxt)
+                self._ensure_link(s.jobid)
+                with s.lock:
+                    s.link = self._link_state(s.jobid)
+                self._emit_meta(s)
+                threading.Thread(target=self._start_worker, args=(s, args, key, op_id), name="ccr-start-" + s.sid,
+                                 daemon=True).start()
+                handed_off = True
+            finally:
+                if not handed_off:
+                    s.oplock.release()
+        except OpError as e:
+            if e.api_code in ("job_ended", "api_key_missing", "target_mismatch", "link_down"):
+                self._op_clear(s, op_id)   # 前端会接着弹出对应的选择（选新作业 / 改选 key / 强制…），进度收起
+            elif e.api_code in ("op_in_progress", "already_running"):
+                self._op_finish(s, op_id, "failed", error=str(e), code=e.api_code)
+            else:
+                self._op_fail_from(s, op_id, e, new_job or s.jobid)
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._op_finish(s, op_id, "failed", error=ccr_op.clip(str(e) or type(e).__name__))
+            raise
         return self.get_meta(sid)
+
+    def _stop_old_job_quiet(self, jobid: str) -> None:
+        try:
+            self._maybe_stop_keeper(jobid)
+        except Exception:  # noqa: BLE001
+            log.exception("清理旧作业 %s 失败（忽略）", jobid)
 
     def remove(self, sid, force: bool = False) -> dict:
         s = self._get(sid)
@@ -2642,6 +2923,7 @@ class SessionManager:
     def _record(self, s: _Session) -> dict:
         with s.lock:
             m = s.meta()
+            m.pop("op", None)
             return {"meta": m, "attached": bool(s.attached and not s.exited), "exited": bool(s.exited),
                     "seen_base": dict(s.seen_base), "done_pending": bool(s.done_pending)}
 

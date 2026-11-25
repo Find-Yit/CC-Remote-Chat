@@ -22,11 +22,19 @@ import { sessionStatus, rowClass, isUnread, docTitle, unreadCount } from './sess
 import { PromptMinimap } from './minimap.js';   // 时间线左侧 prompt 小格子（只读覆盖层）
 import { ChangesButton } from './changes.js';   // 右侧「代码改动」栏的会话头开关（数据只来自前端已有的 transcript）
 import { UpdateStore, UpdateBanner, updateAction } from './update.js';   // dmg 版自动更新（只有后端开启时才显示）
+import { OpBanner, OpGuard, busyLabel, jobPromptModel, opRunning } from './opprogress.js';   // 重启 / 续接进度横幅 + 防连点
 
 const $ = (id) => document.getElementById(id);
 const api = new Api({ onAuthLost: (msg) => showAuthLost(msg) });
 
 let config = {};
+// 重启 / 续接进度：防连点（同一会话进行中时不再发请求）+ 输入框上方的进度横幅（数据 = 后端 meta.op）
+const opGuard = new OpGuard(() => { headerKey = ''; scheduleUI(); });
+const opBanner = new OpBanner({ onAction: (id) => onOpAction(id) });
+setInterval(() => {   // 计时 / "比平时慢"：每秒原地更新（只在横幅显示时）
+  const s = activeSession();
+  if (s && active.type === 'session' && !opBanner.el.hidden && opBanner.sid === s.sid) opBanner.update(opGuard.view(s.sid, s.meta));
+}, 1000);
 // 本机 tmux 的 -L 名：平时 ccr；内置模式（dmg 版，后端 --bundled）由后端在配置里给出 tmux_label（ccr-app）
 const tmuxLabel = () => (config && config.tmux_label) || 'ccr';
 let stream = null;
@@ -745,7 +753,7 @@ function renderHeader() {
   const s = activeSession();
   const key = !s ? 'none' : active.type === 'preview' ? 'p:' + active.uuid + ':' + (active.item.cwd || '')
     : JSON.stringify([s.sid, sessionTitle(s), statusOf(s), s.meta.jobid, s.meta.cwd, s.meta.error, s.meta.link,
-      isBusy(s), isDead(s.meta), termOpen, restarting.has(s.sid), apiLabel(s.meta), (screenHints(s) || {}).shells || 0]);
+      isBusy(s), isDead(s.meta), termOpen, opGuard.busyKind(s.sid, s.meta), apiLabel(s.meta), (screenHints(s) || {}).shells || 0]);
   if (key === headerKey) return;
   headerKey = key;
   const menuBtn = h('button', { class: 'icon-btn menu-btn', type: 'button', title: '会话列表' }, icon('menu'));
@@ -777,12 +785,14 @@ function renderHeader() {
   const title = h('button', { class: 'hd-title editable', type: 'button', title: '点击改名' }, sessionTitle(s));
   title.addEventListener('click', () => editTitle(s, title));
   const local = isLocalMeta(m);
+  // 重启 / 续接 / 启动进行中（本地请求未返回或后端 meta.op 在进行）：同类按钮全部禁用，重启按钮转圈并写明在做什么
+  const opKind = opGuard.busyKind(s.sid, m);
   // 运行位置：本机（不可改）/ 作业 N（点击 = 换作业 --resume 续接）
   let jobBadge;
   if (local) {
     jobBadge = h('span', { class: 'chip job-badge local', title: `在本机运行：这台 Mac 的私有 tmux（-L ${tmuxLabel()}）里的交互式 claude` }, icon('laptop'), '本机');
   } else {
-    jobBadge = h('button', { class: 'chip job-badge mono', type: 'button', title: '点击修改 jobid（在新作业上 --resume 续接本会话）' }, icon('terminal'), 'job ' + (m.jobid || '—'));
+    jobBadge = h('button', { class: 'chip job-badge mono', type: 'button', disabled: !!opKind, title: '点击修改 jobid（在新作业上 --resume 续接本会话）' }, icon('terminal'), 'job ' + (m.jobid || '—'));
     jobBadge.addEventListener('click', () => changeSessionJob(s));
   }
 
@@ -794,7 +804,7 @@ function renderHeader() {
   // 当前使用的 API（--settings 的 key 名称；默认 = 服务器 settings.json）：点击 = 换 API 重启续接
   const apiTitle = () => apiUsageTitle(m) + '\n' + (m.api_key_missing ? '该 API key 已被删除，重启/续接前需要改选。\n' : '')
     + '点击可换 API：以 --resume 重启 claude 续接本会话';
-  const apiChip = h('button', { class: 'chip chip-btn api-chip' + (m.api_key_missing ? ' missing' : ''), type: 'button', disabled: restarting.has(s.sid), title: apiTitle() },
+  const apiChip = h('button', { class: 'chip chip-btn api-chip' + (m.api_key_missing ? ' missing' : ''), type: 'button', disabled: !!opKind, title: apiTitle() },
     icon('key'), apiLabel(m), h('span', { class: 'chip-act' }, '换 API'));
   apiChip.addEventListener('click', () => switchApi(s));
   apiChip.addEventListener('mouseenter', () => {   // tooltip 显示该 key 的近 7 天用量（后端缓存 5 分钟）
@@ -813,13 +823,13 @@ function renderHeader() {
   termBtn.addEventListener('click', () => setTerm(!termOpen));
   actionsEl.push(termBtn);
   const ended = jobEnded(m);
-  const re = h('button', { class: 'btn ghost small', type: 'button', disabled: restarting.has(s.sid),
-    title: ended ? '作业 ' + (m.jobid || '') + ' 已结束：选择新的作业，以 --resume 续接本会话' : dead ? (local ? '在本机 --resume 重新连接' : '在当前作业上 --resume 重新连接') : '关闭并以 --resume 重启 claude' },
-  icon('refresh'), h('span', null, ended ? '换作业续接' : dead ? '重连' : '重启'));
+  const re = h('button', { class: 'btn ghost small restart-btn' + (opKind ? ' is-busy' : ''), type: 'button', disabled: !!opKind, 'aria-busy': opKind ? 'true' : 'false',
+    title: opKind ? busyLabel(opKind) + '进度见输入框上方' : ended ? '作业 ' + (m.jobid || '') + ' 已结束：选择新的作业，以 --resume 续接本会话' : dead ? (local ? '在本机 --resume 重新连接' : '在当前作业上 --resume 重新连接') : '关闭并以 --resume 重启 claude' },
+  opKind ? spinner() : icon('refresh'), h('span', null, opKind ? busyLabel(opKind) : ended ? '换作业续接' : dead ? '重连' : '重启'));
   re.addEventListener('click', () => doRestart(s));
   actionsEl.push(re);
   if (!dead) {
-    const close = h('button', { class: 'btn ghost small', type: 'button', title: '在终端里输入 /exit 结束 claude（保留在列表中）' }, icon('power'), h('span', null, '关闭'));
+    const close = h('button', { class: 'btn ghost small', type: 'button', disabled: !!opKind, title: '在终端里输入 /exit 结束 claude（保留在列表中）' }, icon('power'), h('span', null, '关闭'));
     close.addEventListener('click', () => doClose(s));
     actionsEl.push(close);
   }
@@ -877,7 +887,14 @@ function renderComposerState() {
   const d = currentDialog(s);
   const busy = isBusy(s);
   const banner = $('composer-banner');
-  if (dead && jobEnded(m)) {
+  // 重启 / 续接 / 启动进度：显示时替换下面这些提示条（"在新作业上续接""正在启动 claude…""会话出错"…）
+  if (!opBanner.el.isConnected) banner.parentNode.insertBefore(opBanner.el, banner);
+  const om = opGuard.view(s.sid, m);
+  opBanner.sid = s.sid;
+  opBanner.update(om);
+  if (om) {
+    setBanner(banner, '', null);
+  } else if (dead && jobEnded(m)) {
     // 作业已结束：不再"自动重连"，只能在新作业上 --resume 续接
     const btn = h('button', { class: 'btn primary small', type: 'button' }, icon('refresh'), '在新作业上续接');
     btn.addEventListener('click', () => changeSessionJob(s));
@@ -980,11 +997,11 @@ async function editTitle(s, btn) {
 /** apiKeyId：undefined = 沿用当前 API；null = 服务器默认；字符串 = 改用该 key */
 async function changeSessionJob(s, apiKeyId) {
   if (isLocalMeta(s.meta)) { toast('本机会话没有作业，只能在本机重启 / 重连', 'warn'); return; }
-  const j = await promptDialog('修改此会话的 jobid', {
-    label: '新的作业 jobid（将在该作业上 --resume 续接本会话）',
-    value: s.meta.jobid || config.jobid || '',
-    validate: (v) => (JOBID_RE.test(v) ? '' : 'jobid 格式不正确'),
-    okText: '下一步',
+  if (opGuard.busy(s.sid, s.meta)) { toastBusy(s); return; }
+  // 作业已结束：预填设置里的当前作业（与"从历史续接"一致）；以前预填已结束的旧作业，直接点下一步会被静默忽略
+  const pm = jobPromptModel(s.meta, config.jobid, { ended: jobEnded(s.meta), dead: isDead(s.meta) });
+  const j = await promptDialog(pm.title, {
+    label: pm.label, value: pm.value, placeholder: pm.placeholder, validate: pm.validate, okText: pm.okText,
     extra: (input) => {
       const b = h('button', { class: 'btn ghost', type: 'button' }, '我的作业');
       b.addEventListener('click', () => jobsPopover(api, b, (id) => { input.value = id; }));
@@ -992,51 +1009,72 @@ async function changeSessionJob(s, apiKeyId) {
     },
   });
   if (!j || j === s.meta.jobid) return;
-  const ok = await confirmDialog('确认切换作业', isDead(s.meta)
-    ? `将在作业 ${j} 上以 --resume 续接此会话（对话历史不丢）。`
-    : `将在当前终端里退出 claude${isBusy(s) ? '（正在运行的回复会被中断）' : ''}，并在作业 ${j} 上以 --resume 续接此会话。`, { okText: '切换并续接' });
-  if (!ok) return;
+  if (pm.confirm) {
+    const ok = await confirmDialog('确认切换作业',
+      `将在当前终端里退出 claude${isBusy(s) ? '（正在运行的回复会被中断）' : ''}，并在作业 ${j} 上以 --resume 续接此会话。`, { okText: '切换并续接' });
+    if (!ok) return;
+  }
   await restartOn(s, j, apiKeyId);
 }
 
-const restarting = new Set();
+
+function toastBusy(s) {
+  toast(busyLabel(opGuard.busyKind(s.sid, s.meta) || 'restart') + '进度见输入框上方，请稍候');
+}
+
+function onOpAction(id) {
+  const s = activeSession();
+  if (!s || active.type !== 'session') return;
+  if (id === 'dismiss') { opGuard.dismiss(s.sid, s.meta); return; }
+  if (id === 'term') { setTerm(true); return; }
+  if (id === 'newjob') { opGuard.dismiss(s.sid, s.meta); changeSessionJob(s); return; }
+  if (id === 'retry') {
+    const q = opGuard.last.get(s.sid) || {};
+    opGuard.dismiss(s.sid, s.meta);
+    restartOn(s, q.jobid || null, q.apiKeyId, q.mode);
+  }
+}
 
 /** apiKeyId：undefined = 沿用当前 API；null = 服务器默认；字符串 = 改用该 key（claude 只在启动时读 key） */
 /** mode：覆盖权限启动参数（模式选择栏里"需重启"的模式）：bypassPermissions = 跳过权限，其它 = --permission-mode */
 async function restartOn(s, jobid, apiKeyId, mode) {
-  if (restarting.has(s.sid)) { toast('正在重启…请稍候'); return; }
+  if (opGuard.busy(s.sid, s.meta)) { toastBusy(s); return; }
   const body = {};
   if (jobid) body.jobid = jobid;
   if (apiKeyId !== undefined) body.api_key_id = apiKeyId;
   if (mode) body.mode = mode;
   const switching = apiKeyId !== undefined && (apiKeyId || '') !== ((s.meta.launch && s.meta.launch.api_key_id) || '');
-  restarting.add(s.sid);
-  scheduleUI();
-  toast(jobid ? `正在作业 ${jobid} 上续接…` : mode ? `正在以「${modeName(mode)}」重启并续接…` : switching ? '正在换 API 并续接…' : '正在重新连接…');
+  const kind = jobid && jobid !== s.meta.jobid ? 'resume_new_job' : mode ? 'mode' : switching ? 'switch_api' : isDead(s.meta) ? 'reconnect' : 'restart';
   try {
-    const r = await withForceRetry((force) => api.post(sp(s, '/restart'), force ? { ...body, force: true } : body),
-      '无法关闭旧会话', jobid ? '在新作业上续接' : '重启', isLocalMeta(s.meta));
-    if (r && r.sid) { s.meta = { ...s.meta, ...r }; }
+    // 点下去立刻进入"进行中"（本地 pending），后端的阶段进度经 SSE 到达后接着显示；HTTP 在停止旧 claude 之后才返回
+    const out = await opGuard.run(s.sid, kind, s.meta, () => withForceRetry((force) => api.post(sp(s, '/restart'), force ? { ...body, force: true } : body),
+      '无法关闭旧会话', jobid ? '在新作业上续接' : '重启', isLocalMeta(s.meta)), { jobid, apiKeyId, mode });
+    if (out.skipped) { toastBusy(s); return; }
+    const r = out.result;
+    if (r && r.sid) {
+      const { op_reused: reused, ...meta } = r;
+      s.meta = { ...s.meta, ...meta };
+      if (reused) toast('已经在进行中，进度见输入框上方');   // 另一个窗口 / 连点：后端没有再执行一次
+    }
   } catch (e) {
     if (e && e.status === 409 && e.code === 'job_ended') {
       toast(e.message, 'warn');
-      restarting.delete(s.sid);
       changeSessionJob(s, apiKeyId);   // 旧作业已结束：直接让用户选新作业
       return;
     }
     if (e && e.status === 409 && e.code === 'api_key_missing') {
       toast(e.message, 'warn');
-      restarting.delete(s.sid);
       switchApi(s, jobid, true);       // 该会话用的 key 已被删除：让用户改选
       return;
     }
     if (e && e.status === 409 && e.code === 'target_mismatch') { toast(e.message, 'warn'); return; }
-    if (e && e.message !== '已取消') toast('重启失败：' + e.message, 'error');
+    if (e && e.message !== '已取消') opGuard.fail(s.sid, kind, e.message, e.code);   // 横幅里显示原因 + 重试（不再弹错误）
   } finally {
-    restarting.delete(s.sid);
+    headerKey = '';
     scheduleUI();
   }
 }
+
 
 /** 模式选择栏：循环里的模式 → POST /mode（后端逐个 Shift+Tab 并确认）；不在循环里的 → 确认后以 --resume 重启并改启动参数 */
 async function pickMode(s, mode, needsRestart) {
@@ -1051,6 +1089,7 @@ async function pickMode(s, mode, needsRestart) {
     }
     return;
   }
+  if (opGuard.busy(s.sid, s.meta)) { toastBusy(s); return; }
   const arg = mode === 'bypassPermissions' ? '--dangerously-skip-permissions' : '--permission-mode ' + mode;
   const ok = await confirmDialog('切换到「' + modeName(mode) + '」需要重启',
     '「' + modeName(mode) + '」（' + mode + '）不在本次启动的 Shift+Tab 循环里。\n\n'
@@ -1062,6 +1101,7 @@ async function pickMode(s, mode, needsRestart) {
 }
 
 async function doRestart(s) {
+  if (opGuard.busy(s.sid, s.meta)) { toastBusy(s); return; }    // 防连点：进行中不再弹对话框、不再发请求
   if (jobEnded(s.meta)) { await changeSessionJob(s); return; }   // 作业已结束：只能换作业续接
   if (isDead(s.meta)) { await restartOn(s, null); return; }       // 已退出："重连" = 直接续接（沿用 API）
   const m = s.meta;
@@ -1082,7 +1122,7 @@ async function doRestart(s) {
  * afterMissing：重启时发现原 key 已被删除，要求改选。
  */
 async function switchApi(s, jobid = null, afterMissing = false) {
-  if (restarting.has(s.sid)) { toast('正在重启…请稍候'); return; }
+  if (opGuard.busy(s.sid, s.meta)) { toastBusy(s); return; }
   const m = s.meta;
   const dead = isDead(m);
   const ended = jobEnded(m) && !jobid;

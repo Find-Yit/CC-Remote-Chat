@@ -162,16 +162,27 @@ class RecNotifier:
         return lambda *a, **k: None
 
 
+def link_settled(tc, m, jobid="12345"):
+    """先把作业的 link 连好、等"连接就绪后的重新附着"（_reattach）跑完，再启动会话（条件等待，不靠固定 sleep）。
+    否则高负载下 _reattach 线程可能在会话启动完成之后才轮到：它会对刚启动的会话再 watch 一次，桩 agent 随之推送
+    transcript reset（清掉测试直接注入的子代理）并重置提示音基线——测试就在 working / unread 上偶发失败。"""
+    m._ensure_link(jobid)
+    lk = m._reattach_locks
+    tc.assertTrue(wait_until(lambda: tc.rem.ops("list") and jobid in lk and not lk[jobid].locked(), 5))
+    tc.assertTrue(m._links[jobid].sync())
+
+
 class TestWorkingWithSubagents(Base):
     def test_running_subagent_counts_as_working(self):
         m = self.mgr()
         rec = RecNotifier()
         m.notifier = rec
+        link_settled(self, m)
         sid = self.start(m)
+        jobid = m.get_meta(sid)["jobid"]
         self.assertTrue(wait_until(lambda: m.get_meta(sid)["state"] == "idle", 5))
         self.assertFalse(m.get_meta(sid)["working"])
         aid = "a0123456789abcdef"
-        jobid = m.get_meta(sid)["jobid"]
         base_meta = {"agentType": "general-purpose", "description": "后台任务", "requestShape": "background"}
         m._on_link_event(jobid, {"ev": "subagent", "sid": sid, "session_id": UUID1, "agent_id": aid,
                                  "meta": dict(base_meta), "entries": [], "reset": True})
@@ -192,6 +203,7 @@ class TestUnreadWithSubagents(Base):
         m = self.mgr()
         m.notifier.QUIET_AFTER_RESET = 0.0
         m.notifier.CONFIRM_DELAY = 0.05
+        link_settled(self, m)
         sid = self.start(m)
         jobid = m.get_meta(sid)["jobid"]
         t = self.rem.tuis[sid]

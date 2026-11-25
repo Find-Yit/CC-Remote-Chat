@@ -635,6 +635,39 @@ button.chip:hover { border-color: var(--border-strong); color: var(--text); }
 .send-btn .ic { stroke-width: 2; }
 .composer-banner { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; padding: 7px 12px; border-radius: var(--radius-sm); background: var(--bg-subtle); color: var(--text-2); font-size: 12.5px; }
 .composer-banner .btn { margin-left: auto; }
+/* 重启 / 续接进度（static/opprogress.js）：输入框上方，替换"在新作业上续接"等提示条；文字一律 --text（对比度），状态色只用在图标/左边框 */
+.op-banner { margin-bottom: 8px; padding: 8px 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  background: var(--accent-soft); color: var(--text); font-size: 12.5px; }
+.op-banner.is-done { border-left-color: var(--ok); background: var(--ok-soft); }
+.op-banner.is-failed { border-left-color: var(--err); background: var(--err-soft); }
+.op-banner.is-trust, .op-banner.is-stalled { border-left-color: var(--warn); background: var(--warn-soft); }
+.op-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 24px; }
+.op-head > .ic { width: 14px; height: 14px; flex: none; stroke-width: 2; }
+.op-banner.is-done .op-head > .ic, .op-banner.is-trust .op-head > .ic { color: var(--ok); }
+.op-banner.is-failed .op-head > .ic { color: var(--err); }
+.op-banner.is-stalled .op-head > .ic { color: var(--warn); }
+.op-title { font-weight: 600; }
+.op-text { min-width: 0; overflow-wrap: anywhere; }
+.op-step, .op-time { color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.op-acts { display: inline-flex; gap: 6px; margin-left: auto; }
+.op-error { margin: 6px 0 0 22px; font-weight: 600; overflow-wrap: anywhere; }
+.op-detail { margin: 4px 0 0 22px; color: var(--text); overflow-wrap: anywhere; }
+.op-slow { display: flex; align-items: center; gap: 6px; margin: 4px 0 0 22px; color: var(--text); }
+.op-slow .ic { width: 13px; height: 13px; color: var(--warn); flex: none; }
+.op-steps { list-style: none; margin: 6px 0 0 22px; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.op-steps li { display: flex; align-items: center; gap: 7px; color: var(--text-2); }
+.op-steps li.op-s-cur, .op-steps li.op-s-fail { color: var(--text); font-weight: 600; }
+.op-steps li.op-s-done { color: var(--text-2); }
+.op-s-ic { width: 12px; height: 12px; flex: none; stroke-width: 2.2; }
+.op-s-done .op-s-ic { color: var(--ok); }
+.op-s-fail .op-s-ic { color: var(--err); }
+.op-s-cur .op-s-ic { color: var(--warn); }
+.op-s-dot { width: 12px; height: 12px; flex: none; display: inline-flex; align-items: center; justify-content: center; }
+.op-s-dot::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); }
+.op-s-label { min-width: 0; overflow-wrap: anywhere; }
+.op-s-took { color: var(--text-2); font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.op-steps .spin { width: 12px; height: 12px; }
+.btn .spin { width: 11px; height: 11px; margin-right: 2px; }
 /* CLI 快捷键提示条（输入框上方）：排队中的消息 + 「转到后台运行」「立即发送排队消息」 */
 .hint-bar { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; padding: 8px 10px; border-radius: var(--radius-sm);
   background: var(--bg-subtle); border: 1px solid var(--border); font-size: 12.5px; color: var(--text-2); }

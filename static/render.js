@@ -847,8 +847,8 @@ export function refreshTail(s) { if (s.view) { renderTail(s); if (s.view.stick) 
 function renderTail(s) {
   const v = s.view;
   const m = s.meta;
-  // 启动中
-  const starting = !s.readOnly && m.state === 'starting';
+  // 启动中（有阶段进度 meta.op 时由输入框上方的进度横幅显示，这里不再重复）
+  const starting = !s.readOnly && m.state === 'starting' && !(m.op && m.op.state === 'running');
   v.starting.hidden = !starting;
   if (starting && !v.starting.firstChild) v.starting.replaceChildren(spinner(), m.jobid === 'local' ? '正在启动 claude…（本机 tmux，通常几秒）' : '正在启动 claude…（ssh → srun → tmux，通常需要 10–30 秒）');
   // 草稿：只改文字，不重建节点（平滑不闪）

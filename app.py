@@ -274,6 +274,23 @@ def default_data_dir(bundled: bool) -> str:
     return BUNDLED_DATA_DIR if bundled else str(ccr_config.DEFAULT_DATA_DIR)
 
 
+def parse_fake_delays(text: str) -> dict:
+    """--fake-delays "probe=2,connect=6,keeper=3,boot=4,unreachable=777777+888888" → dict（非法项忽略）。"""
+    out: dict = {}
+    for part in str(text or "").split(","):
+        k, _, v = part.strip().partition("=")
+        if k == "unreachable":
+            out[k] = [j for j in v.split("+") if j.isdigit()]
+        elif k in ("probe", "connect", "keeper", "boot"):
+            try:
+                f = float(v)
+            except ValueError:
+                continue
+            if 0 < f <= 600:
+                out[k] = f
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="cc-remote-chat：本地聊天界面驱动远端 Claude Code")
     ap.add_argument("--port", type=int, default=8765, help="监听端口（被占用则递增），默认 8765")
@@ -290,6 +307,10 @@ def main(argv=None) -> int:
     ap.add_argument("--no-sound", action="store_true", help="提示音只记日志、不真正播放（开发/测试用）")
     # 测试钩子（不出现在 --help）：dmg 版自动更新的本机测试源，只在 --bundled --fake 下生效（ccr/updater.py create）
     ap.add_argument("--update-test", default=None, help=argparse.SUPPRESS)
+    # 测试钩子（不出现在 --help，只在 --fake 下生效）：各启动阶段的人为延迟，用来观察重启/续接进度界面，
+    # 例如 probe=2,connect=6,keeper=3,boot=4,unreachable=777777（boot = 假 claude 出第一帧前的等待；
+    # unreachable = 这些 fake 作业"连不上"，多个用 + 分隔）
+    ap.add_argument("--fake-delays", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
     if args.data_dir is None:
@@ -387,6 +408,11 @@ def main(argv=None) -> int:
     overrides = {"control_dir": str(data_dir / "ssh")}
     if args.fake:
         overrides["fake"] = True
+        if args.fake_delays:
+            fd = parse_fake_delays(args.fake_delays)
+            overrides["fake_delays"] = fd
+            if fd.get("boot"):
+                overrides["fake_env"] = {"CCR_FAKE_BOOT": str(fd["boot"])}
     if args.no_sound:
         overrides["notify_dry_run"] = True   # 运行时覆盖（不写盘、不给前端）
     if args.bundled:

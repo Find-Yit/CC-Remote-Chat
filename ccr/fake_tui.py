@@ -31,7 +31,8 @@ Shift+Tab 循环权限模式；忙时 Esc / Ctrl-C 中断。
 环境变量（均可选）：CCR_FAKE_TRUST=1 强制显示信任框；CCR_FAKE_DELAY 每行流式输出间隔（秒，默认 0.3）；
 CCR_FAKE_THINK 回复前"思考"时长（默认 1.0）；CCR_FAKE_MODEL 默认模型（haiku）；
 CCR_FAKE_EFFORT 默认 effort（low）；CCR_FAKE_MODE 默认权限模式（manual）；
-CCR_FAKE_STATUSLINE=0 不画状态栏（模拟用户没配 statusline，测试统计条的 transcript 后备）。
+CCR_FAKE_STATUSLINE=0 不画状态栏（模拟用户没配 statusline，测试统计条的 transcript 后备）；
+CCR_FAKE_BOOT 出第一帧前的等待秒数（模拟启动慢，观察重启/续接进度）。
 """
 import base64
 import datetime
@@ -1813,6 +1814,13 @@ class FakeClaude(object):
 
 
 def main(argv=None):
+    # CCR_FAKE_BOOT：出第一帧（以及写 sessions/<pid>.json）之前等这么多秒，模拟 claude 启动慢（只用于 fake 演示/测试）
+    try:
+        boot = float(os.environ.get("CCR_FAKE_BOOT") or 0)
+    except ValueError:
+        boot = 0.0
+    if 0 < boot <= 600:
+        time.sleep(boot)
     app = FakeClaude(sys.argv[1:] if argv is None else argv)
     return app.run()
 

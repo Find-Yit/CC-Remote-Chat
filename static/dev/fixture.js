@@ -3,7 +3,7 @@
 // 所有“请求”都由模拟 actions 记录到日志，并按 fixtures 切换到对应的后续画面；任何未经点击触发的请求都会被判为失败。
 import { h, icon } from '/static/dom.js';
 import {
-  createState, ensureSession, applyEnvelope, mountSession, flushNow, currentDialog, draftVisible, setModelList, revealItem,
+  createState, ensureSession, applyEnvelope, mountSession, flushNow, currentDialog, draftVisible, setModelList, revealItem, refreshTail,
 } from '/static/render.js';
 import { openModelModal, openEffortModal, TermPanel, modeText } from '/static/tui.js';
 import { loadToken, TOKEN_HEADER } from '/static/api.js';
@@ -18,6 +18,7 @@ import { PromptNav, promptsFromItems, mergePending, historyDir, recallInto } fro
 import { sessionStatus, rowClass, isUnread, docTitle, titleCount, unreadCount, APP_TITLE } from '/static/sessrow.js';
 import { PromptMinimap, topPercent, MM_TARGET_OFFSET } from '/static/minimap.js';
 import { ChangesButton, trackerOf, NOTE_TEXT, EAGER_LINES } from '/static/changes.js';
+import { OpBanner, OpGuard, opModel, jobPromptModel, fmtSecs, busyLabel } from '/static/opprogress.js';
 import { bannerModel, settingsModel, snoozeText, netText, hostsText, checkText, pctOf, UpdateStore, UpdateBanner, updateAction, updateSettingsField } from '/static/update.js';
 
 const $ = (id) => document.getElementById(id);
@@ -535,6 +536,9 @@ async function autoTest() {
 
   log('== 14c. dmg 版自动更新提示条与设置项（update.js：各状态、只在点击时请求、更新说明、下载页链接、浅色 / 深色对比度）');
   await updateChecks();
+
+  log('== 14c2. 重启 / 续接进度（opprogress.js：阶段、计时、比平时慢、失败与重试、防连点、作业已结束时预填当前作业、浅色 / 深色对比度）');
+  await opChecks();
 
   log('== 14d. /context 卡片与命令输出的 ANSI 颜色（ctxcard.js：真机 transcript、用量条、分类、小节、原文上色与网格对齐、浅色 / 深色）');
   await contextChecks();
@@ -2013,6 +2017,168 @@ async function updateChecks() {
   el.remove();
   check(acts.length === calls.length - nCalls, '更新相关请求都来自点击（共 ' + acts.length + ' 个）');
 }
+
+// ---------- 重启 / 续接进度（opprogress.js） ----------
+// 后端 meta.op 的样例（与 ccr/opprogress.py 的结构一致）；横幅挂在输入框上方（与 app.js 相同位置）。
+let fxOpNow = 0, fxOpId = 0;
+function sampleOp(over = {}) {
+  const now = fxOpNow;
+  const mk = (id, label, state, t0, t1, slow = 30, hint = '比平时慢，仍在进行') => ({ id, label, slow_after: slow, slow_hint: hint, state, t0, t1 });
+  return {
+    id: ++fxOpId, kind: 'resume_new_job', state: 'running', phase: 'connect', jobid: '421865', local: false, retries: 0,
+    started_at: now - 12, phase_started_at: now - 4, finished_at: null, detail: null, error: null, error_code: null,
+    phases: [mk('stop', '退出旧的 claude（/exit）', 'done', now - 12, now - 10), mk('probe', 'ssh gpu-cluster：查询作业 421865（squeue）', 'done', now - 10, now - 4, 15),
+      mk('connect', 'srun --jobid=421865 --overlap：在作业上启动 agent', 'cur', now - 4, null, 30, '比平时慢，仍在进行（gpu-cluster 的 Slurm 偶尔不稳）'),
+      mk('keeper', '确认 tmux 常驻进程（keeper）', 'todo', null, null), mk('start', '在 tmux 里启动 claude --resume 59dd443a', 'todo', null, null),
+      mk('ready', '等待 claude 就绪（出现输入框）', 'todo', null, null)],
+    ...over,
+  };
+}
+
+async function opChecks() {
+  const now = Date.now() / 1000;
+  fxOpNow = now;
+  // 纯函数
+  check(opModel(null) === null && fmtSecs(5) === '5 秒' && fmtSecs(65) === '1 分 05 秒' && busyLabel('resume_new_job') === '正在续接…' && busyLabel('restart') === '正在重启…', '没有进度不显示；秒数格式；按钮文字');
+  const pm = opModel(null, { now, pending: { kind: 'restart', started_at: now - 1 } });
+  check(pm && pm.state === 'pending' && pm.title === '正在重启…' && pm.text === '正在提交请求…', '点下去、请求还没回来：本地"正在重启… 正在提交请求…"');
+  const rm = opModel(sampleOp(), { now });
+  check(rm.state === 'running' && rm.title === '正在续接…' && rm.text.startsWith('srun --jobid=421865') && rm.stepNo === '第 3/6 步' && Math.round(rm.elapsed) === 12 && !rm.slow, '进行中：当前阶段 + 第几步 + 已用秒数');
+  check(rm.steps.filter((x) => x.status === 'done').length === 2 && Math.round(rm.steps[1].took) === 6, '已完成阶段打勾并显示用时');
+  const sm = opModel(sampleOp({ phase_started_at: now - 31 }), { now });
+  check(sm.slow && sm.slowText === '比平时慢，仍在进行（gpu-cluster 的 Slurm 偶尔不稳）', 'srun 超过 30 秒：比平时慢，仍在进行（Slurm 偶尔不稳）');
+  check(opModel(sampleOp({ phase: 'probe', phase_started_at: now - 10 }), { now }).slow === false, 'ssh 查询 10 秒：未超过 15 秒，不提示慢');
+  const fm = opModel(sampleOp({ state: 'failed', error: '连接作业 421865 超时（已等 90 秒）：ssh 连接 gpu-cluster 超时', finished_at: now }), { now });
+  check(fm.state === 'failed' && fm.title === '续接失败' && fm.error.includes('ssh 连接 gpu-cluster 超时') && fm.actions.join() === 'retry,dismiss', '失败：原因 + 重试 / 关闭');
+  const jm = opModel(sampleOp({ state: 'failed', error: 'srun 无法连接作业 421865：作业已结束（请在新作业上续接）', error_code: 'job_ended', finished_at: now }), { now });
+  check(jm.actions.join() === 'newjob,dismiss', '作业已结束：按钮变成「在新作业上续接」（重试同一个作业没有意义）');
+  const dm = opModel(sampleOp({ state: 'done', phase: 'ready', finished_at: now }), { now });
+  check(dm.state === 'done' && dm.title === 'claude 已就绪' && dm.text === '用时 12 秒', '成功：短暂显示「已就绪」');
+  const tm = opModel(sampleOp({ state: 'trust', phase: 'ready', detail: '等待你在上方确认信任目录', finished_at: now }), { now });
+  check(tm.state === 'trust' && tm.text === '等待你在上方确认信任目录', '信任框：提示用户确认（不自动回答）并结束转圈');
+  check(opModel(sampleOp({ state: 'stalled', phase: 'ready', detail: 'claude 已启动，但 90 秒后仍未出现输入框', finished_at: now }), { now }).actions.join() === 'term,dismiss', '长时间未就绪：建议打开终端面板');
+  // 作业已结束时的 jobid 输入框（根因修复：以前预填已结束的旧作业，直接点下一步被静默忽略）
+  const jp = jobPromptModel({ jobid: '123456' }, '421865', { ended: true, dead: true });
+  check(jp.value === '421865' && jp.okText === '续接' && !jp.confirm && jp.title === '在新作业上续接', '作业已结束：预填当前作业 421865（与从历史续接一致），一步续接');
+  check(jp.validate('123456').includes('作业 123456 已结束') && jp.validate('421865') === '' && jp.validate('abc') === 'jobid 格式不正确', '填回已结束的作业：框里说明原因（不再静默无反应）');
+  check(jobPromptModel({ jobid: '123456' }, '123456', { ended: true }).value === '', '设置里的作业也是已结束的那个：不预填，让用户填新作业');
+  const lp = jobPromptModel({ jobid: '421865' }, '421865', { ended: false, dead: false });
+  check(lp.value === '421865' && lp.confirm && lp.validate('421865').includes('已经在作业 421865 上'), '运行中改作业：预填当前作业，填同一个时说明原因，仍需确认');
+
+  // DOM：横幅挂在输入框上方
+  const fxb = $('fx-banner');
+  const banner = new OpBanner({ onAction: (id) => onAct(id) });
+  fxb.parentNode.insertBefore(banner.el, fxb);
+  let meta = { sid: SID, jobid: '123456', state: 'exited', op: null };
+  let pend = null;   // 当前"后端请求"（测试里手动结束）
+  const sent = [];
+  const guard = new OpGuard(() => render());
+  // 与 app.js 相同的规则：进行中时重启按钮禁用、转圈并写明在做什么
+  const btn = h('button', { class: 'btn ghost small restart-btn', type: 'button', id: 'fx-op-restart' });
+  fxb.parentNode.insertBefore(btn, banner.el);   // 回放页的会话头会随屏幕重建，按钮放在横幅旁边
+  function render() {
+    const kind = guard.busyKind(SID, meta);
+    btn.disabled = !!kind;
+    btn.replaceChildren(kind ? h('span', { class: 'spin' }) : icon('refresh'), h('span', null, kind ? busyLabel(kind) : '重连'));
+    banner.update(guard.view(SID, meta));
+  }
+  async function restart(body) {
+    const out = await guard.run(SID, body.jobid ? 'resume_new_job' : 'reconnect', meta, () => {
+      record('restart', body); sent.push(body);
+      return new Promise((res, rej) => { pend = { res, rej }; });
+    }, body);
+    if (out.skipped) log('（toast）正在进行中，进度见输入框上方');
+    return out;
+  }
+  function onAct(id) {
+    if (id === 'dismiss') guard.dismiss(SID, meta);
+    if (id === 'retry') { const q = guard.last.get(SID) || {}; guard.dismiss(SID, meta); restart(q).catch((e) => guard.fail(SID, 'resume_new_job', e.message)); }
+    if (id === 'newjob') record('open_job_prompt');
+  }
+  btn.addEventListener('click', () => { restart({ jobid: '421865' }).catch((e) => guard.fail(SID, 'resume_new_job', e.message, e.code)); });
+  render();
+  check(banner.el.hidden && !btn.disabled, '空闲：横幅隐藏、按钮可用');
+  const n0 = calls.length;
+  // 连点 5 次：只发一次请求，按钮立即进入"进行中"
+  gesture++;
+  for (let i = 0; i < 5; i++) btn.click();
+  gesture--;
+  await raf();
+  check(sent.length === 1 && calls.length === n0 + 1, '连点 5 次只发 1 次请求');
+  check(btn.disabled && btn.textContent === '正在续接…' && !!btn.querySelector('.spin'), '点下去立刻：按钮禁用 + 转圈 +「正在续接…」');
+  check(!banner.el.hidden && banner.el.dataset.state === 'pending' && banner.el.nextElementSibling === fxb && !!banner.el.querySelector('.spin'), '横幅立刻出现（请求还没回来）：转圈 + 正在提交请求…');
+  // 后端进度经 SSE 到达
+  meta = { ...meta, state: 'starting', op: sampleOp() };
+  render();
+  const el = banner.el;
+  check(el.dataset.state === 'running' && el.querySelector('.op-title').textContent === '正在续接…' && el.querySelector('.op-text').textContent.startsWith('srun --jobid=421865'), '后端进度：标题 + 当前阶段');
+  check(el.querySelectorAll('.op-steps li').length === 6 && el.querySelectorAll('.op-steps li.op-s-done .op-s-ic').length === 2 && !!el.querySelector('.op-steps li.op-s-cur .spin'), '阶段列表：2 个打勾、当前阶段转圈、其余待办');
+  check(/已用 12 秒/.test(el.querySelector('.op-time').textContent), '已用秒数');
+  const head0 = el.querySelector('.op-head');
+  meta = { ...meta, op: { ...meta.op, started_at: meta.op.started_at - 1 } };
+  render();
+  check(el.querySelector('.op-head') === head0 && /已用 13 秒/.test(el.querySelector('.op-time').textContent), '每秒计时原地更新（不重建、不闪）');
+  meta = { ...meta, op: { ...meta.op, phase_started_at: now - 40, detail: '第 1 次连接失败（ssh 连接 gpu-cluster 超时），稍后自动重试', retries: 1 } };
+  render();
+  check(el.querySelector('.op-slow')?.textContent.includes('Slurm 偶尔不稳') && el.querySelector('.op-detail')?.textContent.includes('第 1 次连接失败'), '比平时慢 + 第几次失败、原因');
+  // 请求返回（HTTP 在停止旧 claude 之后返回）：仍按后端进度显示，按钮仍禁用
+  pend.res({ sid: SID }); await sleep(20); render();
+  check(btn.disabled && el.dataset.state === 'running', '请求返回后：后端还在进行 → 按钮仍禁用');
+  gesture++; btn.click(); gesture--; await raf();
+  check(sent.length === 1, '后端进行中再点：不发请求');
+  // 失败：按钮恢复，可重试
+  meta = { ...meta, state: 'error', op: { ...meta.op, state: 'failed', error: '连接作业 421865 超时（已等 90 秒）：ssh 连接 gpu-cluster 超时', finished_at: now } };
+  render();
+  check(!btn.disabled && btn.textContent === '重连' && el.dataset.state === 'failed' && el.querySelector('.op-error').textContent.includes('ssh 连接 gpu-cluster 超时')
+    && el.querySelector('.op-steps li.op-s-fail') && !el.querySelector('.spin'), '失败：写清原因、失败阶段打叉、不再转圈、按钮恢复');
+  await click(el.querySelector('[data-act="retry"]'), '重试');
+  check(sent.length === 2 && sent[1].jobid === '421865' && el.dataset.state === 'pending', '重试：同样的参数再发一次，横幅回到进行中');
+  pend.rej(Object.assign(new Error('该会话正在执行其它操作（例如发送消息、切换模型），请稍候再试'), { code: 'op_in_progress' })); await sleep(20);
+  meta = { ...meta, op: null };
+  render();
+  check(el.dataset.state === 'failed' && el.textContent.includes('该会话正在执行其它操作') && !btn.disabled, '请求本身失败：横幅显示原因（不弹错误框），按钮恢复');
+  await click(el.querySelector('[data-act="dismiss"]'), '关闭');
+  check(el.hidden, '关闭失败提示');
+  // 成功
+  meta = { ...meta, state: 'idle', op: sampleOp({ state: 'done', phase: 'ready', finished_at: now }) };
+  render();
+  check(!el.hidden && el.dataset.state === 'done' && el.textContent.includes('claude 已就绪') && !el.querySelector('.op-steps'), '成功：短暂显示「claude 已就绪」');
+  meta = { ...meta, op: null }; render();
+  check(el.hidden && !btn.disabled, '进度收起');
+  // 时间线尾部的「正在启动 claude…」：有阶段进度时不重复显示
+  pushMeta({ ...s.meta, state: 'starting', op: sampleOp() }); await raf(); refreshTailFx();
+  const tailHidden = s.view.starting.hidden;
+  pushMeta({ ...s.meta, state: 'starting', op: null }); await raf(); refreshTailFx();
+  check(tailHidden && !s.view.starting.hidden, '时间线尾部「正在启动 claude…」：有进度横幅时隐藏，没有时照常显示');
+  pushMeta({ ...s.meta, state: 'idle', op: null }); await raf();
+
+  // 对比度（浅色 / 深色）：各状态的文字对横幅底色
+  const th = window.ccrTheme, prev = th.pref(), res = [];
+  const bodyBg = () => rgbaOf(getComputedStyle(document.querySelector('.fx-main .main')).backgroundColor);
+  const states = [['running', sampleOp({ phase_started_at: now - 40, detail: '第 1 次连接失败（ssh 连接 gpu-cluster 超时），稍后自动重试' })],
+    ['failed', sampleOp({ state: 'failed', error: 'srun 无法连接作业 421865：作业已结束', finished_at: now })],
+    ['done', sampleOp({ state: 'done', phase: 'ready', finished_at: now })],
+    ['trust', sampleOp({ state: 'trust', phase: 'ready', detail: '等待你在上方确认信任目录', finished_at: now })],
+    ['stalled', sampleOp({ state: 'stalled', phase: 'ready', detail: 'claude 已启动，但 90 秒后仍未出现输入框', finished_at: now })]];
+  for (const t of ['light', 'dark']) {
+    th.set(t, { persist: false });
+    for (const [k, op] of states) {
+      meta = { ...meta, op }; render(); await raf();
+      const bg = over(rgbaOf(getComputedStyle(el).backgroundColor), bodyBg());
+      for (const sel of ['.op-title', '.op-text', '.op-error', '.op-detail', '.op-slow', '.op-time', '.op-step', '.op-steps li.op-s-todo', '.op-steps li.op-s-done', '.op-s-took']) {
+        const n = el.querySelector(sel);
+        if (n) res.push([t, k, sel, contrast(rgbaOf(getComputedStyle(n).color), bg)]);
+      }
+    }
+  }
+  th.set(prev, { persist: false }); await raf();
+  const worst = res.reduce((a, b) => (b[3] < a[3] ? b : a), res[0]);
+  check(res.length > 40 && res.every((r) => r[3] >= 4.5), '浅色 / 深色：各状态横幅文字对比度 ≥ 4.5（' + res.length + ' 项，最低 ' + worst[3].toFixed(1) + ' ' + worst.slice(0, 3).join(' ') + '）');
+  meta = { ...meta, op: null }; render();
+  el.remove(); btn.remove();
+  check(calls.slice(n0).every((c) => c.gesture) && calls.length - n0 === 2, '进度相关请求都来自点击（共 ' + (calls.length - n0) + ' 个：续接 + 重试，没有其它）');
+}
+function refreshTailFx() { refreshTail(s); }
 
 // ---------- 绑定 ----------
 $('fx-show').addEventListener('click', () => show($('fx-scene').value));

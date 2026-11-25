@@ -372,11 +372,19 @@ class StubLink:
             try:
                 if item[0] == "ev":
                     self.on_event(item[1])
+                elif item[0] == "fn":
+                    item[1]()
                 else:
                     self.on_state(item[1], item[2])
             except Exception:  # noqa
                 import traceback
                 traceback.print_exc()
+
+    def sync(self, timeout=5.0):
+        """等到此刻之前排队的事件 / 状态回调都已交给管理器处理完（FIFO 里放一个标记）。"""
+        done = threading.Event()
+        self._q.put(("fn", done.set))
+        return done.wait(timeout)
 
     def set_state(self, st, err=None):
         self.state = st
@@ -650,7 +658,7 @@ class TestCreate(Base):
         sid = m.create(jobid="12345", cwd="~")["sid"]
         self.assertEqual(m.get_meta(sid)["link"], "connecting")
         self.assertTrue(wait_until(lambda: m.get_meta(sid)["state"] == "error"))
-        self.assertIn("连接计算节点超时", m.get_meta(sid)["error"])
+        self.assertIn("连接作业 12345 超时（已等 0.3 秒）", m.get_meta(sid)["error"])   # 一句话的原因，不甩整段异常
         self.assertEqual(self.rem.ops("start"), [])
 
     def test_resume_already_running_rejected(self):

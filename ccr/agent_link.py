@@ -547,28 +547,42 @@ class AgentLink:
             self.hello = res
         return res
 
-    def ensure_keeper(self, timeout: float = 120) -> None:
-        """确保 tmux 常驻进程（keeper）在运行：server_alive 为真直接返回，否则启动并轮询 hello。"""
+    def ensure_keeper(self, timeout: float = 120, progress: Optional[Callable[[str], None]] = None) -> None:
+        """确保 tmux 常驻进程（keeper）在运行：server_alive 为真直接返回，否则启动并轮询 hello。
+        progress(text)：可选，报告子步骤（界面上的进度说明；只是文字，不影响流程）。"""
+        def note(text):
+            if progress is not None:
+                try:
+                    progress(text)
+                except Exception:  # noqa: BLE001
+                    log.exception("progress 回调出错")
         deadline = time.monotonic() + timeout
         with self._keeper_lock:
+            note("检查 tmux 常驻进程是否在运行…")
+            self._fake_delay("keeper")
             h = self.request("hello", timeout=min(30.0, max(5.0, timeout)))
             if h.get("server_alive"):
                 return
             if self.fake:
                 self._start_fake_keeper()
             elif self.local:
+                note("启动本机 tmux 常驻进程…")
                 self._start_local_keeper(h.get("tmux_path"))
             else:
+                note("查询作业 %s 上已有的 keeper step（squeue -s）…" % self.jobid)
                 if self._keeper_steps():
                     # 已有 keeper step（可能正在启动）：先等一会儿，避免重复启动
+                    note("已有 keeper step，等待它就绪…")
                     if self._poll_alive(min(deadline, time.monotonic() + 30.0)):
                         return
                 # 多节点作业：keeper 钉到 agent 所在节点（tmux 套接字在节点本地 /tmp）
+                note("srun --jobid=%s --overlap：启动 keeper…" % self.jobid)
                 cmd = build_keeper_remote_command(self.jobid, h.get("tmux_path"), node=self._keeper_node(h))
                 rc, _out, err = remote._run_with_retry(remote.ssh_base_argv(self.cfg) + [cmd],
                                                       input_text=None, timeout=60)
                 if rc != 0:
                     raise AgentError("启动 tmux 常驻进程失败（rc=%s）：%s" % (rc, (err or "").strip()[-300:]))
+            note("等待 tmux 常驻进程就绪…")
             if self._poll_alive(deadline):
                 return
             if self.local:
@@ -607,9 +621,18 @@ class AgentLink:
 
     # ------------------------------------------------------------ 作业状态 / 节点
     def _squeue_job(self):
-        """(rc, out, err) 或 None（fake 模式 / 本机 / 参数不合法）。"""
-        if self.fake or self.local:
+        """(rc, out, err) 或 None（fake 模式 / 本机 / 参数不合法）。
+        fake 模式（仅 cfg["fake"]）：<数据目录>/fake/ended_jobs 里列出的 jobid 视为已结束（squeue 空输出），
+        供测试 / 演示"作业已结束 → 在新作业上续接"；真实模式不读这个文件。"""
+        if self.local:
             return None
+        if self.fake:
+            self._fake_delay("probe")
+            try:
+                ended = (remote._data_dir(self.cfg) / "fake" / "ended_jobs").read_text(encoding="utf-8").split()
+            except OSError:
+                return None
+            return (0, "", "") if self.jobid in ended else None
         try:
             return remote.run_remote(self.cfg, ["squeue", "-h", "-j", self.jobid, "-o", "%T|%N"], timeout=30,
                                      should_stop=self._stop.is_set)
@@ -724,6 +747,16 @@ class AgentLink:
             raise AgentError("启动本机 tmux 常驻进程失败：%s" % r.stderr.decode("utf-8", "replace").strip()[-300:])
 
     # ------------------------------------------------------------ 内部
+    def _fake_delay(self, phase: str) -> None:
+        """仅 fake 模式：按 cfg["fake_delays"]（app.py --fake-delays）在某阶段前等一会儿，用来观察进度界面。
+        默认（没配）不等待；真实模式永远不等待。"""
+        if not self.fake:
+            return
+        d = self.cfg.get("fake_delays")
+        v = d.get(phase) if isinstance(d, dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= 600:
+            self._stop.wait(float(v))
+
     def _dispatch_event(self, msg: dict) -> None:
         if msg.get("ev") == "exited":
             with self._lock:
@@ -805,6 +838,12 @@ class AgentLink:
             reason = None
             conn = None
             try:
+                self._fake_delay("connect")
+                fd = self.cfg.get("fake_delays") if self.fake else None
+                if isinstance(fd, dict) and self.jobid in (fd.get("unreachable") or ()):
+                    # 仅 fake：模拟登录节点连不上（演示"第 n 次连接失败，稍后自动重试"）
+                    raise AgentError("ssh: connect to host %s port 22: Operation timed out"
+                                     % (self.cfg.get("host") or "server"))
                 conn = self._connect()
             except (AgentError, OSError, ValueError) as e:
                 reason = "连接%s agent 失败：%s" % (self.where, e)

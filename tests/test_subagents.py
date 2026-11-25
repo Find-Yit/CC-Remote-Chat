@@ -768,8 +768,9 @@ class StoppedSubagentTests(unittest.TestCase):
         main = "main_%s.jsonl" % ABS_MAIN
         ents = lines_of(root / main)
         atts = [e for e in ents if e["type"] == "attachment"]
-        # 只转发通知那一条（排队的用户消息 commandMode=prompt 不转发），且只剩精简字段
-        self.assertEqual(len(atts), 1)
+        # 通知那一条 + 同一轮中途吸收的用户消息（commandMode=prompt，见 tests/test_queued_prompt.py），都只剩精简字段
+        self.assertEqual([e["attachment"]["commandMode"] for e in atts], ["task-notification", "prompt"])
+        self.assertEqual(set(atts[1]["attachment"]), {"type", "commandMode", "prompt", "origin", "source_uuid"})
         self.assertEqual(set(atts[0]), {"type", "uuid", "parentUuid", "timestamp", "isSidechain", "attachment"})
         self.assertEqual(set(atts[0]["attachment"]), {"type", "commandMode", "prompt", "origin"})
         self.assertTrue(atts[0]["attachment"]["prompt"].startswith("<task-notification>"))
@@ -858,7 +859,8 @@ class StoppedSubagentTests(unittest.TestCase):
         # 只有 origin.kind 也算；纯文本通知（无 XML）同样转发（前端显示为系统消息）
         self.assertIsNotNone(NA.filter_entry(mk({"type": "queued_command", "prompt": "Background agent \"x\" was stopped",
                                                  "origin": {"kind": "task-notification"}})))
-        for bad in ({"type": "queued_command", "prompt": "排队的用户消息", "commandMode": "prompt", "origin": {"kind": "human"}},
+        # 回复中发送的用户消息（commandMode=prompt）现在也转发（tests/test_queued_prompt.py）
+        for bad in ({"type": "queued_command", "prompt": "插件提示", "commandMode": "prompt", "origin": {"kind": "plugin"}},
                     {"type": "queued_command", "prompt": "", "commandMode": "task-notification"},
                     {"type": "skill_listing", "content": note}, {"type": "environment"}, "x"):
             self.assertIsNone(NA.filter_entry(mk(bad)), bad)
@@ -875,7 +877,8 @@ class StoppedSubagentTests(unittest.TestCase):
         lines = (STOP / "absorbed" / ("main_%s.jsonl" % ABS_MAIN)).read_bytes().split(b"\n")
         r = H.read_lines(lines)
         atts = [e for e in r["entries"] if e["type"] == "attachment"]
-        self.assertEqual(len(atts), 1)
+        # 通知 + 同一轮中途吸收的用户消息（commandMode=prompt，见 tests/test_queued_prompt.py）
+        self.assertEqual([e["attachment"]["commandMode"] for e in atts], ["task-notification", "prompt"])
         self.assertEqual(set(atts[0]["attachment"]), {"type", "commandMode", "prompt", "origin"})
         self.assertIn("<status>killed</status>", atts[0]["attachment"]["prompt"])
         self.assertNotIn("rendered", atts[0])
@@ -908,7 +911,7 @@ class SessionStoppedSubagentTests(SessionBase):
         self.assertEqual((s["status"], s["raw_status"], s["notifications"]), ("killed", "killed", 1))
         tr = [x for e in m.session_events(sid) if e["kind"] == "transcript" and e["gseq"] > n0
               for x in e["data"]["entries"]]
-        self.assertEqual([x["type"] for x in tr if x["type"] == "attachment"], ["attachment"])
+        self.assertEqual([x["attachment"]["commandMode"] for x in tr if x["type"] == "attachment"], ["task-notification", "prompt"])
 
 
 # ============================================================================ history

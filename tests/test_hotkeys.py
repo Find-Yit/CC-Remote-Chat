@@ -153,7 +153,9 @@ class TestWhitelistAndGuard(unittest.TestCase):
         self.assertTrue(new <= set(node_agent.KEYS))
         self.assertTrue(new <= set(S.KEYS_WHITELIST))
         self.assertTrue(new <= set(S_srv.KEYS_WHITELIST))
-        self.assertEqual(set(node_agent.KEYS), set(S.KEYS_WHITELIST))
+        # C-v 只给 session.paste_image 用（本机会话 ⌘V 粘贴图片），终端面板的 /keys 白名单里没有
+        self.assertEqual(set(node_agent.KEYS), set(S.KEYS_WHITELIST) | {"C-v"})
+        self.assertNotIn("C-v", S.KEYS_WHITELIST)
         self.assertEqual(set(S_srv.KEYS_WHITELIST), set(S.KEYS_WHITELIST))
         self.assertNotIn("C-z", node_agent.KEYS)
 
@@ -362,18 +364,21 @@ class TestFakeScenarios(FakeBase):
         fr = "\n".join(a.frame())
         self.assertEqual(fr.count("Queued · ctrl+x ctrl+s to send now"), 1, fr)
         self.assertEqual(tui_parse.parse_screen(fr)["hints"]["queued"], ["只回复：Q3-OK", "第二条排队"])
-        # Ctrl+B → 转入后台
+        # Ctrl+B → 转入后台；工具结果之后，排队的两条被这一轮吸收（CLI 2.1.330–2.1.332 真机：移到正文 "❯ …"，
+        # transcript 只写 attachment / queued_command，见 tests/test_queued_prompt.py）
         a.feed(b"\x02")
         self.step(a, 2)
         st = tui_parse.parse_screen("\n".join(a.frame()))
         self.assertFalse(st["hints"]["background"])
         self.assertEqual(st["hints"]["shells"], 1)
         self.assertIn("Ran 1 shell command", "\n".join(a.frame()))
-        # Ctrl+X Ctrl+S → 中断当前生成，立即发送排队的消息
+        self.assertEqual(st["hints"]["queued"], [])
+        self.assertEqual(st["echo"], "第二条排队")
+        # 已经没有排队消息：Ctrl+X Ctrl+S 什么都不做
         a.feed(b"\x18\x13")
         st = tui_parse.parse_screen("\n".join(a.frame()))
         self.assertEqual(st["hints"]["queued"], [])
-        self.assertEqual(st["echo"], "只回复：Q3-OK\n第二条排队")
+        self.assertTrue(st["busy"])
         self.run_turn(a)
         st = tui_parse.parse_screen("\n".join(a.frame()))
         self.assertFalse(st["busy"])

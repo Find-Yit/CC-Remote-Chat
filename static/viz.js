@@ -5,7 +5,7 @@
 // 本机会话 = jobid === 'local'（本机模式），或 fake 模式（fake claude 本来就在本机跑）；历史预览（hist:…）不是。
 // 本机文件只能经后端 /api/sessions/<sid>/local/*（需 token、仅本机会话）与 /preview/<cap>/…（只读）访问。
 
-import { TOKEN_HEADER } from './api.js';
+import { TOKEN_HEADER, CREDENTIALS } from './api.js';
 
 export const LOCAL_JOBID = 'local';
 
@@ -169,7 +169,7 @@ export function blobUrl(s, ref) {
   p = limitBlob(async () => {
     if (!ctx.api) throw new Error('未连接');
     const res = await fetch(ctx.api.sessionPath(r.sid, '/blob/' + encodeURIComponent(ref)), {
-      headers: ctx.api.token ? { [TOKEN_HEADER]: ctx.api.token } : {}, credentials: 'omit',
+      headers: ctx.api.token ? { [TOKEN_HEADER]: ctx.api.token } : {}, credentials: CREDENTIALS,
     });
     if (!res.ok) {
       let msg = 'HTTP ' + res.status;

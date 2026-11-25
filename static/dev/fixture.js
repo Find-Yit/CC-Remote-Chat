@@ -4,6 +4,7 @@
 import { h, icon } from '/static/dom.js';
 import {
   createState, ensureSession, applyEnvelope, mountSession, flushNow, forgetSession, createsSession, currentDialog, draftVisible, setModelList, revealItem, refreshTail,
+  applyHistory,
 } from '/static/render.js';
 import { openModelModal, openEffortModal, TermPanel, modeText, effortLockText, appliedToast, resultText, effortSaveBlocked } from '/static/tui.js';
 import { loadToken, TOKEN_HEADER } from '/static/api.js';
@@ -14,9 +15,9 @@ import { cycleOf, closeModeMenu } from '/static/modes.js';
 import { initViz, _setBlobLoader, statPath, limitBlob, STAT_BATCH, BLOB_CONCURRENCY } from '/static/viz.js';
 import { PreviewPanel } from '/static/preview.js';
 import { AutoSize } from '/static/autosize.js';
-import { PromptNav, promptsFromItems, mergePending, historyDir, recallInto } from '/static/prompthist.js';
+import { PromptNav, promptsFromItems, mergePending, addPending, historyDir, recallInto } from '/static/prompthist.js';
 import { sessionStatus, rowClass, isUnread, docTitle, titleCount, unreadCount, APP_TITLE } from '/static/sessrow.js';
-import { PromptMinimap, topPercent, MM_TARGET_OFFSET } from '/static/minimap.js';
+import { PromptMinimap, topPercent, MM_TARGET_OFFSET, minimapEntries } from '/static/minimap.js';
 import { ChangesButton, trackerOf, NOTE_TEXT, EAGER_LINES } from '/static/changes.js';
 import { OpBanner, OpGuard, opModel, jobPromptModel, fmtSecs, busyLabel } from '/static/opprogress.js';
 import { SubagentUI } from '/static/subagents.js';
@@ -24,6 +25,8 @@ import { apiKeySelect, baseInfo, baseEmptyHint, setDefaultBaseUrl, loadApiKeys }
 import { modal as fxModal, topDialog } from '/static/dialogs.js';
 import { settingsDialog } from '/static/settings.js';
 import { bannerModel, settingsModel, snoozeText, netText, hostsText, checkText, pctOf, UpdateStore, UpdateBanner, updateAction, updateSettingsField } from '/static/update.js';
+import { ImageTray, DropOverlay, transferInfo, dragHasFiles, trayModel, dropHint, inputImages, inputHasOther, escapeDropPath, insertPaths, lightboxList } from '/static/attach.js';
+import { openLightbox, lightboxOpen, closeLightbox } from '/static/lightbox.js';
 
 const $ = (id) => document.getElementById(id);
 const SID = 'sfixture00001';
@@ -31,6 +34,7 @@ const FILES = {
   stream: '/fixtures/tui_screens_stream.ndjson',
   dialogs: '/fixtures/tui_screens_dialogs.ndjson',
   transcript: '/fixtures/transcript_interactive_59dd443a.jsonl',
+  images: '/fixtures/tui_screens_images.ndjson',   // CLI 2.1.332 输入框里的 [Image #N]（第 1e 节）
 };
 
 let errors = 0;
@@ -88,7 +92,7 @@ function ingest(name, text) {
     log(`载入 ${name}：${transcriptLines.length} 行`);
     return;
   }
-  const prefix = /dialogs/.test(name) ? 'dialogs' : 'stream';
+  const prefix = /dialogs/.test(name) ? 'dialogs' : /images/.test(name) ? 'images' : 'stream';
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let d; try { d = JSON.parse(line); } catch (_) { continue; }
@@ -334,6 +338,9 @@ async function autoTest() {
   log('== 1d. 左侧 prompt 小格子（minimap.js：鱼眼、预览卡、跳转、可见轮次、上一轮/下一轮、键盘、滚轮、常驻/悬停）');
   await minimapChecks();
 
+  log('== 1e. 图片（attach.js：claude 输入框里的 [Image #N] 图片条、拖动覆盖层、DataTransfer、带图片的用户消息）');
+  await imageChecks();
+
   log('== 2. 信任目录卡片');
   show('stream:trust');
   await raf();
@@ -559,6 +566,9 @@ async function autoTest() {
 
   log('== 14g. API key 对话框（叠放的对话框只有一个是模态、每个输入框都能输入、修改地址、设置里的默认 base_url）');
   await apiKeyChecks();
+
+  log('== 14h. 回复进行中发出的消息（queued_command / commandMode=prompt：用户气泡「回复中发送」、位置、只出现一次、不另起一轮、↑/↓ 历史、小格子、待出现对账、图片、peer、历史预览）');
+  await queuedPromptChecks();
 
   log('== 15. 红线 / 控制台');
   check(calls.every((c) => c.gesture), '所有请求都发生在用户点击中（共 ' + calls.length + ' 个）');
@@ -1269,6 +1279,226 @@ async function statsChecks() {
   check(lightVars.every(Boolean) && darkVars.every(Boolean), '浅色/深色都定义了 --stats-* 变量');
   check(lightTrack !== darkTrack, '圆环底槽随主题变化（' + lightTrack + ' / ' + darkTrack + '）');
   check(calls.length === nCalls, '统计条不发任何请求');
+}
+
+// ---------- 1e. 图片（attach.js：claude 输入框里的 [Image #N]、⌘V、拖入、只有图片的消息；SPEC §4.2「图片」） ----------
+// 图片条 / 覆盖层与 app.js 同一个组件；屏幕用 CLI 2.1.332 真机画面（fixtures/tui_screens_images.ndjson）。
+// 只验证组件与浏览器 API 的行为；app.js 里 paste / drop 事件的接线由 headless Chrome 对 fake 后端的端到端验证。
+const fxTray = new ImageTray({ onClear: () => record('image/clear'), onRemove: (n) => record('image/remove', { n }),
+  onOpen: (n) => { const { list, index } = lightboxList(fxTray.model, n); if (list.length) openLightbox(list, index); } });
+const fxDrop = new DropOverlay();
+const PNG1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+function fxPng(w, h, color) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  g.fillStyle = color; g.fillRect(0, 0, w, h);
+  g.fillStyle = '#fff'; g.fillRect(w / 4, h / 4, w / 2, h / 2);
+  return new Promise((r) => c.toBlob(r, 'image/png'));
+}
+
+async function imageChecks() {
+  const nCalls = calls.length;
+  const box = document.querySelector('.fx-main .composer-box');
+  const mainEl = document.querySelector('.fx-main .main');
+  if (!fxTray.el.isConnected) box.prepend(fxTray.el);
+  if (!fxDrop.el.isConnected) mainEl.appendChild(fxDrop.el);
+  if (!screens.has('images:input_images_text')) { check(false, '没有载入 tui_screens_images.ndjson'); return; }
+  // 真机画面 → 图片编号（与后端 tui_parse 一致）
+  show('images:input_images_text'); await raf();
+  const st1 = s.screen.state;
+  check(JSON.stringify(inputImages(st1)) === '[21,22]' && inputHasOther(st1), '真机画面：输入框里 [Image #21] [Image #22] + 文字');
+  show('images:input_image_only'); await raf();
+  check(JSON.stringify(inputImages(s.screen.state)) === '[21]' && !inputHasOther(s.screen.state), '真机画面：只有图片 [Image #21]');
+  show('images:busy_input_image_text'); await raf();
+  check(JSON.stringify(inputImages(s.screen.state)) === '[23]', '真机画面：回复还在刷屏时输入框里的图片 [Image #23]');
+  show('images:done_after_image'); await raf();
+  check(s.screen.state.live === '⏺ 这张图上写的是 "OK"。' && !inputImages(s.screen.state).length, '回显下的 "⎿  [Image #20]" 不进实时草稿');
+
+  // 图片条：在输入框顶部，56px 小缩略图（点了放大）/ 占位图标、每张一个 ×、说明、清除
+  const ta = $('fx-input');
+  const taH0 = ta.getBoundingClientRect().height;
+  const boxH0 = box.getBoundingClientRect().height;
+  const blob = await fxPng(64, 40, '#2f6bf0');
+  const url = URL.createObjectURL(blob);
+  const blob2 = await fxPng(40, 64, '#e0592a');
+  const url2 = URL.createObjectURL(blob2);
+  const thumbs = new Map([[21, { url, name: '剪贴板里的图片', kind: 'paste' }]]);
+  const m1 = trayModel({ images: [21, 22], pending: null, other: false, thumbs });
+  check(fxTray.update(m1) === true, '图片条：有图片时建一次');
+  await raf();
+  const chips = [...fxTray.el.querySelectorAll('.img-chip')];
+  check(!fxTray.el.hidden && box.firstElementChild === fxTray.el, '图片条在输入框（composer-box）顶部');
+  check(chips.length === 2 && chips[0].textContent.includes('#21') && chips[1].textContent.includes('#22'), '两个图片 chip：#21 #22');
+  const img = chips[0].querySelector('img');
+  if (img) { try { await img.decode(); } catch (_) { /* 下面的检查会失败 */ } }
+  const ir = img ? img.getBoundingClientRect() : { width: 0, height: 0 };
+  check(!!img && img.naturalWidth === 64 && ir.width >= 52 && ir.width <= 64 && Math.abs(ir.height - ir.width) < 1
+    && getComputedStyle(img).objectFit === 'cover', '⌘V 的图片有小缩略图（本页内存里的 blob，' + Math.round(ir.width) + 'px 方图，object-fit: cover）');
+  check(parseFloat(getComputedStyle(chips[0]).borderTopLeftRadius) >= 6, '缩略图圆角');
+  check(!!chips[1].querySelector('.img-chip-ph svg') && chips[1].querySelector('.img-thumb').tagName === 'SPAN', '没有缩略图（拖入的路径 / 刷新后）时显示图片图标，不是按钮');
+  const th0 = chips[0].querySelector('.img-thumb');
+  check(th0.tagName === 'BUTTON' && th0.getAttribute('aria-label') === '放大查看 [Image #21]' && /\[Image #21\]/.test(th0.title)
+    && th0.title.includes('剪贴板里的图片') && th0.title.includes('点击放大'), '有缩略图的是按钮：aria-label、tooltip（[Image #21] · 来源 · 点击放大）');
+  check(/页面刷新后/.test(chips[1].querySelector('.img-thumb').title), '没有缩略图时 tooltip 说明原因');
+  // ×：每张一个，键盘可达（button + aria-label），在 chip 内不被裁掉
+  const xs = [...fxTray.el.querySelectorAll('.img-x')];
+  const cr0 = chips[0].getBoundingClientRect(), xr0 = xs[0] ? xs[0].getBoundingClientRect() : null;
+  check(xs.length === 2 && xs.every((x) => x.tagName === 'BUTTON' && x.type === 'button') && xs[1].getAttribute('aria-label') === '删除 [Image #22]',
+    '每张一个 × 按钮（button、aria-label「删除 [Image #N]」）');
+  check(!!xr0 && xr0.width >= 18 && xr0.left >= cr0.left && xr0.right <= cr0.right && xr0.top >= cr0.top && xr0.bottom <= cr0.bottom
+    && document.elementFromPoint(xr0.left + xr0.width / 2, xr0.top + xr0.height / 2)?.closest('.img-x') === xs[0],
+  '× 在缩略图右上角、可点到（' + (xr0 ? Math.round(xr0.width) : 0) + 'px）');
+  check(fxTray.el.textContent.includes('在 claude 的输入框里，发送时和文字一起发出'), '说明文字');
+  const trayH = fxTray.el.getBoundingClientRect().height;
+  const boxH1 = box.getBoundingClientRect().height;
+  check(trayH >= 56 && trayH <= 80, '图片条一行高（' + trayH.toFixed(1) + 'px）');
+  check(Math.abs(boxH1 - boxH0 - trayH - 4) <= 2, '输入框整体只多出图片条的高度（' + boxH0.toFixed(1) + ' → ' + boxH1.toFixed(1) + '）');
+  check(Math.abs(ta.getBoundingClientRect().height - taH0) < 0.5, '文本框高度不变（autosize 不受影响）');
+  check(fxTray.update(trayModel({ images: [21, 22], pending: null, other: false, thumbs })) === false && chips[0].isConnected, '内容不变不重建');
+  // 很多张：chip 横向滚动，不撑宽、不换行
+  fxTray.update(trayModel({ images: Array.from({ length: 30 }, (_, i) => i + 1), pending: null, other: false, thumbs: new Map() }));
+  await raf();
+  check(fxTray.el.getBoundingClientRect().height <= 80 && box.scrollWidth <= box.clientWidth + 1, '30 张图片：一行、横向滚动，不撑宽输入框');
+  fxTray.update(m1); await raf();
+  // 点缩略图 → 灯箱放大（不发请求）；点 × 不会打开灯箱
+  const nBefore = calls.length;
+  await click(fxTray.el.querySelector('.img-thumb'), '缩略图');
+  await raf();
+  const lb1 = document.querySelector('.lb');
+  check(lightboxOpen() && !!lb1 && lb1.querySelector('.lb-title').textContent.includes('[Image #21]') && lb1.querySelector('.lb-count').textContent === ''
+    && calls.length === nBefore, '点缩略图用灯箱打开原图（只有一张有图时没有切换），不发请求');
+  const lbImg = lb1 && lb1.querySelector('.lb-img');
+  if (lbImg && !lbImg.complete) await new Promise((r) => { lbImg.onload = r; lbImg.onerror = r; setTimeout(r, 500); });
+  check(!!lbImg && lbImg.naturalWidth === 64, '灯箱里是原图（64×40）');
+  lb1.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await raf();
+  check(!lightboxOpen(), 'Esc 关闭灯箱');
+  thumbs.set(22, { url: url2, name: 'b.png', kind: 'drop' });
+  const m2 = trayModel({ images: [21, 22], pending: null, other: false, thumbs });
+  fxTray.update(m2); await raf();
+  await click(fxTray.el.querySelectorAll('.img-thumb')[1], '第二张缩略图');
+  await raf();
+  const lb2 = document.querySelector('.lb');
+  check(!!lb2 && lb2.querySelector('.lb-count').textContent === '2 / 2' && lb2.querySelector('.lb-title').textContent === 'b.png · [Image #22]', '两张都有图：灯箱从点中的那张开始（2 / 2）');
+  lb2.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+  await raf();
+  check(lb2.querySelector('.lb-count').textContent === '1 / 2' && lb2.querySelector('.lb-title').textContent.includes('[Image #21]'), '← 切到图片条上的上一张');
+  closeLightbox(); await raf();
+  await click(fxTray.el.querySelectorAll('.img-x')[1], '删除 #22');
+  check(calls.at(-1)?.op === 'image/remove' && calls.at(-1).body?.n === 22 && calls.at(-1).gesture && !lightboxOpen(),
+    '点 × → POST image/remove {n:22}（只来自点击），不会顺带打开灯箱');
+  // 正在删：那一张变淡，× 暂时都没有，说明换成「正在删」
+  fxTray.update(trayModel({ images: [21, 22], pending: { kind: 'remove', n: 22 }, thumbs })); await raf();
+  check(fxTray.el.querySelectorAll('.img-chip.removing').length === 1 && fxTray.el.querySelector('.img-chip.removing').dataset.n === '22'
+    && !fxTray.el.querySelector('.img-x') && fxTray.el.textContent.includes('[Image #22]') && !!fxTray.el.querySelector('.spin'), '正在删 #22：变淡、转圈说明、没有 ×');
+  fxTray.update(trayModel({ images: [21], pending: null, other: false, thumbs, removable: false })); await raf();
+  check(!fxTray.el.querySelector('.img-x') && !!fxTray.el.querySelector('.img-clear'), '服务器会话：没有 ×（只能清除）');
+  fxTray.update(trayModel({ images: [23], pending: null, other: false, thumbs: new Map([[23, { url: '', name: 'c.png', kind: 'drop', loading: true }]]) })); await raf();
+  check(!!fxTray.el.querySelector('.img-thumb .spin') && /加载中/.test(fxTray.el.querySelector('.img-thumb').title), '拖入的图片：缩略图加载中转圈');
+  fxTray.update(m1); await raf();
+  // 清除：只来自点击
+  await click(fxTray.el.querySelector('.img-clear'), '清除图片');
+  check(calls.at(-1)?.op === 'image/clear' && calls.at(-1).gesture, '点「清除」→ POST image/clear（只来自点击）');
+  // 进行中 / 还有别的文字 / 不可操作
+  fxTray.update(trayModel({ images: [], pending: { kind: 'paste', n: 1 } })); await raf();
+  check(!!fxTray.el.querySelector('.spin') && fxTray.el.textContent.includes('剪贴板') && !fxTray.el.querySelector('.img-clear'), '⌘V 进行中：转圈 + 说明，没有清除按钮');
+  fxTray.update(trayModel({ images: [21], pending: null, other: true })); await raf();
+  check(fxTray.el.classList.contains('warn') && !fxTray.el.querySelector('.img-clear') && fxTray.el.textContent.includes('一起清掉')
+    && !!fxTray.el.querySelector('.img-x'), '输入框里还有别的文字：警示色说明，没有清除按钮，× 仍可逐张删');
+  fxTray.update(trayModel({ images: [21], pending: null, other: false, blocked: 'blocked' })); await raf();
+  check(!fxTray.el.querySelector('.img-clear') && !fxTray.el.querySelector('.img-x'), '已退出 / 有对话框时没有清除和 ×');
+  // 浅色 / 深色：说明文字、#N 角标、× 的对比度
+  const th = window.ccrTheme;
+  const prevPref = th ? th.pref() : 'system';
+  fxTray.update(m1); await raf();
+  for (const theme of ['light', 'dark']) {
+    if (th) th.set(theme, { persist: false });
+    await raf();
+    const tag = theme === 'light' ? '浅色' : '深色';
+    const bg = rgbaOf(getComputedStyle(box).backgroundColor);
+    const note = contrast(rgbaOf(getComputedStyle(fxTray.el.querySelector('.img-note')).color), bg);
+    const ph = fxTray.el.querySelectorAll('.img-chip')[1];
+    const phBg = over(rgbaOf(getComputedStyle(ph.querySelector('.img-chip-ph')).backgroundColor), over(rgbaOf(getComputedStyle(ph).backgroundColor), bg));
+    const nEl = ph.querySelector('.img-chip-n'), xEl = ph.querySelector('.img-x');
+    const nTxt = contrast(rgbaOf(getComputedStyle(nEl).color), over(rgbaOf(getComputedStyle(nEl).backgroundColor), phBg));
+    const xTxt = contrast(rgbaOf(getComputedStyle(xEl).color), over(rgbaOf(getComputedStyle(xEl).backgroundColor), { r: 255, g: 255, b: 255, a: 1 }));
+    check(note >= 4.5 && nTxt >= 4.5 && xTxt >= 4.5, tag + '：图片条对比度 ≥ 4.5（说明 ' + note.toFixed(2) + '，#N ' + nTxt.toFixed(2) + '，× 压在白图上 ' + xTxt.toFixed(2) + '）');
+    const phIc = contrast(rgbaOf(getComputedStyle(ph.querySelector('.img-chip-ph')).color), phBg);
+    check(phIc >= 3, tag + '：占位图标对比度 ' + phIc.toFixed(2) + ' ≥ 3');
+    fxTray.update(trayModel({ images: [21], pending: null, other: true })); await raf();
+    const warn = contrast(rgbaOf(getComputedStyle(fxTray.el.querySelector('.img-note')).color), bg);
+    check(warn >= 3, tag + '：警示说明对比度 ' + warn.toFixed(2) + ' ≥ 3');
+    fxTray.update(m1); await raf();
+  }
+  if (th) th.set(prevPref, { persist: false });
+  await raf();
+  fxTray.update(null); await raf();
+  check(fxTray.el.hidden && Math.abs(box.getBoundingClientRect().height - boxH0) < 0.5, '没有图片时图片条隐藏、输入框恢复原高');
+  URL.revokeObjectURL(url);
+  URL.revokeObjectURL(url2);
+
+  // 浏览器的 DataTransfer / ClipboardEvent（构造的，不碰系统剪贴板）
+  const file = new File([blob], 'shot.png', { type: 'image/png' });
+  const dt = new DataTransfer(); dt.items.add(file);
+  const dtText = new DataTransfer(); dtText.setData('text/plain', '你好');
+  const dtMix = new DataTransfer(); dtMix.setData('text/plain', 'img url'); dtMix.items.add(file);
+  const i1 = transferInfo(dt), i2 = transferInfo(dtText), i3 = transferInfo(dtMix);
+  check(i1.images === 1 && !i1.text && i1.file instanceof File && i1.file.type === 'image/png', 'DataTransfer 里只有截图：1 张图片、没有文字');
+  check(i2.images === 0 && i2.text, '纯文字粘贴：不当图片处理');
+  check(i3.images === 1 && i3.text, '图片 + 文字：两样都认出来（文字照常粘贴）');
+  check(dragHasFiles(dt) && !dragHasFiles(dtText), '拖动里有文件才算文件拖放');
+  let seen = null;
+  const onPaste = (e) => { seen = transferInfo(e.clipboardData); e.preventDefault(); };
+  ta.addEventListener('paste', onPaste);
+  ta.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  ta.removeEventListener('paste', onPaste);
+  check(seen && seen.images === 1 && !seen.text, 'paste 事件的 clipboardData 里能拿到图片（构造的 ClipboardEvent）');
+
+  // 拖动覆盖层
+  fxDrop.show(dropHint({ native: true, paths: ['/Users/u/Desktop/截屏 2026.png', '/tmp/a.py'], sess: { local: true } }));
+  await raf();
+  const or = fxDrop.el.getBoundingClientRect(), mr = mainEl.getBoundingClientRect();
+  check(!fxDrop.el.hidden && or.width >= mr.width - 20 && or.height >= mr.height - 20 && or.left >= mr.left && or.bottom <= mr.bottom, '覆盖层盖住会话头 + 聊天区 + 输入框（' + Math.round(or.width) + '×' + Math.round(or.height) + '）');
+  check(getComputedStyle(fxDrop.el).pointerEvents === 'none', '覆盖层不接收指针（拖放事件照常到下面）');
+  check(fxDrop.el.textContent.includes('松开即可') && fxDrop.el.textContent.includes('1 张图片') && fxDrop.el.textContent.includes('1 个文件以路径插入'), '本机会话：说明图片进 claude 输入框、其它文件以路径插入');
+  fxDrop.show(dropHint({ native: true, paths: ['/a/x.png'], sess: { local: false } })); await raf();
+  check(fxDrop.el.classList.contains('bad') && fxDrop.el.textContent.includes('服务器会话'), '服务器会话：提示不支持');
+  fxDrop.show(dropHint({ native: false })); await raf();
+  check(fxDrop.el.classList.contains('bad') && fxDrop.el.textContent.includes('⌘V'), '浏览器（拿不到路径）：提示用 ⌘V');
+  fxDrop.hide(); await raf();
+  check(fxDrop.el.hidden, '离开后覆盖层隐藏');
+  // 非图片文件 = 终端拖放：转义后的路径插到光标处
+  const r = insertPaths('看看这个', 4, 4, ['/Users/u/my notes (1).md']);
+  check(r.value === '看看这个 /Users/u/my\\ notes\\ \\(1\\).md ' && r.caret === r.value.length && escapeDropPath('/a/b c.png') === '/a/b\\ c.png', '路径按终端拖放的写法转义插入');
+
+  // transcript：带图片的用户消息（CLI 把 "[Image #N] " 占位写进文字）
+  const ts = new Date().toISOString();
+  const imgB = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG1 } };
+  pushTranscript([
+    { type: 'user', uuid: 'img-u1', timestamp: ts, imagePasteIds: [1, 2], message: { role: 'user', content: [{ type: 'text', text: '[Image #1] [Image #2] 这两张图写了什么？' }, imgB, imgB] } },
+    { type: 'user', uuid: 'img-u1m', timestamp: ts, isMeta: true, message: { role: 'user', content: [{ type: 'text', text: '[Image: source: /tmp/imgs/a.png]' }] } },
+    { type: 'assistant', uuid: 'img-a1', timestamp: ts, message: { id: 'msg_img1', role: 'assistant', content: [{ type: 'text', text: '第一张 CAT，第二张 DOG。' }] } },
+    { type: 'user', uuid: 'img-u2', timestamp: ts, imagePasteIds: [3], message: { role: 'user', content: [{ type: 'text', text: '[Image #3]' }, imgB] } },
+  ], false);
+  await raf(); flushNow(s);
+  const us = qa('.k-user');
+  const u1 = us.at(-2), u2 = us.at(-1);
+  check(u1 && u1.querySelectorAll('.user-imgs img').length === 2 && u1.querySelector('.user-text')?.textContent === '这两张图写了什么？', '文字 + 图片：气泡里 2 张图，文字去掉了开头的 [Image #N] 占位');
+  check(u2 && u2.querySelectorAll('.user-imgs img').length === 1 && !u2.querySelector('.user-text'), '只有图片：只显示图片');
+  check(!qa('.k-user').some((e) => e.textContent.includes('[Image: source:')), 'isMeta 的 [Image: source: …] 不显示');
+  // 发出去之后：时间线里的图片点击同样用灯箱放大（同一条消息里的两张可以切换）
+  const ub = u1 && u1.querySelector('.user-imgs .cimg');
+  if (ub) { ub.scrollIntoView({ block: 'center' }); await raf(); }
+  await click(ub, '用户消息里的图片');
+  await raf();
+  const lb3 = document.querySelector('.lb');
+  check(!!lb3 && lb3.querySelector('.lb-count').textContent === '1 / 2', '时间线里用户消息的图片：点击用灯箱放大（1 / 2）');
+  closeLightbox(); await raf();
+  const pl = promptsFromItems(s.items);
+  check(pl.at(-1) === '这两张图写了什么？', '↑/↓ 历史：带图片的消息只取文字，只有图片的跳过');
+  check(calls.length === nCalls + 2, '图片条 / 覆盖层 / 灯箱 / 渲染不自动发请求（只有点击 × 与「清除」那两次）');
+  calls.length = nCalls;   // 后面几节按「没有任何请求」起算
 }
 
 // ---------- 侧栏「新回复」/「待处理」 ----------
@@ -2159,14 +2389,13 @@ async function subStopChecks() {
       'attachment 通知渲染成结束通知行「子代理「搭建沙盒」已终止」：' + (notes[0] ? notes[0].textContent : '无'));
     check(s.items.length === nItems + 2 && !qa('.k-user').some((el) => /task-notification/.test(el.textContent)), '通知不显示成用户消息（只多了通知行与回复）');
     check(!!notes[0] && !notes[0].querySelector('.sa-note-tog') && !!notes[0].querySelector('.st-warn'), '通知行：停止图标、没有结果可展开（被停止的通知不带 <result>）');
-    // 其它 attachment：排队的用户消息（commandMode=prompt）/ 未知类型不渲染；纯文本通知 → 系统消息
+    // 其它 attachment：未知类型不渲染（回复中发送的用户消息 commandMode=prompt 见第 14h 节）；纯文本通知 → 系统消息
     const n2 = s.items.length;
     pushTranscript([
-      { type: 'attachment', uuid: 'ss-at2', timestamp: ents[cut].timestamp, attachment: { type: 'queued_command', commandMode: 'prompt', prompt: '中断所有会话', origin: { kind: 'human' } } },
       { type: 'attachment', uuid: 'ss-at3', timestamp: ents[cut].timestamp, attachment: { type: 'skill_listing', content: SS_NOTE } },
     ], false);
     await raf(); flushNow(s);
-    check(s.items.length === n2, '非通知的 attachment 不渲染');
+    check(s.items.length === n2, '非通知、非用户消息的 attachment 不渲染');
     pushTranscript([{ type: 'attachment', uuid: 'ss-at4', timestamp: ents[cut].timestamp, attachment: { type: 'queued_command', commandMode: 'task-notification', prompt: 'Background agent "第三次数数" was stopped by the user.' } }], false);
     await raf(); flushNow(s);
     check(s.items.length === n2 + 1 && qa('.k-hint').some((el) => /系统消息：Background agent "第三次数数" was stopped by the user\./.test(el.textContent)),
@@ -2182,6 +2411,114 @@ async function subStopChecks() {
     window.fetch = origFetch;
     state.onSubagent = prevOn;
     if (fxSaUI) fxSaUI.setSession(null);
+  }
+}
+
+// ---------- 回复进行中发出的消息（CLI 2.1.330–2.1.332：被这一轮中途吸收的消息只写成 attachment / queued_command，
+// commandMode=prompt，不另写 user 条目；render.js onQueuedPrompt）。条目全部是合成的。 ----------
+async function queuedPromptChecks() {
+  const nCalls = calls.length;
+  let fetches = 0;
+  const origFetch = window.fetch;
+  window.fetch = (...a) => { fetches++; return origFetch(...a); };
+  const th = window.ccrTheme;
+  const prevPref = th ? th.pref() : 'system';
+  try {
+    const QCWD = '/mnt/ssd/home/demouser/qproj';
+    const t0 = Date.parse('2026-11-25T08:00:00Z');
+    const U = (i) => '00000000-0000-4000-9000-' + String(i).padStart(12, '0');
+    const base = (i, type, extra) => ({ type, uuid: U(i), parentUuid: i > 1 ? U(i - 1) : null, isSidechain: false, cwd: QCWD, timestamp: new Date(t0 + i * 1000).toISOString(), ...extra });
+    const userE = (i, text) => base(i, 'user', { message: { role: 'user', content: text }, origin: { kind: 'human' }, promptSource: 'typed' });
+    const asst = (i, content, stop) => base(i, 'assistant', { message: { id: 'msg_q' + i, role: 'assistant', content, stop_reason: stop || 'tool_use' } });
+    const res = (i, id, content, tur) => base(i, 'user', { message: { role: 'user', content: [{ tool_use_id: id, type: 'tool_result', content }] }, ...(tur ? { toolUseResult: tur } : {}) });
+    // 与 node_agent.note_attachment 转发的精简版同形
+    const att = (i, prompt, extra = {}) => base(i, 'attachment', { attachment: { type: 'queued_command', commandMode: 'prompt', prompt, origin: { kind: 'human' }, source_uuid: 'qsrc-' + i, ...extra } });
+    const file = QCWD + '/notes.txt';
+    const MID = '顺便把第二行也改成 world';
+    const ents = [
+      userE(1, '把 notes.txt 第一行改成 hello'),
+      asst(2, [{ type: 'tool_use', id: 'tq1', name: 'Edit', input: { file_path: file, old_string: 'hi', new_string: 'hello' } }]),
+      res(3, 'tq1', 'The file has been updated', { filePath: file, structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-hi', '+hello'] }] }),
+      att(4, MID),
+      asst(5, [{ type: 'tool_use', id: 'tq2', name: 'Edit', input: { file_path: file, old_string: 'x', new_string: 'world' } }]),
+      res(6, 'tq2', 'The file has been updated', { filePath: file, structuredPatch: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ['-x', '+world'] }] }),
+      asst(7, [{ type: 'text', text: '两行都改好了。' }], 'end_turn'),
+      base(8, 'system', { subtype: 'turn_duration', durationMs: 5000 }),
+      userE(9, '谢谢'),
+      asst(10, [{ type: 'text', text: '不客气。' }], 'end_turn'),
+    ];
+    pushTranscript(ents.slice(0, 3), true);
+    await raf(); flushNow(s);
+    // 回复进行中发送：前端先记成“待出现”（与 app.js send() 相同：n = 发送前时间线上的用户消息条数）
+    const pend = [];
+    addPending(pend, MID, promptsFromItems(s.items).length);
+    check(mergePending(promptsFromItems(s.items), pend).pending.length === 1, '回复中发送后 transcript 里还没有：待出现 1 条');
+    pushTranscript(ents.slice(3), false);
+    await raf(); flushNow(s);
+    const users = qa('.k-user');
+    const mid = users[1];
+    check(users.length === 3 && !!mid && mid.classList.contains('mid-turn') && !users[0].classList.contains('mid-turn') && !users[2].classList.contains('mid-turn'),
+      'attachment（commandMode=prompt）渲染成用户气泡，只有它带 mid-turn（共 ' + users.length + ' 条用户消息）');
+    check(!!mid && mid.querySelector('.user-text').textContent === MID && /回复中发送/.test(mid.querySelector('.user-tag').textContent),
+      '气泡文字 = 原文，顶部小标注「回复中发送」');
+    const meta = mid && mid.querySelector(':scope > .msg-meta.mm-user');
+    check(!!meta && !!meta.querySelector('.mm-btn') && !!meta.querySelector('.mm-time'), '悬停操作照常：时间 + 复制');
+    const kinds = s.items.map((it) => it.kind).join(',');
+    check(kinds === 'user,tool,user,tool,text,turnsum,user,text', '位置：第一次工具结果之后、第二次工具调用之前（' + kinds + '）');
+    const ts = s.items.find((it) => it.kind === 'turnsum');
+    check(!!ts && ts.tools.length === 2 && ts.tools.every((t) => t.name === 'Edit') && qa('.k-turnsum').length === 1,
+      '不结束这一轮：只有一张「本轮改动」卡片，包含前后两次 Edit');
+    const tr = trackerOf(s);
+    tr.update(s);
+    check(tr.turns.length === 3 && tr.main.length === 2 && tr.main.every((e) => e.turn === 1), '「改动」栏不另起一轮：轮 = 开头 + 2 条普通用户消息，两次编辑都在第 1 轮');
+    const prompts = promptsFromItems(s.items);
+    check(prompts.join('|') === ['把 notes.txt 第一行改成 hello', MID, '谢谢'].join('|'), '↑/↓ 历史包含回复中发送的消息（按时间顺序）');
+    check(mergePending(prompts, pend).pending.length === 0, '待出现对账：出现了对应 attachment 就算已出现，不再单独列出');
+    check(minimapEntries(s.items).length === 3 && fxMinimap.entries.length === 3, '左侧小格子：每条用户消息一格（含回复中发送的，共 ' + fxMinimap.entries.length + ' 格）');
+    // 只出现一次：同一条再推一遍（uuid 相同）、或压缩后 CLI 原样再写一遍（uuid 不同、source_uuid 相同）
+    const n1 = s.items.length;
+    pushTranscript([ents[3], { ...ents[3], uuid: U(99) }], false);
+    await raf(); flushNow(s);
+    check(s.items.length === n1 && qa('.k-user').length === 3, '只出现一次：重复的 uuid / 相同 source_uuid 都不再追加');
+    // 带图片（CLI：prompt = [文字块, 图片块…]，开头的 [Image #1] 占位与 onUser 一样去掉）
+    const SMALL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    pushTranscript([att(11, [{ type: 'text', text: '[Image #1] 看看这张图' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: SMALL } }])], false);
+    await raf(); flushNow(s);
+    const imgU = qa('.k-user').pop();
+    check(!!imgU && imgU.classList.contains('mid-turn') && imgU.querySelectorAll('.user-imgs img').length === 1 && imgU.querySelector('.user-text').textContent === '看看这张图',
+      '带图片的：气泡里显示图片，文字去掉 [Image #1] 占位');
+    // 来自其它会话（peer，CLI 记为 isMeta）→ 系统行，不是用户气泡，不进 ↑/↓ 历史
+    const nU = qa('.k-user').length, nP = promptsFromItems(s.items).length;
+    pushTranscript([att(12, '<agent-message from="helper">\n后台任务的报告第一行\n第二行\n</agent-message>', { origin: { kind: 'peer', name: 'helper' } })], false);
+    await raf(); flushNow(s);
+    check(qa('.k-user').length === nU && promptsFromItems(s.items).length === nP
+      && qa('.k-hint').some((el) => /来自其它会话「helper」：后台任务的报告第一行/.test(el.textContent)), '来自其它会话的消息 → 系统行「来自其它会话「helper」：…」');
+    // 子代理通知仍是通知行；其它 attachment 不渲染
+    const n2 = s.items.length;
+    pushTranscript([base(13, 'attachment', { attachment: { type: 'date', date: '2026-11-25' } })], false);
+    await raf(); flushNow(s);
+    check(s.items.length === n2, '其它 attachment（date 等）不渲染');
+    // 历史预览（/api/history 的 entries 同形）：同样渲染
+    const hs = ensureSession(createState({ actions: {} }), 'squeuedhist01', { title: '历史', state: 'exited' });
+    applyHistory(hs, ents);
+    const hu = hs.items.filter((it) => it.kind === 'user');
+    check(hu.length === 3 && hu[1].midTurn === true && hu[1].text === MID && hs.items.filter((it) => it.kind === 'turnsum').length === 1, '历史预览：同样渲染成回复中发送的用户消息，不另起一轮');
+    // 浅色 / 深色：小标注的对比度
+    const res2 = [];
+    if (th) {
+      for (const theme of ['light', 'dark']) {
+        th.set(theme, { persist: false }); await raf();
+        const tag = mid.querySelector('.user-tag');
+        const bubbleBg = over(rgbaOf(getComputedStyle(mid.querySelector('.bubble')).backgroundColor), rgbaOf(getComputedStyle(document.body).backgroundColor));
+        res2.push(contrast(rgbaOf(getComputedStyle(tag).color), bubbleBg).toFixed(2));
+      }
+      th.set(prevPref, { persist: false }); await raf();
+    }
+    check(res2.length === 2 && res2.every((v) => Number(v) >= 4.5), '浅色 / 深色：「回复中发送」小标注对比度 ≥ 4.5（' + res2.join(' / ') + '）');
+    check(calls.length === nCalls && fetches === 0, '整个过程不发任何请求 / 按键');
+  } finally {
+    window.fetch = origFetch;
+    if (th) th.set(prevPref, { persist: false });
   }
 }
 

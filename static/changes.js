@@ -286,7 +286,7 @@ export class ChangeTracker {
     for (; this.scanned < items.length; this.scanned++) {
       const it = items[this.scanned];
       if (!it) continue;
-      if (it.kind === 'user') {
+      if (it.kind === 'user' && !it.midTurn) {   // 回复中发送的消息（midTurn）属于当前这一轮，不另起一轮
         const n = this.turns.length;
         this.turns.push({ idx: n, n, text: userText(it), ts: typeof it.ts === 'number' ? it.ts : null, item: it });
         changed = true;

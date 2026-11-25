@@ -1,5 +1,5 @@
 // 应用入口（v2：交互式 Claude Code）：网络 ↔ 渲染核心 ↔ 侧栏/头部/输入框/终端面板
-import { Api, EventStream, takeLoginCode } from './api.js';
+import { Api, EventStream, takeLoginCode, REMOTE, CREDENTIALS } from './api.js';
 import { h, icon, spinner, fmtRelTime, fmtSize, basename, truncate } from './dom.js';
 import {
   createState, ensureSession, forgetSession, applyEnvelope, applyToSession, releaseHold, applyHistory, applyScreen, mountSession,
@@ -11,9 +11,10 @@ import { SubagentUI } from './subagents.js';
 import { StatsBar } from './stats.js';
 import { apiLabel, apiUsageTitle, restartApiDialog, loadApiKeys, loadUsage, onApiKeysChange, setDefaultBaseUrl } from './apikeys.js';
 import { initViz } from './viz.js';           // 可视化（§10）：图片引用 / 灯箱 / 文件 chip / 右侧预览面板
+import { openLightbox } from './lightbox.js';  // 图片条缩略图点击放大
 import { PreviewPanel } from './preview.js';
 import { HintBar, installChords, screenHints } from './hotkeys.js';
-import { settingsDialog, setUpdateStore } from './settings.js';
+import { settingsDialog, setUpdateStore, setExtraSection } from './settings.js';
 import { modeName, cycleOf } from './modes.js';
 import { ComposerControls } from './composerbar.js';   // 输入框底栏：模型/effort 胶囊、权限模式、Shift+Tab
 import { AutoSize } from './autosize.js';  // 输入框自适应高度（镜像测量，不临时缩小输入框，打字不抖）
@@ -23,9 +24,13 @@ import { PromptMinimap } from './minimap.js';   // 时间线左侧 prompt 小格
 import { ChangesButton } from './changes.js';   // 右侧「代码改动」栏的会话头开关（数据只来自前端已有的 transcript）
 import { UpdateStore, UpdateBanner, updateAction } from './update.js';   // dmg 版自动更新（只有后端开启时才显示）
 import { OpBanner, OpGuard, busyLabel, jobPromptModel, opRunning } from './opprogress.js';   // 重启 / 续接进度横幅 + 防连点
+import { ImageTray, DropOverlay, transferInfo, dragHasFiles, splitDropPaths, insertPaths, inputImages, inputHasOther,
+  imageBlocked, dropHint, trayModel, lightboxList } from './attach.js';   // 本机会话发图片：⌘V = claude 的 Ctrl+V、原生窗口拖入 = 粘贴图片路径
 
 const $ = (id) => document.getElementById(id);
 const api = new Api({ onAuthLost: (msg) => showAuthLost(msg) });
+// 手机远程（触屏）：回车 = 换行、点发送按钮发送（避免半句话被误发进 claude）；本机窗口与以前完全相同
+const TOUCH_COMPOSE = REMOTE && typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 
 let config = {};
 // 重启 / 续接进度：防连点（同一会话进行中时不再发请求）+ 输入框上方的进度横幅（数据 = 后端 meta.op）
@@ -56,6 +61,14 @@ let saUI = null;            // 子代理托盘 + 抽屉（subagents.js）
 let pvPanel = null;         // 右侧预览面板（preview.js）
 let hintBar = null;         // CLI 快捷键提示条（hotkeys.js）
 const statsBar = new StatsBar();   // 统计（上下文圆环 / 花费 / tok/s）：只建一次，boot 时挂进输入框底栏的固定槽位，之后原地更新
+// claude 输入框里的图片（[Image #N]）：输入框顶部的图片条 + 拖动覆盖层；imgOps = sid -> 进行中的图片操作（串行）
+const imageTray = new ImageTray({ onClear: () => clearImages(), onRemove: (n) => removeImage(n), onOpen: (n) => openTrayImage(n) });
+const dropOverlay = new DropOverlay();
+const imgOps = new Map();     // sid -> { kind:'paste'|'paths'|'clear'|'remove', n, promise }
+// sid -> Map(N -> { url, name, kind:'paste'|'drop', token, path, loading, failed })：缩略图（blob URL，只在本页内存里）：
+// ⌘V 的 = 浏览器 paste 事件给的图片；拖入的 = 后端只读通道 GET image/file/<token>（只读那个刚拖入的文件）
+const imgThumbs = new Map();
+const NATIVE_APP = typeof navigator !== 'undefined' && /CCRemoteChat\//.test(navigator.userAgent || '');
 let composerCtl = null;            // 输入框底栏左侧控件组（composerbar.js）
 let minimap = null;                // 时间线左侧 prompt 小格子（minimap.js）：#chat-host 里只挂一个，跟随当前会话 / 历史预览
 // 会话头「改动」按钮：只建一次，每次重建会话头时挂回去，角标 / 按下状态原地更新
@@ -168,13 +181,14 @@ async function boot() {
     onRefresh: () => refreshScreen(liveSession()),
     onClose: () => setTerm(false),
   });
-  window.addEventListener('hashchange', async () => {
+  if (REMOTE) document.documentElement.classList.add('remote');   // 手机远程访问：没有窗口登录码，401 → 配对页
+  if (!REMOTE) window.addEventListener('hashchange', async () => {
     const code = takeLoginCode();
     if (!code) return;
     try { await api.login(code); location.reload(); }
     catch (e) { if (e.status !== 401) toast('登录失败：' + e.message, 'error'); else showAuthLost(e.message); }
   });
-  const code = takeLoginCode(); // 先清掉地址栏中的登录码，再去兑换
+  const code = REMOTE ? '' : takeLoginCode(); // 先清掉地址栏中的登录码，再去兑换
   if (code) {
     try {
       await api.login(code);
@@ -226,6 +240,7 @@ async function loadAll() {
   config = b.config || {};
   applyConfigUI();
   if (b.update) setUpdate(b.update);
+  if (b.remote || b.remote_access) setupRemote(b.remote || null);
   state.lastGseq = typeof b.gseq === 'number' ? b.gseq : 0;
 
   for (const meta of Array.isArray(b.sessions) ? b.sessions : []) {
@@ -344,12 +359,32 @@ function resetAll(reason) {
   loadAll();
 }
 
+// ---------- 手机远程访问（私有版：static/remote.js；开源版没有这个文件，bootstrap 也不会带 remote / remote_access） ----------
+let remoteMod = null;
+function loadRemote() {
+  if (!remoteMod) remoteMod = import('./remote.js').catch((e) => { remoteMod = null; throw e; });
+  return remoteMod;
+}
+let remoteReady = false;
+function setupRemote(remote) {
+  if (remoteReady) return;
+  remoteReady = true;
+  loadRemote().then((m) => setExtraSection((a) => Object.assign(m.settingsSection(a, remote), { hideTest: !!remote })))
+    .catch(() => { remoteReady = false; });
+}
+
 let authShown = false;
 /** 没有 token / 任何请求 401 → 全屏提示，停止重连 */
 function showAuthLost(detail) {
   if (detail && /python3 app\.py|会话已失效/.test(detail)) detail = '';
   epoch++;
   if (stream) { stream.stop(); stream = null; }
+  if (REMOTE) {   // 手机：没有窗口可以重新打开 → 配对页
+    setConn('auth', '需要配对');
+    loadRemote().then((m) => m.showPairing(api, detail, { onPaired: () => location.reload() }),
+      (e) => setConn('auth', '加载配对页失败：' + e.message));
+    return;
+  }
   setConn('auth', '会话已失效');
   if (authShown) {
     const card = document.querySelector('.auth-lost .auth-card');
@@ -932,7 +967,7 @@ function renderComposerState() {
   const blocked = dead || !!d;
   // 运行中的提示写进占位文字（底栏留给控件）；比默认占位短，不会因此多折一行
   const ph = d ? '请先处理上方对话框' : dead ? '会话已退出' : busy ? '运行中：新消息会进入 claude 的输入队列'
-    : '给 Claude 发消息（Enter 发送 · Shift+Enter 换行 · / 命令）';
+    : TOUCH_COMPOSE ? '给 Claude 发消息（/ 命令）' : '给 Claude 发消息（Enter 发送 · Shift+Enter 换行 · / 命令）';
   // 先改占位文字再测高：空输入框的高度按占位文字量（AutoSize 连同 placeholder 一起量）
   const phChanged = ta.placeholder !== ph;
   if (phChanged) ta.placeholder = ph;
@@ -942,6 +977,9 @@ function renderComposerState() {
   $('send-btn').disabled = blocked;
   $('stop-btn').hidden = !(busy && !dead);
   if (hintBar) hintBar.update(dead ? null : screenHints(s), { blocked: dead || !!d || m.link === 'down' });
+  // claude 输入框里的图片（⌘V / 拖入后出现的 [Image #N]）：输入框顶部的图片条，内容不变不重建
+  if (!imageTray.el.isConnected) $('composer-box').prepend(imageTray.el);
+  imageTray.update(trayFor(s));
 }
 
 function setBanner(el, key, build) {
@@ -1391,6 +1429,7 @@ const SLASH_COMMANDS = ['model', 'effort', 'clear', 'compact', 'context', 'cost'
 
 let composing = false;
 let compositionEndAt = 0;
+let sendWaitImg = false;   // 发送正在等图片操作结束
 let slashIndex = 0;
 let slashMatches = [];
 let restoredDrafts = null;
@@ -1460,6 +1499,8 @@ function bindComposer() {
   ta.addEventListener('input', () => { autosize(); updateSlash(); });
   ta.addEventListener('keydown', onComposerKey);
   ta.addEventListener('blur', () => setTimeout(closeSlash, 150));
+  ta.addEventListener('paste', onComposerPaste);   // ⌘V 里有图片 → claude 自己的 Ctrl+V（只拦图片，文字照常粘贴）
+  bindImageDrop();
   $('send-btn').addEventListener('click', send);
   $('stop-btn').addEventListener('click', () => { const s = liveSession(); if (s) doInterrupt(s); });
   window.addEventListener('resize', () => autosize());
@@ -1493,7 +1534,7 @@ function onComposerKey(e) {
   const dir = historyDir(e, composing);
   if (dir && recallPrompt(dir)) { e.preventDefault(); return; }
   if (e.key === 'Enter' && !e.shiftKey && !e.altKey) {
-    if (isImeEnter(e)) return;
+    if (isImeEnter(e) || TOUCH_COMPOSE) return;
     e.preventDefault();
     send();
   }
@@ -1557,13 +1598,230 @@ function pickSlash(c) {
 
 function closeSlash() { $('slash-pop').hidden = true; slashMatches = []; slashIndex = 0; }
 
+// ====================== 图片（SPEC §4.2「图片」）：claude 输入框里的 [Image #N] ======================
+
+function screenState(s) { return s && s.screen && !s.screen.stale ? s.screen.state : null; }
+
+/** attach.js 的 imageBlocked 用的会话情况 */
+function imageSess(s) {
+  if (!s) return null;
+  const m = s.meta;
+  return { local: isLocalMeta(m), dead: isDead(m), dialog: !!currentDialog(s), linkDown: m.link === 'down', remote: REMOTE };
+}
+
+/** 图片操作串行执行（同一会话一次一个）；进行中时图片条显示转圈，发送会先等它结束。
+ *  结束后马上取一帧最新屏幕（推送的屏幕帧有节流，图片条不闪回旧状态） */
+function runImageOp(s, kind, n, fn) {
+  const prev = imgOps.get(s.sid);
+  const op = { kind, n, promise: null };
+  const fresh = () => refreshScreen(s).catch(() => {});
+  op.promise = (prev ? prev.promise.catch(() => {}) : Promise.resolve()).then(fn).then(async (r) => { await fresh(); return r; },
+    async (e) => { await fresh(); throw e; }).finally(() => {
+    if (imgOps.get(s.sid) === op) imgOps.delete(s.sid);
+    scheduleUI();
+  });
+  imgOps.set(s.sid, op);
+  scheduleUI();
+  return op.promise;
+}
+
+/** 输入框 ⌘V：剪贴板里有图片 → 让本机 claude 自己读剪贴板（终端里的 Ctrl+V）；文字照常粘进输入框 */
+function onComposerPaste(e) {
+  const s = liveSession();
+  if (!s) return;
+  const info = transferInfo(e.clipboardData);
+  if (!info.images) return;            // 纯文字：浏览器默认行为，什么都不改
+  if (!info.text) e.preventDefault();  // 只有图片：不往 textarea 里塞任何东西
+  const why = imageBlocked(imageSess(s), 'paste');
+  if (why) { toast(why, 'warn'); return; }
+  const url = info.file && typeof URL !== 'undefined' && URL.createObjectURL ? URL.createObjectURL(info.file) : '';
+  runImageOp(s, 'paste', 1, () => api.post(sp(s, '/image/paste'))).then((r) => {
+    const added = (r && Array.isArray(r.added)) ? r.added : [];
+    if (added.length && url) thumbsOf(s).set(added[added.length - 1], { url, name: '剪贴板里的图片', kind: 'paste', at: Date.now() });
+    else if (url) URL.revokeObjectURL(url);
+    scheduleUI();
+  }, (err) => {
+    if (url) URL.revokeObjectURL(url);
+    toast('粘贴图片失败：' + err.message, 'error', 8000);
+  });
+}
+
+function thumbsOf(s) {
+  let m = imgThumbs.get(s.sid);
+  if (!m) { m = new Map(); imgThumbs.set(s.sid, m); }
+  return m;
+}
+
+/** 屏幕上已经没有的图片编号（发出去了 / 清掉了 / claude 重启了）：释放缩略图。
+ *  刚加进来、推送的屏幕还没刷到的（后端已确认、SSE 的屏幕帧慢一点）先留着：在屏幕上出现过之后才按"没了"处理，
+ *  10 秒都没出现也释放。 */
+function pruneThumbs(s, ids) {
+  const m = imgThumbs.get(s.sid);
+  if (!m) return;
+  const now = Date.now();
+  for (const [n, t] of m) {
+    if (ids.includes(n)) { t.seen = true; continue; }
+    if (!t.seen && now - (t.at || 0) < 10000) continue;
+    if (t.url) URL.revokeObjectURL(t.url);
+    m.delete(n);
+  }
+}
+
+function trayFor(s) {
+  const st = screenState(s);
+  const ids = inputImages(st);
+  const op = imgOps.get(s.sid);
+  if (!op && st && st.input && st.input.visible) pruneThumbs(s, ids);   // 对话框挡住输入框时不算"图片没了"
+  const sess = imageSess(s);
+  return trayModel({ images: ids, pending: op ? { kind: op.kind, n: op.n } : null, other: inputHasOther(st),
+    thumbs: imgThumbs.get(s.sid), blocked: sess.dead || sess.dialog || sess.linkDown ? 'blocked' : null, removable: sess.local });
+}
+
+/** 图片条某张的 ×：只删这一张（后端把终端光标挪到 [Image #N] 后面按退格，每步带 guard；只由这次点击触发） */
+function removeImage(n) {
+  const s = liveSession();
+  if (!s) return;
+  const sess = imageSess(s);
+  const why = sess.dead ? '会话已退出' : sess.dialog ? '请先处理上方对话框' : sess.linkDown ? '与本机 agent 的连接已断开，请稍后再试' : null;
+  if (why || !sess.local) { if (why) toast(why, 'warn'); return; }
+  const expect = inputImages(screenState(s));   // 图片条上此刻显示的编号：与屏幕不一致时后端一个键都不按
+  if (!expect.includes(n)) return;
+  runImageOp(s, 'remove', n, () => api.post(sp(s, '/image/remove'), { n, expect })).then((r) => {
+    const m = imgThumbs.get(s.sid);
+    const t = m && m.get(n);
+    if (t) { if (t.url) URL.revokeObjectURL(t.url); m.delete(n); }
+    if (r && r.warning) toast(r.warning, 'warn', 8000);
+    scheduleUI();
+  }, (e) => toast('删除图片失败：' + e.message, 'error', 8000));
+}
+
+/** 点图片条上的缩略图：用灯箱放大（图片条上有缩略图的几张可以 ←/→ 切换） */
+function openTrayImage(n) {
+  const s = liveSession();
+  if (!s) return;
+  const m = imgThumbs.get(s.sid);
+  const { list, index } = lightboxList(imageTray.model, n, (c) => {
+    const t = m && m.get(c.n);
+    return t && t.path ? { s, path: t.path } : {};
+  });
+  if (list.length) openLightbox(list, index);
+}
+
+/** 拖入的图片：经后端只读通道取回文件做缩略图（带 token 头；只读该会话刚拖入并校验过的那个文件） */
+async function loadDropThumb(s, n, token) {
+  const m = thumbsOf(s);
+  const fail = () => { const t = m.get(n); if (t && t.token === token) { t.loading = false; t.failed = true; scheduleUI(); } };
+  try {
+    const res = await fetch(sp(s, '/image/file/' + encodeURIComponent(token)), { headers: api.headers(), credentials: CREDENTIALS, cache: 'no-store' });
+    if (!res.ok) { fail(); return; }
+    const blob = await res.blob();
+    if (!/^image\/(png|jpeg|gif|webp)$/.test(blob.type)) { fail(); return; }
+    const t = m.get(n);
+    if (!t || t.token !== token) return;   // 期间已被删掉 / 换了
+    t.url = URL.createObjectURL(blob);
+    t.loading = false;
+    scheduleUI();
+  } catch (_) { fail(); }
+}
+
+/** 图片条「清除」：claude 输入框里只有图片时在终端里按 Ctrl+U（后端带 guard；只由这次点击触发） */
+function clearImages() {
+  const s = liveSession();
+  if (!s) return;
+  runImageOp(s, 'clear', 0, () => api.post(sp(s, '/image/clear'))).catch((e) => toast('清除图片失败：' + e.message, 'error'));
+}
+
+/** 拖放：全局拦掉文件拖放（否则浏览器 / WKWebView 会把文件当成导航打开）；原生窗口交来的路径见 ccr-native-* 事件 */
+function bindImageDrop() {
+  const main = document.querySelector('.main');
+  if (main && !dropOverlay.el.isConnected) main.appendChild(dropOverlay.el);
+  let depth = 0;
+  window.addEventListener('dragenter', (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    depth++;
+    dropOverlay.show(dropHint({ native: false }));
+  });
+  window.addEventListener('dragleave', (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    depth = Math.max(0, depth - 1);
+    if (!depth) dropOverlay.hide();
+  });
+  window.addEventListener('dragover', (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'none';
+  });
+  window.addEventListener('drop', (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    depth = 0;
+    dropOverlay.hide();
+    // 能走到这里 = 没有路径（浏览器；或原生窗口里从网页拖来的图片、只有文件承诺的拖动）
+    toast(NATIVE_APP ? '拿不到这个文件的路径（例如从网页拖来的图片）：可以复制图片后在输入框里按 ⌘V'
+      : '浏览器里拿不到文件路径：截图请在输入框里按 ⌘V 粘贴（截屏时加按 Control 会直接存进剪贴板），或在 CC Remote Chat 原生窗口里拖入', 'warn', 8000);
+  });
+  // 原生窗口（tools/macapp/main.swift 的 CCRWebView）：拖入的是本机文件 → 带路径的事件，页面收不到 DOM 的拖放事件
+  window.addEventListener('ccr-native-drag', (e) => {
+    const d = (e && e.detail) || {};
+    if (d.phase === 'leave') { dropOverlay.hide(); return; }
+    dropOverlay.show(dropHint({ native: true, paths: d.paths, sess: imageSess(liveSession()) }));
+  });
+  window.addEventListener('ccr-native-drop', (e) => {
+    dropOverlay.hide();
+    onNativeDrop(((e && e.detail) || {}).paths);
+  });
+}
+
+/** 原生窗口拖入的本机文件：图片 → 粘贴路径进 claude 输入框（claude 变成 [Image #N]）；其它文件 → 路径插入输入框 */
+function onNativeDrop(paths) {
+  const s = liveSession();
+  const sp2 = splitDropPaths(paths);
+  const why = imageBlocked(imageSess(s), 'drop');
+  if (why) { toast(why, 'warn', 6000); return; }
+  if (sp2.others.length) {
+    const ta = $('input');
+    if (!ta.disabled) {
+      const r = insertPaths(ta.value, ta.selectionStart, ta.selectionEnd, sp2.others);
+      ta.value = r.value;
+      const d = currentDraft();
+      if (d) { d.text = r.value; if (d.nav) d.nav.reset(); }
+      ta.focus();
+      ta.setSelectionRange(r.caret, r.caret);
+      autosize();
+    }
+  }
+  if (!sp2.images.length) return;
+  if (sp2.images.length > 10) { toast('一次最多拖入 10 张图片', 'warn'); return; }
+  const names = sp2.images.map((p) => p.slice(p.lastIndexOf('/') + 1));
+  runImageOp(s, 'paths', sp2.images.length, () => api.post(sp(s, '/image/paths'), { paths: sp2.images })).then((r) => {
+    const added = (r && Array.isArray(r.added)) ? r.added : [];
+    const files = (r && r.files && typeof r.files === 'object') ? r.files : {};
+    added.forEach((n, k) => {
+      const token = typeof files[String(n)] === 'string' ? files[String(n)] : '';
+      if (!names[k]) return;
+      thumbsOf(s).set(n, { url: '', name: names[k], kind: 'drop', token, path: sp2.images[k], loading: !!token && !REMOTE, at: Date.now() });
+      if (token && !REMOTE) loadDropThumb(s, n, token);
+    });
+    scheduleUI();
+  }, (err) => toast('拖入图片失败：' + err.message, 'error', 8000));
+}
+
 async function send() {
   const s = liveSession();
   if (!s) return;
   const ta = $('input');
   const d = currentDraft();
+  // 图片操作（⌘V / 拖入）还在进行：先等它结束并取一帧最新屏幕，这样刚粘的图片会一起发出（等待期间再按回车不重复发）
+  const op = imgOps.get(s.sid);
+  if (op) {
+    if (sendWaitImg) return;
+    sendWaitImg = true;
+    try { await op.promise; await refreshScreen(s); } catch (e) { /* 失败已提示 */ } finally { sendWaitImg = false; }
+    if (liveSession() !== s) return;
+  }
   const text = ta.value;
-  if (!text.trim()) return;
+  const imgs = inputImages(screenState(s));
+  if (!text.trim() && !imgs.length) return;
   if (isDead(s.meta)) { toast('会话已退出，请先点击“重连”', 'warn'); return; }
   if (currentDialog(s)) { toast('请先处理上方对话框', 'warn'); return; }
   ta.value = '';
@@ -1575,10 +1833,11 @@ async function send() {
   // 发送前就记成“待出现”（等粘贴确认的一两秒里按 ↑ 也能翻到）；发送失败再撤回
   const pend = sentPending.get(s.sid) || [];
   addPending(pend, text, promptsFromItems(s.items).length);
-  const mine = pend[pend.length - 1];
+  const mine = text.trim() ? pend[pend.length - 1] : null;   // 只有图片的消息不进 ↑/↓ 历史
   if (pend.length) sentPending.set(s.sid, pend);
   try {
-    await withClearRetry((extra) => api.post(sp(s, '/message'), { text, ...extra }));
+    // expect_images：此刻图片条上显示的图片（可以是空数组）；后端核对屏幕，不一致就不发（不发用户没看到的图片）；只有图片也能发
+    await withClearRetry((extra) => api.post(sp(s, '/message'), { text, expect_images: imgs, ...extra }));
   } catch (e) {
     const cur = sentPending.get(s.sid);
     const k = cur && mine ? cur.indexOf(mine) : -1;

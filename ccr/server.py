@@ -211,6 +211,8 @@ class CCRServer:
         self.port = self.httpd.server_address[1]
         self.allowed_hosts = {"127.0.0.1:%d" % self.port, "localhost:%d" % self.port}
         self.allowed_origins = {"http://" + h for h in self.allowed_hosts}
+        # 私有版的手机远程访问（ccr/remote_access.py 起的第二个监听口）；没有时 None，本机口行为不变
+        self.remote_access = None
 
     # -- 生命周期 ------------------------------------------------------------
     def _bind(self, port: int, tries: int) -> _HTTPServer:
@@ -364,6 +366,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def app(self) -> CCRServer:
         return self.server.ccr  # type: ignore[attr-defined]
 
+    @property
+    def remote(self):
+        """来自手机远程口（ccr/remote_access.py 的第二个监听口）→ RemoteAccess；本机口 → None。"""
+        return getattr(self.server, "ccr_remote", None)
+
     def log_message(self, fmt, *args):  # 不记录查询串
         try:
             path = urllib.parse.urlsplit(self.path).path
@@ -466,11 +473,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # -- 安全检查 ------------------------------------------------------------
     def _check_host(self):
         host = (self.headers.get("Host") or "").strip().lower()
+        ra = self.remote
+        if ra is not None:
+            if host not in ra.allowed_hosts:
+                raise ApiError(403, "Host 不被允许")
+            return
         if host not in self.app.allowed_hosts:
             raise ApiError(403, "Host 不被允许（仅限 127.0.0.1/localhost 本机访问）")
 
     def _check_origin(self):
         """有 Origin 必须同源；有 Sec-Fetch-Site 且不是 same-origin/none 一律拒绝（含 GET）。"""
+        if self.remote is not None:
+            return self.remote.check_origin(self)
         origin = self.headers.get("Origin")
         if origin is not None:
             origin = origin.strip().lower()
@@ -482,7 +496,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             raise ApiError(403, "跨站请求被拒绝")
 
     def _require_token(self):
-        """只认 X-CCR-Token 请求头（不接受 Cookie）。"""
+        """只认 X-CCR-Token 请求头（不接受 Cookie）。远程口认设备 token（self.device = 设备公开信息）。"""
+        if self.remote is not None:
+            self.device = self.remote.authenticate(self)
+            return
         if not self.app.check_token(self.headers.get(TOKEN_HEADER)):
             raise ApiError(401, UNAUTH_MSG)
 
@@ -531,6 +548,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # -- 路由 ----------------------------------------------------------------
     def _handle(self, method: str):
         self._body_consumed = True
+        self.device = None   # 远程口：本次请求的设备（keep-alive 复用处理器，每个请求重新认证）
         if method in ("POST", "PATCH", "PUT", "DELETE"):
             # 先标记：若在读取请求体前就出错，需要关闭连接
             self._body_consumed = not (self.headers.get("Content-Length") not in (None, "", "0")
@@ -548,14 +566,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         is_api = path.startswith("/api/") or path == "/api"
         if is_api:
             if path == "/api/login":
+                if self.remote is not None:   # 窗口登录码只给本机窗口
+                    raise ApiError(404, "接口不存在")
                 if method != "POST":
                     raise ApiError(405, "不支持的方法")
                 return self._login()
+            if path == "/api/remote/pair" and self.remote is not None:
+                if method != "POST":
+                    raise ApiError(405, "不支持的方法")
+                return self.remote.api_pair(self)
             self._require_token()
             self._route_api(method, path, query)
             return
         if method != "GET":
             raise ApiError(405, "不支持的方法")
+        if path == "/manifest.webmanifest" and self.remote is not None:   # 手机主屏 Web App（只在远程口）
+            return self._send_bytes(200, _json_bytes(self.remote.manifest()), "application/manifest+json; charset=utf-8")
         if path.startswith("/fixtures/"):
             if self.app.fixtures_dir is None:  # 仅 --dev 启用
                 raise ApiError(404, "未找到")
@@ -578,6 +604,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             v = query.get(name)
             return v[0] if v else default
 
+        ra = self.remote
+        if ra is not None:
+            why = ra.forbidden(method, segs)
+            if why:
+                raise ApiError(403, why, "remote_forbidden")
+        if segs and segs[0] == "remote":
+            if app.remote_access is None:
+                raise ApiError(404, "接口不存在")
+            return app.remote_access.route(self, method, segs[1:], getattr(self, "device", None) if ra else None)
+
         if segs and segs[0] == "update" and app.updater is not None:
             return self._update_route(method, segs[1:])
 
@@ -599,6 +635,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 }
                 if app.updater is not None:
                     boot["update"] = app.updater.status()
+                if ra is not None:
+                    boot["remote"] = ra.bootstrap_info(getattr(self, "device", None))
+                elif app.remote_access is not None:
+                    boot["remote_access"] = True
                 return self._send_json(200, boot)
             if segs == ["stream"]:
                 return self._sse(q("since"), q("instance"))
@@ -624,6 +664,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(200, {"events": evs, "truncated": bool(truncated)})
             if len(segs) == 4 and segs[0] == "sessions" and segs[2] == "blob":
                 return self._blob(self._sid(segs[1]), segs[3])
+            if len(segs) == 5 and segs[0] == "sessions" and segs[2:4] == ["image", "file"]:
+                return self._drop_image(self._sid(segs[1]), segs[4])
             if len(segs) == 4 and segs[0] == "sessions" and segs[2:] == ["local", "info"]:
                 sid = self._sid(segs[1])
                 return self._send_json(200, self._call(self._local_info, sid, {}))
@@ -695,6 +737,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     "send_now": lambda sd, _b: self.app.manager.send_now(sd),
                     "seen": self._act_seen,
                     "unseen": lambda sd, _b: self.app.manager.mark_unseen(sd),
+                    # 发图片（SPEC §4.2「图片」）：⌘V 截图 → claude 自己的 Ctrl+V；原生窗口拖入 → 粘贴图片路径；清除 = Ctrl+U
+                    "image/paste": lambda sd, _b: self.app.manager.paste_image(sd),
+                    "image/paths": self._act_image_paths,
+                    "image/clear": lambda sd, _b: self.app.manager.clear_images(sd),
+                    "image/remove": self._act_image_remove,   # 图片条上某张的 ×：只删这一张（光标定位 + 退格）
                 }.get(action)
                 if handler is None:
                     raise ApiError(404, "接口不存在")
@@ -751,6 +798,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             ctype, data = hit
         self._send_bytes(200, data, ctype, [("Content-Security-Policy", "default-src 'none'; sandbox")],
                          cache="private, max-age=86400, immutable")
+
+    def _drop_image(self, sid: str, token: str):
+        """GET /api/sessions/<sid>/image/file/<token>：拖入的图片（图片条缩略图 / 灯箱）。只读该会话 attach_paths
+        登记过的那个文件（SessionManager.read_drop_image）；不缓存、按文件头给 Content-Type + nosniff + 沙箱 CSP。"""
+        fn = getattr(self.app.manager, "read_drop_image", None)
+        if not callable(fn):
+            raise ApiError(404, "接口不存在")
+        ctype, data = self._call(lambda sd, _b: fn(sd, token), sid, {})
+        self._send_bytes(200, data, ctype, [("Content-Security-Policy", "default-src 'none'; sandbox"),
+                                            ("Content-Disposition", "inline")], cache="no-store")
 
     def _local_meta(self, sid: str) -> dict:
         meta = self.app.manager.get_meta(sid)
@@ -960,15 +1017,37 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             text = ""
         if not isinstance(text, str):
             raise ApiError(400, "text 必须是字符串")
-        if body.get("images"):
-            raise ApiError(400, "交互模式暂不支持图片附件")
-        if not text.strip():
+        if body.get("images"):   # v1 的"随消息上传图片"：交互模式不支持（图片走 claude 自己的 Ctrl+V / 粘贴图片路径）
+            raise ApiError(400, "不支持随消息上传图片（本机会话请在输入框里 ⌘V 粘贴截图，或在原生窗口里把图片拖进来）")
+        kw = {}
+        exp = body.get("expect_images")
+        if exp is not None:   # 前端此刻显示的"claude 输入框里的图片"编号；只有图片、没有文字时也能发
+            if not isinstance(exp, list) or len(exp) > 50 or not all(
+                    isinstance(i, int) and not isinstance(i, bool) for i in exp):
+                raise ApiError(400, "expect_images 必须是图片编号数组")
+            kw["expect_images"] = list(exp)
+        if not text.strip() and not exp:
             raise ApiError(400, "消息不能为空")
         if len(text) > MAX_TEXT:
             raise ApiError(400, "消息过长（最多 %d 字符）" % MAX_TEXT)
         if "\x00" in text:
             raise ApiError(400, "消息不能包含 NUL 字符")
-        return self.app.manager.send_message(sid, text, clear_input=_opt_bool(body, "clear_input"))
+        return self.app.manager.send_message(sid, text, clear_input=_opt_bool(body, "clear_input"), **kw)
+
+    def _act_image_remove(self, sid: str, body: dict):
+        n, exp = body.get("n"), body.get("expect")
+        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n < 10 ** 6:
+            raise ApiError(400, "n 必须是图片编号")
+        if not isinstance(exp, list) or len(exp) > 50 or not all(
+                isinstance(i, int) and not isinstance(i, bool) and 0 <= i < 10 ** 6 for i in exp):
+            raise ApiError(400, "expect 必须是图片编号数组")
+        return self.app.manager.remove_image(sid, n, list(exp))
+
+    def _act_image_paths(self, sid: str, body: dict):
+        paths = body.get("paths")
+        if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
+            raise ApiError(400, "paths 必须是非空字符串数组")
+        return self.app.manager.attach_paths(sid, list(paths))
 
     def _act_keys(self, sid: str, body: dict):
         keys = body.get("keys")
@@ -1322,6 +1401,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             raise ApiError(404, "未找到") from None
         ctype = CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        if self.remote is not None and rel == "index.html":
+            data = self.remote.patch_index(data)
         extra = []
         if ctype.startswith("text/html"):
             extra.append(("Content-Security-Policy", CSP))

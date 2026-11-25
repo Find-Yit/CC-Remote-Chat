@@ -176,6 +176,9 @@ export function parseScreen(text) {
     const inp = lines.slice(lo + 1, hi);
     const first = (inp[0] || '').replace(/^❯[  ]?/, '');
     res.input = { visible: true, text: [first, ...inp.slice(1).map((l) => l.replace(/^ {2}/, ''))].join('\n').trimEnd() };
+    // 输入框里的图片占位（与 ccr/tui_parse.py 的 split_input_images 一致：有才给 images）
+    const imgs = [...res.input.text.matchAll(/\[Image #(\d{1,6})\]/g)].map((m) => Number(m[1]));
+    if (imgs.length) res.input.images = imgs;
     footer = lines.slice(hi + 1);
     content = lines.slice(0, lo);
   } else {
@@ -214,6 +217,7 @@ export function parseScreen(text) {
   if (echo >= 0) {
     let j = echo + 1;
     while (j < content.length && content[j].startsWith('  ') && content[j].trim() && !content[j].trim().startsWith('⎿')) j++;
+    while (j < content.length && /^\s+⎿\s+\[Image #\d{1,6}\]\s*$/.test(content[j])) j++;   // 带图片的回显（与 tui_parse 一致）
     body = content.slice(j); base = j;
   } else { body = res.busy ? content : []; base = 0; }
   const kept = [];

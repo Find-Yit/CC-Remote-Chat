@@ -43,6 +43,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from ccr import config as ccr_config  # noqa: E402
 
+try:  # 手机远程访问：私有版才有这个模块（export-ignore，开源版里没有 → 整个功能不存在）
+    from ccr import remote_access as ccr_remote_access  # noqa: E402
+except ImportError:  # pragma: no cover
+    ccr_remote_access = None
+
 log = logging.getLogger("ccr.app")
 
 
@@ -311,6 +316,9 @@ def main(argv=None) -> int:
     # 例如 probe=2,connect=6,keeper=3,boot=4,unreachable=777777（boot = 假 claude 出第一帧前的等待；
     # unreachable = 这些 fake 作业"连不上"，多个用 + 分隔）
     ap.add_argument("--fake-delays", default=None, help=argparse.SUPPRESS)
+    if ccr_remote_access is not None:
+        ap.add_argument("--remote-pair", action="store_true",
+                        help="手机远程访问：生成一个配对码并打印（10 分钟内有效，只能用一次）")
     args = ap.parse_args(argv)
 
     if args.data_dir is None:
@@ -318,6 +326,8 @@ def main(argv=None) -> int:
     data_dir = pathlib.Path(os.path.expanduser(args.data_dir)).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(data_dir, 0o700)
+    if getattr(args, "remote_pair", False):
+        return ccr_remote_access.cli_pair(data_dir)
 
     cfg_path = data_dir / "config.json"
     if args.jobid is not None and not args.stop:
@@ -450,6 +460,12 @@ def main(argv=None) -> int:
         return 1
 
     server.start()
+    remote = None
+    if ccr_remote_access is not None:   # 只有 <data>/remote.json 开启时才起第二个监听口；失败不影响本机口
+        try:
+            remote = ccr_remote_access.start_from_config(server, data_dir)
+        except Exception:  # noqa
+            log.exception("手机远程访问启动失败，已跳过")
     if updater is not None:
         updater.on_change = server.notify_update_changed
         updater.start()
@@ -477,6 +493,8 @@ def main(argv=None) -> int:
         log.info("正在退出：断开与计算节点的连接（远端 claude 保持运行）…")
         if updater is not None:
             updater.stop()
+        if remote is not None:
+            remote.shutdown()
         server.shutdown()
         try:
             manager.shutdown()

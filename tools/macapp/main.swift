@@ -434,6 +434,82 @@ func bundledErrorPageHTML(reason: String, cfg: LaunchConfig) -> String {
     """
 }
 
+// MARK: - 拖入文件（SPEC §7「图片」、§14.6）
+// 终端里把文件拖进去 = 终端把文件路径作为一次粘贴送给 claude（claude 自己把图片路径变成 [Image #N]）。WKWebView 自己处理
+// 拖放时网页只拿得到文件内容、拿不到路径，所以这里截下"带本机文件 URL 的拖动"（Finder 里的文件、截屏后右下角的浮动
+// 缩略图），把路径以 `ccr-native-drag`（phase: enter / leave）/ `ccr-native-drop` 事件交给页面；页面按当前会话决定：
+// 本机会话的图片 → 后端粘贴路径进 claude 输入框，其它文件 → 路径插进输入框，服务器会话 → 提示。转义（终端拖放的写法）
+// 在页面 / 后端做（static/attach.js、ccr/attach.py，有单测）。只在显示本应用页面时截；没有文件 URL 的拖动（页面里拖文字、
+// 从浏览器拖来的网页图片等）一律照常交给 WebKit。本类不读写剪贴板（拖动用的是单独的拖动粘贴板），也不读文件内容。
+// BEGIN ccr-drop-script（tests/test_native_drop.py 抽出这段单独编译，用 JavaScriptCore 核对路径原样到达页面）
+/// 交给页面的事件脚本：JSON 由 JSONSerialization 生成（路径里的引号、反斜杠、换行、</script> 都只是字符串内容），不拼接 HTML。
+/// phase 只能是 enter / leave / drop。
+func ccrDropEventScript(_ phase: String, _ paths: [String]) -> String? {
+    guard ["enter", "leave", "drop"].contains(phase) else { return nil }
+    let detail: [String: Any] = ["phase": phase, "paths": paths]
+    guard let data = try? JSONSerialization.data(withJSONObject: detail),
+          let json = String(data: data, encoding: .utf8) else { return nil }
+    let name = phase == "drop" ? "ccr-native-drop" : "ccr-native-drag"
+    return "window.dispatchEvent(new CustomEvent('\(name)', { detail: \(json) }));"
+}
+// END ccr-drop-script
+
+final class CCRWebView: WKWebView {
+    static let maxDropFiles = 20
+    var acceptsFileDrops: () -> Bool = { false }
+    private var fileDrag = false   // 当前这次拖动由本类处理（WebKit 完全不知道它）
+
+    /// 拖动粘贴板上的本机文件 URL（最多 maxDropFiles 个）
+    static func fileURLs(_ pb: NSPasteboard) -> [URL] {
+        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        let urls = (pb.readObjects(forClasses: [NSURL.self], options: opts) as? [URL]) ?? []
+        return Array(urls.filter { $0.isFileURL }.prefix(maxDropFiles))
+    }
+
+    private func notify(_ phase: String, _ urls: [URL]) {
+        guard let js = ccrDropEventScript(phase, urls.map { $0.path }) else { return }
+        evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let urls = Self.fileURLs(sender.draggingPasteboard)
+        if !urls.isEmpty && acceptsFileDrops() {
+            fileDrag = true
+            notify("enter", urls)
+            return .copy
+        }
+        fileDrag = false
+        return super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return fileDrag ? .copy : super.draggingUpdated(sender)
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        guard fileDrag else { return super.draggingExited(sender) }
+        fileDrag = false
+        notify("leave", [])
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        return fileDrag ? true : super.prepareForDragOperation(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard fileDrag else { return super.performDragOperation(sender) }
+        let urls = Self.fileURLs(sender.draggingPasteboard)
+        notify(urls.isEmpty ? "leave" : "drop", urls)
+        NativeLog.write("拖入 \(urls.count) 个文件（路径已交给页面）")
+        return !urls.isEmpty
+    }
+
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        guard fileDrag else { return super.concludeDragOperation(sender) }
+        fileDrag = false
+    }
+}
+
 // MARK: - 应用
 
 @MainActor
@@ -521,7 +597,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
                                        in: .defaultClient))
         ucc.add(self, contentWorld: .defaultClient, name: "ccrNative")
 
-        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 820), configuration: conf)
+        let wv = CCRWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 820), configuration: conf)
+        // 拖入文件：只在显示本应用页面时把路径交给页面（错误页 / 连接中页面照常交给 WebKit，file: 导航会被下面的策略拦掉）
+        wv.acceptsFileDrops = { [weak self] in self?.pageState == .app }
+        webView = wv
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false

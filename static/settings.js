@@ -9,6 +9,9 @@ import { BASE_URL_RE, setDefaultBaseUrl, loadUsage } from './apikeys.js';
 // dmg 版自动更新：app.js 在后端开启了自动更新时调用（之后设置弹窗多一节「更新」）；没调用时与以前完全相同
 let updateStore = null;
 export function setUpdateStore(store) { updateStore = store || null; }
+// 额外的一节（私有版的手机远程访问）：fn(api) → { el, dispose }；没设置时与以前完全相同
+let extraSection = null;
+export function setExtraSection(fn) { extraSection = typeof fn === 'function' ? fn : null; }
 
 export function settingsDialog(api, { config, onSaved }) {
   const update = updateStore;
@@ -116,7 +119,10 @@ export function settingsDialog(api, { config, onSaved }) {
     // dmg 版自动更新（只有后端开启时 update 才不为 null）
     const upd = update ? updateSettingsField(api, update, { onError: (e) => toast('操作失败：' + e.message, 'error') }) : null;
     if (upd) body.appendChild(upd.el);
-    const dlg = modal({ title: '设置', body, actions: [done], onClose: () => { if (upd) upd.dispose(); resolve(cfg); } });
+    const extra = extraSection ? extraSection(api) : null;
+    if (extra) body.appendChild(extra.el);
+    if (extra && extra.hideTest) test.hidden = true;
+    const dlg = modal({ title: '设置', body, actions: [done], onClose: () => { if (upd) upd.dispose(); if (extra) extra.dispose(); resolve(cfg); } });
     syncDisabled();
     api.get('/api/notify').then((info) => {
       const names = Array.isArray(info.sounds) ? info.sounds : [];

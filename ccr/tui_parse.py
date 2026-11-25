@@ -62,6 +62,133 @@ HINT_SEND_NOW_RE = re.compile(r"^\s*(?:⎿\s+)?(?:Queued\s+·\s+)?ctrl\+x\s+ctrl
 _QUEUED_RE = re.compile(r"^\s+⎿\s+Queued\b")
 # 排队时输入框里的占位文字（不是用户输入的内容）
 QUEUED_PLACEHOLDER = "Press up to edit queued messages"
+# 输入框里的图片占位（CLI 2.1.332 真机实测，fixtures/image_paste/）：粘贴一个图片路径（= 终端里拖入文件）或按 Ctrl+V
+# 读剪贴板图片后，输入框显示 "[Image #N]"（N 在整个 claude 进程里递增，不随消息重置）；连续两张之间 CLI 自己补一个空格；
+# 提交后回显 "❯ [Image #1] 文字" 下面每张一行 "  ⎿  [Image #1]"。
+IMAGE_TOKEN_RE = re.compile(r"\[Image #(\d{1,6})\]")
+_ECHO_IMAGE_RE = re.compile(r"^\s+⎿\s+\[Image #\d{1,6}\]\s*$")
+
+
+def split_input_images(text: Optional[str]) -> Tuple[List[int], str]:
+    """输入框文字 → ([图片编号…], 去掉所有 "[Image #N]" 后的其余文字（首尾空白去掉）)。"""
+    t = text or ""
+    ids = [int(m.group(1)) for m in IMAGE_TOKEN_RE.finditer(t)]
+    rest = IMAGE_TOKEN_RE.sub(" ", t).strip() if ids else t.strip()
+    return ids, rest
+
+
+# 输入框里的光标（删除单张图片用，SPEC §4.2「图片」；CLI 2.1.332 真机实测）：CLI 把终端的硬件光标停在输入框的插入点上
+# （光标是隐藏的，但位置准确：tmux 的 #{cursor_x} #{cursor_y} 读得到，中文两列宽、多行输入都对得上）。
+# ← / → 在 "[Image #N]" 上整块跳过、其余字符一步一个，行首按 ← 到上一行行尾；退格整块删掉光标前的 "[Image #N]"，
+# 两边的空格都留着；编号不重排。光标的屏幕坐标要配 **不带 -J** 的 capture-pane（行号 = 终端行号）。
+# **与 node_agent.caret_view 逐字一致**（agent 按同一规则就地复核 guard.cursor_image / cursor_space）。
+INPUT_PREFIX_CELLS = 2      # 输入框每行开头的 "❯ " / "  "
+# ← / → 的一步：图片占位（实测整块）与 "[Pasted text #N …]" 都按 1 步算（少算只会少走、再读屏补走，绝不多走）
+_CARET_TOKEN_RE = re.compile(r"\[Image #\d{1,6}\]|\[Pasted text #\d{1,6}[^\]\n]{0,40}\]|.", re.S)
+
+
+def _cells_to_index(s: str, cells: int) -> Optional[int]:
+    """显示列 → 字符下标（落在宽字符中间 → None；超出文字 → None）。"""
+    w = 0
+    for i, ch in enumerate(s):
+        if w == cells:
+            return i
+        w += _cell_width(ch)
+        if w > cells:
+            return None
+    return len(s) if w == cells else None
+
+
+def _input_body(row: str) -> str:
+    """输入框一行去掉开头 2 列的 "❯ " / "  "。"""
+    i = _cells_to_index(row, INPUT_PREFIX_CELLS)
+    return row[i:] if i is not None else ""
+
+
+def input_caret(lines: List[str], cx, cy) -> Optional[Dict]:
+    """屏幕行（screen_lines，行号 = 终端行号）+ 终端光标 (cx, cy) → 光标在 claude 输入框里的位置：
+    {"box": (上横线, 下横线), "row": 输入框内第几行（0 起）, "rows": 输入框行数, "col": 本行文字里的第几列,
+     "before": 本行光标前的输入文字, "after": 本行光标后的输入文字}；光标不在输入框的文字区里 → None。
+    行尾 rstrip 掉的空格：光标在文字之后几列 → before 末尾补同样多的空格（那一定是真的空格：光标只停在文字位置上）。"""
+    if isinstance(cx, bool) or isinstance(cy, bool) or not isinstance(cx, int) or not isinstance(cy, int):
+        return None
+    box = _find_input_box(lines)
+    if box is None:
+        return None
+    lo, hi = box
+    if not lo < cy < hi or cx < INPUT_PREFIX_CELLS:
+        return None
+    body = _input_body(lines[cy])
+    col = cx - INPUT_PREFIX_CELLS
+    w = sum(_cell_width(ch) for ch in body)
+    if col >= w:
+        before, after = body + " " * (col - w), ""
+    else:
+        i = _cells_to_index(body, col)
+        if i is None:
+            return None
+        before, after = body[:i], body[i:]
+    return {"box": box, "row": cy - lo - 1, "rows": hi - lo - 1, "col": col, "before": before, "after": after}
+
+
+def input_image_cells(lines: List[str], n: int) -> List[Tuple[int, int]]:
+    """输入框里每个 "[Image #n]" 后面那一格的终端坐标 (cx, cy)（光标停在这里按退格 = 删掉这一张）。"""
+    box = _find_input_box(lines)
+    if box is None:
+        return []
+    out = []
+    for cy in range(box[0] + 1, box[1]):
+        body = _input_body(lines[cy])
+        for m in IMAGE_TOKEN_RE.finditer(body):
+            if int(m.group(1)) == n:
+                out.append((INPUT_PREFIX_CELLS + sum(_cell_width(ch) for ch in body[:m.end()]), cy))
+    return out
+
+
+def input_end_cell(lines: List[str]) -> Optional[Tuple[int, int]]:
+    """输入框最后一行文字之后那一格 (cx, cy)（rstrip 过：真有行尾空格时光标会比这里再靠右，不必再往右走）。"""
+    box = _find_input_box(lines)
+    if box is None:
+        return None
+    cy = box[1] - 1
+    return INPUT_PREFIX_CELLS + sum(_cell_width(ch) for ch in _input_body(lines[cy])), cy
+
+
+def _caret_steps(body: str, a: int, b: int) -> int:
+    """本行显示列 [a, b) 之间按 ← / → 要走几步（图片占位等整块算 1 步；按开头所在的列算，宁少勿多）。"""
+    if b <= a:
+        return 0
+    n, w = 0, 0
+    for m in _CARET_TOKEN_RE.finditer(body):
+        tw = sum(_cell_width(ch) for ch in m.group(0))
+        if w >= b:
+            break
+        if w >= a and w + tw <= b:
+            n += 1
+        w += tw
+    if w < b:   # 光标在行尾补的空格里（真有行尾空格）：每列一步
+        n += b - max(w, a)
+    return n
+
+
+def caret_moves(lines: List[str], cur: Tuple[int, int], tgt: Tuple[int, int], limit: int = 40) -> List[str]:
+    """从光标 cur 走到 tgt（都是终端坐标 (cx, cy)、都在输入框里）的一批 ← / →（最多 limit 个）。
+    同一行：按步数精确走；不同行：先走到本行行首 / 行尾再多一步跨行，下一轮读屏再接着走。
+    宁少勿多：→ 绝不会越过 tgt（输入框末尾按 → 可能另有含义，不能多按）；走不动（[] ）由调用方判定失败。"""
+    (cx, cy), (tx, ty) = cur, tgt
+    if (cx, cy) == (tx, ty):
+        return []
+    body = _input_body(lines[cy]) if 0 <= cy < len(lines) else ""
+    a, t = cx - INPUT_PREFIX_CELLS, tx - INPUT_PREFIX_CELLS
+    if cy == ty:
+        n = _caret_steps(body, t, a) if t < a else _caret_steps(body, a, t)
+        key = "Left" if t < a else "Right"
+    elif ty < cy:
+        n, key = _caret_steps(body, 0, a) + 1, "Left"
+    else:
+        w = sum(_cell_width(ch) for ch in body)
+        n, key = _caret_steps(body, a, max(a, w)) + 1, "Right"
+    return [key] * max(0, min(n, limit))
 # 底栏 "⏵⏵ auto mode on · 1 shell · esc to interrupt · ↓ to manage" / 结束行 "… · 1 shell still running"
 _SHELLS_RE = re.compile(r"(?<![\w.])(\d{1,3})\s+shells?\b")
 
@@ -656,6 +783,9 @@ def _parse_content(content: List[str], busy: bool, queued: Optional[List[Tuple[i
             echo.append(content[j].strip())
             j += 1
         out["echo"] = "\n".join(echo)
+        # 带图片的消息：回显下面每张图一行 "  ⎿  [Image #N]"（实测），属于回显，不进实时草稿
+        while j < len(content) and _ECHO_IMAGE_RE.match(content[j]):
+            j += 1
         body = content[j:]
         base = j
     else:
@@ -1021,6 +1151,9 @@ def parse_screen(text: str) -> Dict:
             res["input"] = {"visible": True, "text": "", "placeholder": itext}
         else:
             res["input"] = {"visible": True, "text": itext}
+            ids, _rest = split_input_images(itext)
+            if ids:   # 输入框里的图片（粘贴的图片路径 / Ctrl+V）：前端据此显示"claude 输入框里的图片"
+                res["input"]["images"] = ids
         footer = lines[hi + 1:]
         content = lines[:lo]
     else:

@@ -1,5 +1,6 @@
 // 对话框 / 弹出层 / 提示条（全部受控 DOM，基于原生 <dialog>）
 import { h, icon, spinner, basename } from './dom.js';
+import { REMOTE } from './api.js';
 import { apiKeySelect, SWITCH_COST_HINT } from './apikeys.js';
 import { initialPerm, savePerm, PERM_SKIP } from './launchprefs.js';
 
@@ -309,7 +310,7 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
     // 本机仍保留应用内浏览作为次要入口（小链接）。
     const browse = h('button', { class: 'btn ghost', type: 'button' }, icon('folder'), '浏览…');
     browse.addEventListener('click', async () => {
-      if (target === 'local') {
+      if (target === 'local' && !REMOTE) {   // 手机远程：弹不了 Mac 的对话框，本机目录也走应用内浏览
         browse.disabled = true;
         browse.replaceChildren(spinner(), ' 在 Finder 对话框中选择…');
         try {
@@ -331,7 +332,7 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
       if (p) cwd.value = p;
     });
     const renderBrowse = () => {
-      const local = target === 'local';
+      const local = target === 'local' && !REMOTE;
       browse.replaceChildren(icon('folder'), local ? '选择文件夹…' : '浏览…');
       browse.title = local ? '打开 macOS 自带的“选择文件夹”对话框（与 Finder 相同）' : '浏览登录节点上的目录';
       inApp.hidden = !local;

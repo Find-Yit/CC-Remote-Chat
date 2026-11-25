@@ -5,12 +5,21 @@
 export const TOKEN_KEY = 'ccr_token';
 export const TOKEN_HEADER = 'X-CCR-Token';
 
+// 手机远程访问（私有版，docs/REMOTE_ACCESS.md）：页面不是从 127.0.0.1 / localhost 打开的 = 经公网域名进来的远程口。
+//   - 设备 token 存 localStorage（Safari 被杀掉 / 主屏 App 重开后不用重新配对）；本机窗口仍用 sessionStorage、逐字不变。
+//   - 远程口前面有 Caddy 暗门 cookie，所以请求要带同源 cookie；后端本身仍然只认 X-CCR-Token 头、不看 cookie。
+export const REMOTE = typeof location !== 'undefined' && !['127.0.0.1', 'localhost'].includes(location.hostname);
+export const CREDENTIALS = REMOTE ? 'same-origin' : 'omit';
+const DEVICE_TOKEN_KEY = 'ccr_device_token';
+const tokenKey = () => (REMOTE ? DEVICE_TOKEN_KEY : TOKEN_KEY);
+const tokenStore = () => (REMOTE ? localStorage : sessionStorage);
+
 export class ApiError extends Error {
   constructor(message, status, code = '') { super(message); this.status = status; this.code = code || ''; }
 }
 
 export function loadToken() {
-  try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch (_) { return ''; }
+  try { return tokenStore().getItem(tokenKey()) || ''; } catch (_) { return ''; }
 }
 
 /** 从 location.hash 取出一次性登录码，并立即把 hash 从地址栏/历史记录中清掉 */
@@ -35,8 +44,8 @@ export class Api {
   setToken(t) {
     this.token = t || '';
     try {
-      if (this.token) sessionStorage.setItem(TOKEN_KEY, this.token);
-      else sessionStorage.removeItem(TOKEN_KEY);
+      if (this.token) tokenStore().setItem(tokenKey(), this.token);
+      else tokenStore().removeItem(tokenKey());
     } catch (_) { /* 忽略 */ }
   }
 
@@ -55,7 +64,7 @@ export class Api {
   }
 
   async request(method, path, body, { auth = true } = {}) {
-    const opts = { method, headers: auth ? this.headers() : {}, credentials: 'omit', cache: 'no-store' };
+    const opts = { method, headers: auth ? this.headers() : {}, credentials: CREDENTIALS, cache: 'no-store' };
     if (body !== undefined) {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
@@ -64,7 +73,7 @@ export class Api {
     try {
       res = await fetch(path, opts);
     } catch (e) {
-      throw new ApiError('无法连接本地服务（应用可能已退出）', 0);
+      throw new ApiError(REMOTE ? '连不上 Mac（网络、隧道或 Mac 上的应用没在运行）' : '无法连接本地服务（应用可能已退出）', 0);
     }
     let data = null;
     const text = await res.text().catch(() => '');
@@ -92,6 +101,15 @@ export class Api {
     this.authLost = false;
     this.setToken(r.token);
     return r.token;
+  }
+
+  /** 手机远程访问：用 Mac 上生成的配对码换设备 token（不带 token 头）→ 设备信息 */
+  async pair(code, name) {
+    const r = await this.request('POST', '/api/remote/pair', { code, name }, { auth: false });
+    if (!r || typeof r.token !== 'string' || !r.token) throw new ApiError('配对失败：服务器未返回 token', 500);
+    this.authLost = false;
+    this.setToken(r.token);
+    return r.device || null;
   }
 
   bootstrap() { return this.get('/api/bootstrap'); }
@@ -206,7 +224,7 @@ export class EventStream {
     try {
       res = await fetch(this.url(), {
         method: 'GET', headers: this.api.headers({ Accept: 'text/event-stream' }),
-        credentials: 'omit', cache: 'no-store', signal: ctrl.signal,
+        credentials: CREDENTIALS, cache: 'no-store', signal: ctrl.signal,
       });
     } catch (_) {
       if (alive()) this.failed();

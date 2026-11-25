@@ -629,23 +629,66 @@ function onUser(s, e, ts) {
   }
   if (texts.length || images.length) {
     closeTurn(s);
-    addItem(s, 'user', { text: texts.join('\n\n'), imageBlocks: images, ts, truncated: !!e.truncated });
+    let text = texts.join('\n\n');
+    // 带图片的消息（⌘V / 拖入，SPEC §4.2「图片」）：CLI 把开头的 "[Image #1] [Image #2] " 占位也写进了文字，
+    // 图片本身已在气泡里显示，去掉这串占位（↑/↓ 历史、小格子预览、待出现消息的对账都按去掉后的文字）
+    if (images.length) text = text.replace(/^(?:\s*\[Image #\d+\])+\s*/, '');
+    addItem(s, 'user', { text, imageBlocks: images, ts, truncated: !!e.truncated });
   }
   return ended;
 }
 
-/** 回复中途被 CLI 吸收的通知（attachment / queued_command / commandMode=task-notification；CLI 2.1.332 实测不再另写
- *  user 条目，agent 只转发这一种 attachment）：与 user 条目形式的通知同样处理 */
+/** 回复中途被 CLI 吸收的排队命令（attachment / queued_command；CLI 2.1.330–2.1.332 实测这两种都**只**写成 attachment、
+ *  不另写 user 条目）：commandMode=task-notification → 与 user 条目形式的通知同样处理；commandMode=prompt → 用户在
+ *  回复进行中发出的消息（onQueuedPrompt） */
 function onAttachment(s, e, ts) {
   const a = e.attachment && typeof e.attachment === 'object' ? e.attachment : null;
   if (!a || a.type !== 'queued_command') return;
   const kind = a.origin && typeof a.origin === 'object' ? a.origin.kind : null;
+  if (a.commandMode === 'prompt' && kind !== 'task-notification') { onQueuedPrompt(s, a, kind, ts, !!e.truncated); return; }
   if (a.commandMode !== 'task-notification' && kind !== 'task-notification') return;
   const raw = typeof a.prompt === 'string' ? a.prompt : resultText(a.prompt);
   const note = parseTaskNotification(raw);
   if (note) { addSubnote(s, note, ts); return; }
   const text = stripReminders(raw).trim();
   if (text) addItem(s, 'hint', { level: 'info', text: '系统消息：' + truncate(text.split('\n')[0], 160), detail: text, ts });
+}
+
+const AGENT_MSG_RE = /^\s*<agent-message\b[^>]*>([\s\S]*?)(?:<\/agent-message>\s*)?$/;
+
+/** 回复进行中发出、被 CLI 在这一轮中途读到的消息（queued_command、commandMode=prompt）：
+ *  - 用户自己的（origin.kind = human 或缺省）→ 与普通用户消息一样的气泡，标「回复中发送」（midTurn：属于当前这一轮，
+ *    不结束本轮——不出「本轮改动」卡片、「改动」栏不另起一轮；↑/↓ 历史、左侧小格子、待出现对账照常把它当用户消息）；
+ *  - 来自其它会话的（peer，CLI 记为 isMeta、正文包在 <agent-message from=…> 里，不是用户打的字）→ 小系统行，可展开原文。
+ *  同一条命令（source_uuid）只显示一次：压缩后 CLI 会把 peer 交接消息原样再写一遍。 */
+function onQueuedPrompt(s, a, kind, ts, truncated) {
+  const src = typeof a.source_uuid === 'string' && a.source_uuid ? 'src:' + a.source_uuid : null;
+  if (src) {
+    if (s.entryIds.has(src)) return;
+    s.entryIds.add(src);
+  }
+  const blocks = typeof a.prompt === 'string' ? [{ type: 'text', text: a.prompt }] : Array.isArray(a.prompt) ? a.prompt : [];
+  const texts = [];
+  const images = [];
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'text') { const t = stripReminders(String(b.text || '')).trim(); if (t) texts.push(t); }
+    else if (b.type === 'image') images.push(b);
+  }
+  let text = texts.join('\n\n');
+  if (images.length) text = text.replace(/^(?:\s*\[Image #\d+\])+\s*/, '');   // 与 onUser 相同：图片已在气泡里显示
+  if (kind && kind !== 'human') {
+    if (!text) return;
+    const m = kind === 'peer' ? text.match(AGENT_MSG_RE) : null;
+    const body = (m ? m[1] : text).trim() || text;
+    const name = kind === 'peer' && a.origin && typeof a.origin.name === 'string' && a.origin.name.trim()
+      ? '「' + truncate(a.origin.name.trim(), 40) + '」' : '';
+    const label = kind === 'peer' ? '来自其它会话' + name + '：' : '系统消息：';
+    addItem(s, 'hint', { level: 'info', text: label + truncate(body.split('\n')[0], 160), detail: body, ts });
+    return;
+  }
+  if (!text && !images.length) return;
+  addItem(s, 'user', { text, imageBlocks: images, ts, truncated, midTurn: true });
 }
 
 /** 子代理结束通知：挂到对应 Agent 卡上（卡片状态/结果），并在时间线上留一条小系统行 */
@@ -1241,9 +1284,15 @@ function msgMeta(text, ts, cls, copyFirst) {
 }
 
 function renderUser(s, item, el, cls) {
+  if (item.midTurn) cls.push('mid-turn');
   el.className = cls.join(' ');
   if (item.ts) el.title = fmtTime(item.ts);
   const bubble = h('div', { class: 'bubble' });
+  if (item.midTurn) {
+    // 回复进行中发出、Claude 在这一轮中途读到的消息（transcript 里只是一条 queued_command 附件）
+    bubble.appendChild(h('div', { class: 'user-tag', title: 'Claude 回复进行中发出的消息：Claude Code 在这一轮中途读到了它，回复会接着往下进行' },
+      icon('clock'), '回复中发送'));
+  }
   if (item.imageBlocks && item.imageBlocks.length) {
     // 用户粘贴的图片：小图内联，大图是 ccr_ref 引用（按需加载）；点击打开灯箱
     const imgs = item.imageBlocks.map((b, k) => chatImage(s, b, { alt: '图片', name: '粘贴的图片 ' + (k + 1) }));

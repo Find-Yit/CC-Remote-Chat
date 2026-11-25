@@ -67,7 +67,9 @@ KEY_DIR_PARTS = (".cc-remote-chat", "keys")
 MAX_KEY_FILE = 4096
 # C-b：把正在运行的 Bash 命令转入后台（CLI 提示 "ctrl+b ctrl+b (twice)"：send-keys 不经过 tmux 前缀键，一次即可）；
 # C-x C-s：立即发送排队的消息（中断当前生成）。只由用户点击/和弦触发（§0.5）。
-KEYS = frozenset("Enter Escape Up Down Left Right Tab BTab BSpace Space C-c C-u C-b C-x C-s "
+# C-v：claude 自己的"粘贴剪贴板图片"（CLI 在 macOS 上自己读系统剪贴板，输入框出现 [Image #N]）。只在用户于本机会话的
+# 输入框里按 ⌘V 粘贴图片时由 session.paste_image 发送（本程序不读剪贴板；服务器会话不发：远端 claude 读不到这台 Mac 的剪贴板）。
+KEYS = frozenset("Enter Escape Up Down Left Right Tab BTab BSpace Space C-c C-u C-b C-x C-s C-v "
                  "1 2 3 4 5 6 7 8 9 s y n".split())
 SESSION_FIELDS = ("pid", "sessionId", "status", "cwd", "kind", "entrypoint")
 TRANSCRIPT_TYPES = ("user", "assistant", "system", "custom-title", "ai-title", "summary")   # 后三种只用来取会话标题
@@ -503,7 +505,8 @@ def _drop_tur_dups(tur):
 
 
 def refify_entry(d, ref_base):
-    """把条目里的大图片换成引用（message.content 的图片块、tool_result 内的图片块），并丢掉 toolUseResult 里的重复数据。"""
+    """把条目里的大图片换成引用（message.content 的图片块、tool_result 内的图片块、转发的 attachment 的 prompt 块），
+    并丢掉 toolUseResult 里的重复数据。"""
     msg = d.get("message")
     if isinstance(msg, dict) and isinstance(msg.get("content"), list):
         content = list(msg["content"])
@@ -525,6 +528,17 @@ def refify_entry(d, ref_base):
                 changed = True
         if changed:
             d = dict(d, message=dict(msg, content=content))
+    att = d.get("attachment") if d.get("type") == "attachment" else None
+    if isinstance(att, dict) and isinstance(att.get("prompt"), list):   # 回复中发送、带图片的消息（note_attachment）
+        blocks = list(att["prompt"])
+        changed = False
+        for i, b in enumerate(blocks[:MAX_REF_BLOCKS]):
+            nb = _ref_block(b, ref_base, (i,))
+            if nb is not None:
+                blocks[i] = nb
+                changed = True
+        if changed:
+            d = dict(d, attachment=dict(att, prompt=blocks))
     if "toolUseResult" in d:
         tur = _drop_tur_dups(d["toolUseResult"])
         if tur is not d["toolUseResult"]:
@@ -532,34 +546,74 @@ def refify_entry(d, ref_base):
     return d
 
 
+def _queued_prompt(prompt):
+    """queued_command 的 prompt（字符串；带图片时是 [文字块, 图片块…]）→ 字符串 / 块列表；没有内容返回 None。
+    块列表只保留 text（只留 text 字段）与 image（refify_entry 把大图换成引用），其它块换成只有 type 的占位：
+    下标与原行一一对应，图片引用的块路径（op_blob）据此回到原行的 attachment.prompt[i]。"""
+    if isinstance(prompt, str):
+        return prompt if prompt.strip() else None
+    if not isinstance(prompt, list):
+        return None
+    out = []
+    has = False
+    for b in prompt[:MAX_REF_BLOCKS]:
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+            out.append({"type": "text", "text": b["text"]})
+            has = has or bool(b["text"].strip())
+        elif isinstance(b, dict) and b.get("type") == "image":
+            out.append(b)
+            has = True
+        else:
+            t = b.get("type") if isinstance(b, dict) else None
+            out.append({"type": t[:32] if isinstance(t, str) else "unknown"})
+    return out if has else None
+
+
 def note_attachment(d):
-    """主 transcript 的 attachment 条目 → 精简版；只认 CLI 在回复中途吸收的子代理/后台任务通知
-    （`attachment.type == "queued_command"` 且 `commandMode` 或 `origin.kind` 为 task-notification，CLI 2.1.332 实测：
-    这种通知不再另写 user 条目），其它 attachment（环境、技能清单、排队的用户消息…）一律返回 None。
-    只保留 type/uuid/parentUuid/timestamp/isSidechain 与 attachment 的 type/commandMode/origin.kind/prompt。"""
+    """主 transcript 的 attachment 条目 → 精简版；只认 CLI 在回复中途吸收的排队命令（`attachment.type == "queued_command"`，
+    CLI 2.1.330–2.1.332 实测这两种都**只**写成 attachment、不另写 user 条目），其它 attachment（环境、技能清单…）返回 None：
+    - 子代理/后台任务通知：`commandMode` 或 `origin.kind` 为 task-notification（prompt 只取文字）；
+    - 用户在回复进行中发出的消息：`commandMode == "prompt"` 且 `origin.kind` 为 human / 缺省（CLI 自己标了 isMeta 的不转发），
+      或 peer（别的会话发来的，CLI 记为 isMeta，前端显示为系统行）；prompt 是字符串或 [文字块, 图片块…]。
+      带 `source_uuid`（≤64 字符）供前端去重：压缩后 CLI 会把 peer 交接消息原样再写一遍。
+    只保留 type/uuid/parentUuid/timestamp/isSidechain 与 attachment 的 type/commandMode/origin.kind(/name)/prompt(/source_uuid)。"""
     a = d.get("attachment")
     if not isinstance(a, dict) or a.get("type") != "queued_command":
         return None
     origin = a.get("origin") if isinstance(a.get("origin"), dict) else {}
     kind = origin.get("kind") if isinstance(origin.get("kind"), str) else None
-    if a.get("commandMode") != "task-notification" and kind != "task-notification":
-        return None
-    prompt = a.get("prompt")
-    if isinstance(prompt, list):   # 防御：内容块形式只取文字
-        prompt = "\n".join(str(b.get("text") or "") for b in prompt if isinstance(b, dict) and b.get("type") == "text")
-    if not isinstance(prompt, str) or not prompt.strip():
+    if a.get("commandMode") == "task-notification" or kind == "task-notification":
+        mode = "task-notification"
+        prompt = a.get("prompt")
+        if isinstance(prompt, list):   # 防御：内容块形式只取文字
+            prompt = "\n".join(str(b.get("text") or "") for b in prompt if isinstance(b, dict) and b.get("type") == "text")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+    elif a.get("commandMode") == "prompt" and kind in (None, "human", "peer"):
+        if a.get("isMeta") and kind != "peer":
+            return None
+        mode = "prompt"
+        prompt = _queued_prompt(a.get("prompt"))
+        if prompt is None:
+            return None
+    else:
         return None
     out = {k: d[k] for k in ("type", "uuid", "parentUuid", "timestamp", "isSidechain") if k in d}
-    att = {"type": "queued_command", "commandMode": "task-notification", "prompt": prompt}
+    att = {"type": "queued_command", "commandMode": mode, "prompt": prompt}
     if kind:
         att["origin"] = {"kind": kind[:64]}
+        if kind == "peer" and isinstance(origin.get("name"), str) and origin["name"].strip():
+            att["origin"]["name"] = origin["name"][:80]
+    su = a.get("source_uuid")
+    if mode == "prompt" and isinstance(su, str) and 0 < len(su) <= 64:
+        att["source_uuid"] = su
     out["attachment"] = att
     return out
 
 
 def filter_entry(line, types=TRANSCRIPT_TYPES, sidechain=False, max_bytes=None, ref=None):
     """解析一行 transcript；只保留 types 里的类型（主 transcript 另外跳过 isSidechain）。
-    主 transcript（types 为默认值）另外转发回复中途吸收的子代理通知（attachment，见 note_attachment）。
+    主 transcript（types 为默认值）另外转发回复中途吸收的子代理通知与用户消息（attachment，见 note_attachment）。
 
     给了 ref=(kind, 标识, 该行字节偏移) 时先把大图片换成引用（refify_entry），再截断：
     字符串字段超过 MAX_STR 截断并加 "truncated":true；给了 max_bytes 时（子代理），
@@ -1328,8 +1382,18 @@ def op_paste(p):
         raise OpError("文本过长（最多 %d 字符）" % MAX_PASTE)
     if "\x00" in text:
         raise OpError("文本不能包含 NUL")
+    guard = p.get("guard")   # 可选：粘贴前就地重抓屏复核（拖入图片路径时用：不往刚弹出的对话框里粘）
+    if guard is not None:
+        validate_guard(guard)
     if text == "" and not enter:
         return {}
+    if guard is not None:
+        rc, out, err = tmux(["capture-pane", "-p", "-J", "-t", target(sid)])
+        if rc != 0:
+            raise tmux_err(err, "读取屏幕")
+        why = check_guard(out, guard)
+        if why:
+            raise OpError("未粘贴：%s" % why, code="guard")
     if text:
         buf = "ccrp-" + sid
         rc, out, err = tmux(["load-buffer", "-b", buf, "-"], input_bytes=text.encode("utf-8", "surrogatepass"))
@@ -1358,7 +1422,20 @@ G_AGENT_ROW_RE = re.compile(r"^\s*(?:❯\s+)?[●◯○◉◐⏺]\s+\S")   # 与
 G_POPUP_RE = re.compile(r"^\s{2,4}(❯\s)?\s*(/[\w:.\-]+)(?:\s{2,}.*)?$")
 G_HINT_RE = re.compile(r"^\s{10,}\S")
 POPUP_CMD_RE = re.compile(r"/[\w:.\-]{1,64}\Z")
-GUARD_KEYS = ("lines", "input_box", "input_nonempty", "popup", "tail", "hint")
+GUARD_KEYS = ("lines", "input_box", "input_nonempty", "input_images_only", "popup", "tail", "hint",
+              "input_images", "cursor_image", "cursor_space")
+# guard.input_images_only：输入框里只有图片占位 "[Image #N]"（至少一个，没有别的文字）。与 ccr.tui_parse.IMAGE_TOKEN_RE 一致
+G_IMAGES_ONLY_RE = re.compile(r"\s*(?:\[Image #\d{1,6}\]\s*)+")
+G_IMAGE_RE = re.compile(r"\[Image #(\d{1,6})\]")
+# 删除单张图片（SPEC §4.2「图片」）用的 guard，都要求 input_box：
+#   input_images：输入框里的图片编号（按出现顺序）正好是这个列表；
+#   cursor_image：终端光标在输入框里、紧跟在 "[Image #N]" 后面（此时按退格 = 只删这一张，CLI 2.1.332 实测整块删除）；
+#   cursor_space：终端光标在输入框里、前一个字符是空格（删掉图片后多出来的空格）。
+# 光标位置 = tmux 的 #{cursor_x} #{cursor_y}（CLI 把隐藏的硬件光标停在输入框插入点上），配不带 -J 的 capture-pane
+# （行号 = 终端行号），两者在同一条 tmux 命令里取，见 capture_with_cursor。规则与 ccr.tui_parse.input_caret 逐字一致。
+G_CURSOR_GUARDS = ("cursor_image", "cursor_space")
+MAX_GUARD_IMAGES = 50
+INPUT_PREFIX_CELLS = 2
 # guard.hint：屏幕上（输入框之上，不含对话框）此刻仍有该 CLI 提示行。**白名单**：只接受这两个固定 id，
 # 不接受任意正则。整行匹配，与 ccr.tui_parse.HINT_BACKGROUND_RE / HINT_SEND_NOW_RE 一致。
 GUARD_HINTS = {
@@ -1484,14 +1561,73 @@ def popup_selected(lines, lo):
     return None
 
 
+def _cells_to_index(s, cells):
+    """显示列 → 字符下标（落在宽字符中间或超出文字 → None）。与 ccr.tui_parse._cells_to_index 一致。"""
+    w = 0
+    for i, ch in enumerate(s):
+        if w == cells:
+            return i
+        w += _cell_width(ch)
+        if w > cells:
+            return None
+    return len(s) if w == cells else None
+
+
+def _input_body(row):
+    i = _cells_to_index(row, INPUT_PREFIX_CELLS)
+    return row[i:] if i is not None else ""
+
+
+def caret_before(lines, box, cursor):
+    """光标所在输入框行里、光标之前的输入文字；光标不在输入框文字区 → None（与 ccr.tui_parse.input_caret 的 before 一致）。"""
+    if box is None or not isinstance(cursor, (tuple, list)) or len(cursor) != 2:
+        return None
+    cx, cy = cursor
+    lo, hi = box
+    if not lo < cy < hi or cx < INPUT_PREFIX_CELLS:
+        return None
+    body = _input_body(lines[cy])
+    col = cx - INPUT_PREFIX_CELLS
+    w = sum(_cell_width(ch) for ch in body)
+    if col >= w:
+        return body + " " * (col - w)
+    i = _cells_to_index(body, col)
+    return None if i is None else body[:i]
+
+
+def capture_with_cursor(sid):
+    """同一条 tmux 命令里先读光标 (#{cursor_x} #{cursor_y})、再抓屏（不带 -J：行号 = 终端行号）→ (屏幕文字, (x, y))。"""
+    rc, out, err = tmux(["display-message", "-p", "-t", target(sid), "#{cursor_x} #{cursor_y}", ";",
+                         "capture-pane", "-p", "-t", target(sid)])
+    if rc != 0:
+        raise tmux_err(err, "读取屏幕")
+    head, _, text = out.partition("\n")
+    m = re.match(r"^(\d{1,5}) (\d{1,5})$", head.strip())
+    if not m:
+        raise OpError("读不到终端光标位置")
+    return text, (int(m.group(1)), int(m.group(2)))
+
+
 def validate_guard(g):
     if not isinstance(g, dict) or not set(g) <= set(GUARD_KEYS):
         raise OpError("guard 格式不正确")
+    if "input_images" in g:
+        v = g["input_images"]
+        if not isinstance(v, list) or len(v) > MAX_GUARD_IMAGES or not all(
+                isinstance(i, int) and not isinstance(i, bool) and 0 <= i < 10 ** 6 for i in v):
+            raise OpError("guard.input_images 不合法")
+    if "cursor_image" in g and (isinstance(g["cursor_image"], bool) or not isinstance(g["cursor_image"], int)
+                                or not 0 <= g["cursor_image"] < 10 ** 6):
+        raise OpError("guard.cursor_image 不合法")
+    if not isinstance(g.get("cursor_space", False), bool):
+        raise OpError("guard.cursor_space 必须是布尔值")
+    if any(k in g for k in ("input_images",) + G_CURSOR_GUARDS) and g.get("input_box") is not True:
+        raise OpError("guard.input_images / cursor_* 需要 input_box")
     lines = g.get("lines", [])
     if not isinstance(lines, list) or len(lines) > MAX_GUARD_LINES or not all(
             isinstance(x, str) and len(x) <= 4000 and "\x00" not in x for x in lines):
         raise OpError("guard.lines 不合法")
-    for k in ("input_box", "input_nonempty"):
+    for k in ("input_box", "input_nonempty", "input_images_only"):
         if not isinstance(g.get(k, False), bool):
             raise OpError("guard.%s 必须是布尔值" % k)
     if "popup" in g and g["popup"] is not None and not (
@@ -1512,10 +1648,15 @@ def tail_sha1(lines, n):
     return hashlib.sha1("\n".join(lines[-n:]).encode("utf-8", "replace")).hexdigest()
 
 
-def check_guard(text, g):
+def needs_cursor(g):
+    return isinstance(g, dict) and ("cursor_image" in g or g.get("cursor_space") is True)
+
+
+def check_guard(text, g, cursor=None):
     """None = 通过；否则返回中文原因。
     lines：这些行都还在；input_box：输入框在底部（没有对话框）；popup：补全列表没出现或高亮项就是它；
-    tail：屏幕最后 n 行（对话框区域）的 sha1 没变（对话框没被换成另一个）。"""
+    tail：屏幕最后 n 行（对话框区域）的 sha1 没变（对话框没被换成另一个）；
+    input_images / cursor_image / cursor_space：见 G_CURSOR_GUARDS 上方说明（cursor = 终端光标 (x, y)，text 不带 -J）。"""
     lines = screen_lines(text)
     have = set(lines)
     if "tail" in g:
@@ -1531,6 +1672,20 @@ def check_guard(text, g):
             return "输入框不可见（可能弹出了对话框）"
         if g.get("input_nonempty") and not "".join(lines[box[0] + 1:box[1]]).lstrip("❯").strip():
             return "输入框是空的"
+        if g.get("input_images_only") and not G_IMAGES_ONLY_RE.fullmatch(
+                " ".join(lines[box[0] + 1:box[1]]).lstrip("❯")):
+            return "输入框里不只有图片"
+        if "input_images" in g and [int(x) for x in G_IMAGE_RE.findall("\n".join(lines[box[0] + 1:box[1]]))] != \
+                g["input_images"]:
+            return "输入框里的图片已变化"
+        if needs_cursor(g):
+            before = caret_before(lines, box, cursor)
+            if before is None:
+                return "终端光标不在输入框里"
+            if "cursor_image" in g and not before.endswith("[Image #%d]" % g["cursor_image"]):
+                return "光标前不是 [Image #%d]" % g["cursor_image"]
+            if g.get("cursor_space") and not before.endswith(" "):
+                return "光标前不是空格"
     if "popup" in g and box is not None:
         sel = popup_selected(lines, box[0])
         if sel is not None and sel != g["popup"]:
@@ -1557,10 +1712,14 @@ def op_keys(p):
     guard = p.get("guard")
     if guard is not None:
         validate_guard(guard)
-        rc, out, err = tmux(["capture-pane", "-p", "-J", "-t", target(sid)])
-        if rc != 0:
-            raise tmux_err(err, "读取屏幕")
-        why = check_guard(out, guard)
+        if needs_cursor(guard):
+            out, cur = capture_with_cursor(sid)
+        else:
+            rc, out, err = tmux(["capture-pane", "-p", "-J", "-t", target(sid)])
+            if rc != 0:
+                raise tmux_err(err, "读取屏幕")
+            cur = None
+        why = check_guard(out, guard, cur)
         if why:
             raise OpError("未发送按键：%s" % why, code="guard")
     for i, k in enumerate(keys):
@@ -1577,6 +1736,14 @@ def op_capture(p):
     h = p.get("history", 0)
     if isinstance(h, bool) or not isinstance(h, int) or h < 0 or h > 100000:
         raise OpError("history 必须是 0–100000 的整数")
+    cursor = p.get("cursor", False)
+    if not isinstance(cursor, bool):
+        raise OpError("cursor 必须是布尔值")
+    if cursor:   # 删除单张图片时定位输入框里的光标：不带 -J（行号 = 终端行号），与光标在同一条 tmux 命令里取
+        if h:
+            raise OpError("cursor 不能与 history 同时使用")
+        text, (x, y) = capture_with_cursor(sid)
+        return {"text": text, "cursor": {"x": x, "y": y}}
     argv = ["capture-pane", "-p", "-J", "-t", target(sid)]
     if h > 0:
         argv += ["-S", "-%d" % h]
@@ -1732,9 +1899,14 @@ def op_blob(p):
         raise OpError("该行过长或不完整", code="too_large")
     try:
         obj = json.loads(r[1].decode("utf-8", "replace"))
-        blk = obj["message"]["content"][path[0]]
-        if len(path) == 2:
-            blk = blk["content"][path[1]]
+        if isinstance(obj, dict) and obj.get("type") == "attachment":   # 回复中发送、带图片的消息：attachment.prompt[i]（refify_entry）
+            if len(path) != 1:
+                raise KeyError("path")
+            blk = obj["attachment"]["prompt"][path[0]]
+        else:
+            blk = obj["message"]["content"][path[0]]
+            if len(path) == 2:
+                blk = blk["content"][path[1]]
         src = blk["source"]
         b64 = src["data"]
     except (ValueError, KeyError, IndexError, TypeError):

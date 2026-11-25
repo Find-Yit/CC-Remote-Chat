@@ -6,7 +6,8 @@
 - 数据来源只有三种：屏幕（capture/screen 事件 → ccr.tui_parse）、~/.claude/sessions/<pid>.json（session 事件）、
   transcript jsonl（transcript 事件；子代理的 transcript/meta 经 subagent 事件，由 ccr.subagents 汇总）。本模块**不**做任何 headless / stream-json / control_request。
 - 红线 §0.5：除用户在界面上触发的操作外绝不发送按键。所有发键路径都在 send_message / send_keys / choose /
-  interrupt / cycle_mode / open_model_picker / apply_model / apply_effort / cancel_dialog / close 里，
+  interrupt / cycle_mode / open_model_picker / apply_model / apply_effort / cancel_dialog / close /
+  paste_image / attach_paths / clear_images（本机会话发图片）里，
   且导航序列每一步都基于**最新**屏幕解析结果计算，有步数上限与超时。
 - app 退出（shutdown）只关闭 link，不关闭远端 claude（keeper 保活）；重启后按作业重新附着。
 
@@ -27,12 +28,14 @@ import os
 import pathlib
 import queue
 import re
+import secrets
 import threading
 import time
 import uuid
 from typing import Callable, Optional
 
 from . import api_keys as ccr_api_keys
+from . import attach as ccr_attach
 from . import notify as ccr_notify
 from . import opprogress as ccr_op
 from . import remote, stats, subagents, titles, tui_parse
@@ -46,6 +49,9 @@ KEYS_WHITELIST = tuple("Enter Escape Up Down Left Right Tab BTab BSpace Space C-
                        "1 2 3 4 5 6 7 8 9 s y n".split())
 MAX_KEYS = 40
 MAX_TEXT = 200000
+MAX_IMAGES = 50          # send_message 的 expect_images 最多这么多个编号
+MAX_DROP_FILES = 32      # 每个会话最多记住这么多个拖入图片（缩略图通道的白名单）
+_DROP_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{24}\Z")
 SCOPES = ("session", "save")
 # Shift+Tab 的循环顺序（claude v2.1.330 真机实测，SPEC §13）：manual → acceptEdits → plan →
 # [bypassPermissions：只有以 --dangerously-skip-permissions（或 --permission-mode bypassPermissions）启动才有] → auto → manual。
@@ -248,6 +254,9 @@ class _Session:
         # 重启 / 续接 / 新建 / 换 API 重启的阶段进度（meta.op，见 ccr.opprogress）；只在内存里，不落盘
         self.op: Optional[dict] = None
         self.op_timer: Optional[threading.Timer] = None
+        # 拖入的图片（attach_paths 校验过并粘进 claude 输入框的本机文件）：token -> {path, n, dev, ino}，只在内存里，
+        # 图片条的缩略图 / 灯箱经 GET image/file/<token> 只读这些文件（SPEC §4.2「图片」）；claude 退出、清除、删除、发出后作废
+        self.drop_files: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
         self.events: "collections.deque[dict]" = collections.deque(maxlen=max_events)
         self.truncated = False
         self.last_meta = None
@@ -534,12 +543,14 @@ class SessionManager:
         self.stats_interval = 1.0        # meta.stats 变化时最多每秒推一次 meta
         self.poll_interval = 0.1         # 等待屏幕变化时的抓屏间隔
         self.step_timeout = 3.0          # 单步按键后等待屏幕响应
+        self.image_timeout = 8.0         # Ctrl+V / 粘贴图片路径后等 claude 把图片放进输入框（读大截图要一会儿）
         self.panel_timeout = 10.0        # 等 /model、/effort 面板出现
         self.result_timeout = 5.0        # 等面板关闭/结果行
         self.result_settle = 1.5         # 面板关闭后结果行还没出现时，再等这么久
         self.max_nav_steps = 24
         self.max_effort_steps = 8
         self.max_clear_steps = 12
+        self.max_caret_rounds = 12       # 删除单张图片：挪光标最多读屏 / 按键这么多轮
         self.max_mode_steps = MAX_MODE_STEPS   # 选择权限模式：最多按这么多次 Shift+Tab
         self.op_lock_timeout = 15.0
         self.exit_timeout = 15.0
@@ -1513,6 +1524,7 @@ class SessionManager:
                                           "点「重启」将以新会话启动（目录、模型、API 不变）")
             s.exited = True
             s.exit_status = exit_status if isinstance(exit_status, int) else None
+            s.drop_files.clear()   # 图片编号随 claude 进程重来：拖入图片的缩略图通道作废
             # 新启动的 claude 在启动/等待就绪阶段就退出了：进度里写明（旧 claude 在 stop 阶段退出是预期的）
             op = self._op_live(s)
             op_id = None
@@ -2039,19 +2051,27 @@ class SessionManager:
         self._apply_session(s, sess)
         return sess.get("status") == "waiting"
 
-    def _submit_text(self, s: _Session, text: str, slash: Optional[str] = None) -> dict:
-        """调用方持有 s.oplock，且已确认无对话框、输入框可见且为空。
+    def _submit_text(self, s: _Session, text: str, slash: Optional[str] = None,
+                     images: Optional[list] = None) -> dict:
+        """调用方持有 s.oplock，且已确认无对话框、输入框可见且为空（images 非空时：输入框里只有这些图片占位）。
         粘贴（不回车）→ 抓屏确认：文字进了输入框、没有对话框、session status 不是 waiting；以 / 开头时补全列表
         没出现或高亮项正好是目标命令 → 再抓一帧确认画面稳定 → 带 guard 单独发 Enter（agent 发之前再复核一次）。
+        images：输入框里已有用户粘贴 / 拖入的图片（"[Image #N]"）→ 文字前补一个空格接在图片后面，确认时要求
+        图片占位原样还在、其余部分是刚粘贴的文字。
         任何一步不满足都**不按 Enter**（文字留在输入框里），抛 OpError。"""
-        self._paste(s, text, enter=False)
+        self._paste(s, (" " + text) if images else text, enter=False)
 
         def verdict(x):
             if self._blocking_dialog(s, x, refresh=False):   # 调用前已用 refresh 核实过 status
                 return "dialog"
             if not (x.get("input") or {}).get("visible"):
                 return None
-            if not _input_matches((x.get("input") or {}).get("text") or "", text):
+            itext = (x.get("input") or {}).get("text") or ""
+            if images:
+                ids, rest = tui_parse.split_input_images(itext)
+                if ids != list(images) or not _input_matches(rest, text):
+                    return None
+            elif not _input_matches(itext, text):
                 return None
             sel = _popup_selected(x)
             if sel is not None and sel != slash:
@@ -2109,6 +2129,10 @@ class SessionManager:
             return st
         if not clear:
             short = txt if len(txt) <= 60 else txt[:60] + "…"
+            ids = tui_parse.split_input_images(txt)[0]
+            if ids:   # 清空会连图片一起清掉：说清楚，只有用户确认才清
+                raise OpError("终端输入框里已有未发送的内容「%s」（含 %d 张图片），确认后会连同图片一起清空再继续"
+                              % (short, len(ids)), code="input_not_empty")
             raise OpError("终端输入框里已有未发送的文字「%s」，确认后可清空再继续" % short, code="input_not_empty")
         prev = txt
         for _ in range(self.max_clear_steps):
@@ -2124,11 +2148,18 @@ class SessionManager:
         raise OpError("无法清空终端输入框，请在终端面板手动处理", code="clear_failed")
 
     # ================================================================ 用户操作
-    def send_message(self, sid, text, clear_input: bool = False) -> dict:
+    def send_message(self, sid, text, clear_input: bool = False, expect_images: Optional[list] = None) -> dict:
+        """expect_images：前端此刻显示的"claude 输入框里的图片"编号（[Image #N] 的 N，按顺序）；给了就必须与最新屏幕
+        一致，否则 409 images_changed（不发没被用户看到的图片，也不漏发）。None = 不核对（旧调用方）。
+        输入框里只有图片占位（用户 ⌘V / 拖入的）时保留它们，文字接在后面一起发；只有图片、没有文字也能发。"""
         s = self._get(sid)
         if not isinstance(text, str):
             raise ValueError("text 必须是字符串")
-        if not text.strip():
+        if expect_images is not None and (not isinstance(expect_images, list) or len(expect_images) > MAX_IMAGES or
+                                          not all(isinstance(i, int) and not isinstance(i, bool) and 0 <= i < 10 ** 6
+                                                  for i in expect_images)):
+            raise ValueError("expect_images 必须是图片编号数组")
+        if not text.strip() and not expect_images:
             raise ValueError("消息不能为空")
         if len(text) > MAX_TEXT:
             raise ValueError("消息过长（最多 %d 字符）" % MAX_TEXT)
@@ -2141,10 +2172,358 @@ class SessionManager:
                 raise OpError("请先处理当前对话框", code="dialog_open")
             if not (st.get("input") or {}).get("visible"):
                 raise OpError("输入框不可见（Claude 可能还在启动），请稍后再试", code="no_input")
-            self._ensure_input_empty(s, st, bool(clear_input))
-            self._submit_text(s, text, slash=_slash_target(text))
+            ids, rest = tui_parse.split_input_images((st.get("input") or {}).get("text") or "")
+            if expect_images is not None and ids != list(expect_images):
+                raise OpError(("claude 输入框里的图片有变化（现在是 %s），没有发送；请确认后再发"
+                               % " ".join("[Image #%d]" % i for i in ids)) if ids else
+                              "claude 输入框里已经没有图片了（可能在终端里被删掉或已发出），没有发送；请确认后再发",
+                              code="images_changed")
+            if ids and not rest:
+                # 输入框里只有用户放进去的图片：不清空，文字接在图片后面（= 终端里拖入截图后再打字）
+                if not text.strip():
+                    self._submit_images(s, ids)
+                else:
+                    if _slash_target(text):
+                        raise OpError("claude 输入框里有图片时发 / 命令会被当成普通文字，没有发送；请先发送或清除图片",
+                                      code="images_with_command")
+                    self._submit_text(s, text, images=ids)
+            else:
+                if not text.strip():
+                    raise OpError("claude 输入框里没有图片，没有发送", code="images_changed")
+                self._ensure_input_empty(s, st, bool(clear_input))
+                self._submit_text(s, text, slash=_slash_target(text))
+            self._forget_drop_files(s)   # 发出去了（或连同文字清掉了）：拖入图片的缩略图通道作废
         self._emit_meta(s)
         return {"ok": True, "local_id": "l" + uuid.uuid4().hex[:12]}
+
+    # ================================================================ 图片（SPEC §4.2「图片」、§9.8）
+    # 与终端里的操作完全等价：⌘V 截图 = 在终端里按 Ctrl+V（claude 自己读剪贴板）；拖入图片 = 终端把文件路径作为一次
+    # 粘贴送给 claude（claude 自己把图片路径变成 [Image #N]）。本程序不读写剪贴板、不另存文件。只对本机会话开放。
+    def _submit_images(self, s: _Session, ids: list) -> dict:
+        """只有图片、没有文字：输入框里正好是这些图片占位、没有对话框（连续两帧）→ 带 guard 按 Enter。"""
+        def ok(x):
+            if self._blocking_dialog(s, x, refresh=False) or not (x.get("input") or {}).get("visible"):
+                return False
+            got, rest = tui_parse.split_input_images((x.get("input") or {}).get("text") or "")
+            return got == list(ids) and not rest and _popup_selected(x) is None
+
+        streak = 0
+        deadline = time.monotonic() + self.step_timeout
+        while streak < 2:
+            st = self._fresh(s)
+            streak = streak + 1 if ok(st) else 0
+            if streak >= 2:
+                break
+            if self._blocking_dialog(s, st, refresh=False):
+                raise OpError("终端里出现了对话框，没有按回车，请先处理对话框", code="dialog_open")
+            if time.monotonic() >= deadline:
+                raise OpError("没能确认 claude 输入框里的图片，没有按回车；请在终端面板检查后按 Enter",
+                              code="paste_unconfirmed", status=504)
+            time.sleep(self.poll_interval)
+        self._keys(s, ["Enter"], guard={"input_box": True, "input_images_only": True})
+        return st
+
+    def _image_ready(self, s: _Session, st: dict) -> list:
+        """发图片前的屏幕核对（调用方持有 oplock）：没有对话框、输入框可见、焦点不在子代理列表上。返回输入框里现有的图片编号。"""
+        if self._blocking_dialog(s, st) or s.state == "trust":
+            raise OpError("请先处理当前对话框", code="dialog_open")
+        if not (st.get("input") or {}).get("visible"):
+            raise OpError("输入框不可见（Claude 可能还在启动），请稍后再试", code="no_input")
+        if st.get("agents_focus"):
+            raise OpError("终端里的焦点在子代理列表上，请先在终端面板按 Esc 回到输入框", code="agents_focus")
+        return tui_parse.split_input_images((st.get("input") or {}).get("text") or "")[0]
+
+    def _wait_new_image(self, s: _Session, before: list) -> tuple:
+        """等输入框里出现新的 [Image #N]（或出现对话框 / 输入框消失）。返回 (最新屏幕或 None, 新增编号)。"""
+        old = set(before)
+
+        def pred(x):
+            if x.get("dialog") or not (x.get("input") or {}).get("visible"):
+                return True
+            return any(i not in old for i in tui_parse.split_input_images((x.get("input") or {}).get("text") or "")[0])
+
+        st = self._wait_for(s, pred, self.image_timeout)
+        if st is None:
+            return None, []
+        ids = tui_parse.split_input_images((st.get("input") or {}).get("text") or "")[0]
+        return st, [i for i in ids if i not in old]
+
+    def _require_local(self, s: _Session, what: str) -> None:
+        if s.jobid != remote.LOCAL_JOBID:
+            raise OpError("服务器会话暂不支持直接发图片：%s" % what, code="not_local")
+
+    def paste_image(self, sid) -> dict:
+        """用户在本机会话的输入框里按 ⌘V、且粘贴的内容里有图片 → 在终端里按 Ctrl+V，由 claude 自己读剪贴板
+        （与用户在终端里按 Ctrl+V 完全相同；本程序不读剪贴板）。等输入框里出现新的 [Image #N]。"""
+        s = self._get(sid)
+        self._require_local(s, "远端的 claude 读不到这台 Mac 的剪贴板")
+        self._user_engaged(s)
+        with self._op(s):
+            st = self._fresh(s)
+            before = self._image_ready(s, st)
+            self._keys(s, ["C-v"], guard={"input_box": True})
+            st2, added = self._wait_new_image(s, before)
+        if st2 is not None and st2.get("dialog"):
+            raise OpError("按 Ctrl+V 后终端里出现了对话框，请先处理对话框", code="dialog_open")
+        if not added:
+            raise OpError("已在终端里按了 Ctrl+V，但 claude 没有从剪贴板读到图片（剪贴板里可能已经不是图片）；"
+                          "可打开终端面板查看", code="image_not_found", status=504)
+        ids = tui_parse.split_input_images((st2.get("input") or {}).get("text") or "")[0]
+        return {"ok": True, "images": ids, "added": added}
+
+    def attach_paths(self, sid, paths) -> dict:
+        """原生窗口里拖入的本机图片文件：每个路径按终端拖放的规则转义后单独粘贴一次（带 guard：输入框可见、没有对话框），
+        等 claude 把它变成 [Image #N] 再粘下一个。只接受本机上真实存在的图片文件（ccr.attach.check_image_path）。"""
+        s = self._get(sid)
+        self._require_local(s, "文件在这台 Mac 上，远端的 claude 读不到")
+        if not isinstance(paths, list) or not paths:
+            raise ValueError("paths 必须是非空数组")
+        if len(paths) > ccr_attach.MAX_PATHS:
+            raise ValueError("一次最多拖入 %d 张图片" % ccr_attach.MAX_PATHS)
+        checked = [ccr_attach.check_image_file(p) for p in paths]
+        self._user_engaged(s)
+        added = []
+        files = {}
+        with self._op(s):
+            st = self._fresh(s)
+            ids = self._image_ready(s, st)
+            for p, ident in checked:
+                self._req(s.jobid, "paste", sid=s.sid, text=ccr_attach.escape_drop_path(p), enter=False,
+                          guard={"input_box": True}, timeout=30)
+                with s.lock:
+                    s.last_activity = time.time()
+                st2, new = self._wait_new_image(s, ids)
+                if st2 is not None and st2.get("dialog"):
+                    raise OpError("粘贴图片路径后终端里出现了对话框，请先处理对话框", code="dialog_open")
+                if not new:
+                    raise OpError("claude 没有把「%s」识别成图片（路径文字留在了终端输入框里，可打开终端面板删除）"
+                                  % os.path.basename(p), code="path_not_image")
+                added += new
+                # 缩略图通道（只读这个文件）：一次粘贴只对应一张新图片时才登记
+                if len(new) == 1:
+                    files.update(self._remember_drop_files(s, [(new[0], p, ident)]))
+                ids = tui_parse.split_input_images((st2.get("input") or {}).get("text") or "")[0]
+        return {"ok": True, "images": ids, "added": added, "files": {str(k): v for k, v in files.items()}}
+
+    def clear_images(self, sid) -> dict:
+        """用户点「清除」：claude 输入框里只有图片占位时按 Ctrl+U 清掉（guard：输入框里只有图片）。还有别的文字 → 409，不动。"""
+        s = self._get(sid)
+        self._user_engaged(s)
+        with self._op(s):
+            st = self._fresh(s)
+            if self._blocking_dialog(s, st) or s.state == "trust":
+                raise OpError("请先处理当前对话框", code="dialog_open")
+            ids, rest = tui_parse.split_input_images((st.get("input") or {}).get("text") or "")
+            for _ in range(self.max_clear_steps):
+                if not ids:
+                    self._forget_drop_files(s)
+                    return {"ok": True, "images": []}
+                if rest:
+                    raise OpError("终端输入框里除了图片还有其它文字，没有清除；请在终端面板里处理", code="input_not_only_images")
+                prev = ids
+                self._keys(s, ["C-u"], guard={"input_box": True, "input_images_only": True})
+                st2 = self._wait_for(s, lambda x: tui_parse.split_input_images(
+                    (x.get("input") or {}).get("text") or "")[0] != prev, self.step_timeout)
+                if st2 is None:
+                    break
+                ids, rest = tui_parse.split_input_images((st2.get("input") or {}).get("text") or "")
+            if not ids:
+                self._forget_drop_files(s)
+                return {"ok": True, "images": []}
+            raise OpError("没能清除 claude 输入框里的图片，请在终端面板里处理", code="clear_failed")
+
+    # ---------------------------------------------------------------- 删除单张图片（图片条上的 ×）
+    # CLI 2.1.332 真机实测（SPEC §1「图片」）：CLI 把隐藏的硬件光标停在输入框插入点上（tmux #{cursor_x}/#{cursor_y} 准确）；
+    # ← / → 在 "[Image #N]" 上整块跳、其余字符一步一个；光标紧跟在 "[Image #N]" 后按退格 = 整块删掉这一张，
+    # 两边的空格都留下（"[Image #1]  [Image #3]"），编号不重排；之后再发送只带剩下的图片（transcript 的 image 块 / imagePasteIds）。
+    # 做法：读光标 → 只用 ← / →（每批都带 guard：输入框在、图片没变）把光标挪到目标后面 → 读屏确认 → 退格（guard：
+    # 光标前就是 "[Image #N]"）→ 确认只少了这一张 → 删掉多出来的一个空格（guard：光标前是空格）→ 光标挪回末尾
+    # （之后的拖入 / 发送都是接在末尾）。任何一步对不上就停下、返回错误，不连续乱按。
+    def _caret_snap(self, s: _Session) -> dict:
+        """读光标 + 不带 -J 的屏幕（同一条 tmux 命令）→ {lines, st, images, cur:(x,y), caret}；caret 不在输入框 = None。"""
+        res = self._req(s.jobid, "capture", sid=s.sid, cursor=True, timeout=15)
+        cur = res.get("cursor") if isinstance(res, dict) else None
+        text = res.get("text") if isinstance(res, dict) else None
+        if not isinstance(cur, dict) or not isinstance(text, str) or \
+                not all(isinstance(cur.get(k), int) and not isinstance(cur.get(k), bool) for k in ("x", "y")):
+            raise OpError("读不到终端里的光标位置，没有删除；可以点「清除」全部清掉，或在终端面板里手动删除",
+                          code="cursor_unknown")
+        st = tui_parse.parse_screen(text)
+        lines = tui_parse.screen_lines(text)
+        xy = (cur["x"], cur["y"])
+        return {"lines": lines, "st": st, "cur": xy, "caret": tui_parse.input_caret(lines, xy[0], xy[1]),
+                "images": tui_parse.split_input_images((st.get("input") or {}).get("text") or "")[0]}
+
+    def _snap_ok(self, s: _Session, snap: dict, ids: list, stop: str = "没有删除") -> None:
+        st = snap["st"]
+        if st.get("dialog") or not (st.get("input") or {}).get("visible"):
+            raise OpError("终端里出现了对话框（或输入框不见了），已停止，%s" % stop, code="dialog_open")
+        if snap["images"] != list(ids):
+            raise OpError("claude 输入框里的图片有变化（现在是 %s），已停止，%s"
+                          % (" ".join("[Image #%d]" % i for i in snap["images"]) or "没有图片", stop),
+                          code="images_changed")
+        if snap["caret"] is None:
+            raise OpError("终端光标不在 claude 的输入框里（可能在别处操作过），%s；可以点「清除」全部清掉，"
+                          "或在终端面板里手动处理" % stop, code="cursor_unknown")
+
+    def _caret_settle(self, s: _Session, prev_cur) -> dict:
+        """按了挪光标 / 退格之后：等光标离开 prev_cur 并且连续两次读到同一个位置（CLI 重画完）再返回最新 snap；
+        超时返回最后一次读到的（调用方据此判定"走不动"）。"""
+        deadline = time.monotonic() + self.step_timeout
+        last = None
+        while True:
+            snap = self._caret_snap(s)
+            if last is not None and snap["cur"] == last["cur"] and snap["cur"] != tuple(prev_cur) and \
+                    snap["lines"] == last["lines"]:
+                return snap
+            if time.monotonic() >= deadline:
+                return snap
+            last = snap
+            time.sleep(self.poll_interval)
+
+    def _caret_goto(self, s: _Session, ids: list, target, snap: Optional[dict] = None, stop: str = "没有删除") -> dict:
+        """只用 ← / → 把光标挪到 target(snap) 返回的位置；每批按键带 guard（输入框在、图片编号没变）。
+        target(snap) → (x, y) 或 None（找不到）。返回到位后的 snap。走不动 / 轮数用完 → OpError。"""
+        if snap is None:
+            snap = self._caret_snap(s)
+        for _ in range(self.max_caret_rounds):
+            self._snap_ok(s, snap, ids, stop)
+            tgt = target(snap)
+            if tgt is None:
+                raise OpError("在终端画面里找不到目标位置（可能折行了），%s；可以在终端面板里手动处理" % stop,
+                              code="cursor_unknown")
+            if snap["cur"] == tuple(tgt):
+                return snap
+            keys = tui_parse.caret_moves(snap["lines"], snap["cur"], tuple(tgt))
+            if not keys:
+                break
+            self._keys(s, keys, guard={"input_box": True, "input_images": list(ids)})
+            after = self._caret_settle(s, snap["cur"])
+            if after["cur"] == snap["cur"]:
+                break   # 按了也没动：不再继续按
+            snap = after
+        raise OpError("没能把终端光标移到目标位置，%s；可以在终端面板里手动处理" % stop, code="cursor_unknown")
+
+    def remove_image(self, sid, n, expect) -> dict:
+        """用户点图片条上某张图片的 ×：只删 claude 输入框里的这一张 [Image #n]，其它图片和文字不动。
+        expect = 前端此刻显示的图片编号列表：与最新屏幕不一致 → 409 images_changed（一个键都不按）。只对本机会话。"""
+        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n < 10 ** 6:
+            raise ValueError("n 必须是图片编号")
+        if not isinstance(expect, list) or len(expect) > MAX_IMAGES or not all(
+                isinstance(i, int) and not isinstance(i, bool) and 0 <= i < 10 ** 6 for i in expect):
+            raise ValueError("expect 必须是图片编号数组")
+        s = self._get(sid)
+        self._require_local(s, "图片只在本机会话里")
+        self._user_engaged(s)
+        with self._op(s):
+            st = self._fresh(s)
+            ids = self._image_ready(s, st)
+            rest = tui_parse.split_input_images((st.get("input") or {}).get("text") or "")[1]
+            if ids != list(expect):
+                raise OpError(("claude 输入框里的图片有变化（现在是 %s），没有删除；请确认后再试"
+                               % " ".join("[Image #%d]" % i for i in ids)) if ids else
+                              "claude 输入框里已经没有图片了，没有删除", code="images_changed")
+            if n not in ids:
+                raise OpError("claude 输入框里没有 [Image #%d]，没有删除" % n, code="images_changed")
+            if ids.count(n) != 1:
+                raise OpError("claude 输入框里有不止一个 [Image #%d]，无法确定删哪个；请在终端面板里手动删除" % n,
+                              code="image_ambiguous")
+            want = [i for i in ids if i != n]
+
+            def at_image(snap):
+                cells = tui_parse.input_image_cells(snap["lines"], n)
+                return cells[0] if len(cells) == 1 else None
+
+            self._caret_goto(s, ids, at_image)
+            self._keys(s, ["BSpace"], guard={"input_box": True, "input_images": ids, "cursor_image": n})
+            with s.lock:
+                s.last_activity = time.time()
+            st2 = self._wait_for(s, lambda x: tui_parse.split_input_images(
+                (x.get("input") or {}).get("text") or "")[0] != ids, self.step_timeout)
+            got = tui_parse.split_input_images(((st2 or {}).get("input") or {}).get("text") or "")[0] \
+                if st2 is not None else ids
+            if got != want:
+                raise OpError("按了一次退格，但 claude 输入框里的图片是 %s（应为 %s），已停止；请打开终端面板检查"
+                              % (" ".join("[Image #%d]" % i for i in got) or "没有图片",
+                                 " ".join("[Image #%d]" % i for i in want) or "没有图片"), code="remove_unconfirmed")
+            self._forget_drop_files(s, [n])
+            # 删完输入框就空了：什么都不再按（空输入框里 CLI 可能显示灰色的建议文字，→ 会把它接受进来）
+            warning = self._tidy_after_remove(s, want) if (want or rest) else None
+        out = {"ok": True, "images": want, "removed": n}
+        if warning:
+            out["warning"] = warning
+        return out
+
+    def _tidy_after_remove(self, s: _Session, ids: list) -> Optional[str]:
+        """删掉图片后多出来的一个空格（"[Image #1]  [Image #3]" → 一个空格；开头 / 结尾的空格），再把光标挪回输入框末尾
+        （之后的拖入 / 发送都接在末尾）。尽力而为：图片已经删掉了，这里任何一步对不上就停下，只返回提示，不算失败。"""
+        stop = "光标可能不在末尾"
+        try:
+            snap = self._caret_snap(s)
+            self._snap_ok(s, snap, ids, stop)
+            c = snap["caret"]
+            last = c["row"] == c["rows"] - 1
+            if c["before"].endswith(" ") and (c["after"].startswith(" ") or (not c["after"] and last)):
+                self._keys(s, ["BSpace"], guard={"input_box": True, "input_images": ids, "cursor_space": True})
+                snap = self._caret_settle(s, snap["cur"])
+            elif c["row"] == 0 and not c["before"] and c["after"].startswith(" "):
+                self._keys(s, ["Right"], guard={"input_box": True, "input_images": ids})
+                snap = self._caret_settle(s, snap["cur"])
+                self._snap_ok(s, snap, ids, stop)
+                if snap["caret"]["row"] == 0 and snap["caret"]["before"] == " ":
+                    self._keys(s, ["BSpace"], guard={"input_box": True, "input_images": ids, "cursor_space": True})
+                    snap = self._caret_settle(s, snap["cur"])
+
+            def at_end(sn):
+                end = tui_parse.input_end_cell(sn["lines"])
+                cur = sn["cur"]
+                if end is not None and cur[1] == end[1] and cur[0] >= end[0]:
+                    return cur   # 已在末尾（真有行尾空格时光标比 rstrip 后的末尾更靠右）
+                return end
+
+            self._caret_goto(s, ids, at_end, snap, stop)
+        except OpError as e:
+            log.info("删除图片后整理输入框没完成（图片已删掉）：%s", e)
+            return "图片已删除；整理输入框时停下了（%s），可以打开终端面板看一眼" % e
+        return None
+
+    # ---------------------------------------------------------------- 拖入图片的缩略图通道（只读、白名单）
+    def _remember_drop_files(self, s: _Session, items: list) -> dict:
+        """attach_paths 成功粘进去的文件：[(n, path, ident)] → {n: token}（会话级白名单，最多 MAX_DROP_FILES 个）。"""
+        out = {}
+        with s.lock:
+            for n, path, ident in items:
+                tok = secrets.token_urlsafe(18)
+                s.drop_files[tok] = {"n": n, "path": path, "ident": tuple(ident)}
+                out[n] = tok
+            while len(s.drop_files) > MAX_DROP_FILES:
+                s.drop_files.popitem(last=False)
+        return out
+
+    def _forget_drop_files(self, s: _Session, ns=None) -> None:
+        with s.lock:
+            if ns is None:
+                s.drop_files.clear()
+                return
+            for tok in [t for t, r in s.drop_files.items() if r["n"] in ns]:
+                del s.drop_files[tok]
+
+    def read_drop_image(self, sid, token) -> tuple:
+        """GET image/file/<token>：图片条缩略图 / 灯箱看拖入的图片。只读本会话 attach_paths 记下的那个文件（同一个 inode），
+        再核对魔数 → (Content-Type, 字节)。token 不存在 / 已作废 → 404；文件被换 / 删 → 404；太大 → 413。"""
+        s = self._get(sid)
+        self._require_local(s, "图片只在本机会话里")
+        if not isinstance(token, str) or not _DROP_TOKEN_RE.match(token):
+            raise OpError("图片不存在或已作废", code="not_found", status=404)
+        with s.lock:
+            rec = s.drop_files.get(token)
+            rec = dict(rec) if rec else None
+        if rec is None:
+            raise OpError("图片不存在或已作废", code="not_found", status=404)
+        try:
+            return ccr_attach.read_image_file(rec["path"], rec["ident"])
+        except ccr_attach.ImageFileError as e:
+            raise OpError(str(e), code="image_file", status=e.status) from None
 
     def send_keys(self, sid, keys) -> dict:
         s = self._get(sid)

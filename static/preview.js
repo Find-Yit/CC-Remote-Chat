@@ -11,6 +11,7 @@
 //        每个会话一个 ChangesView（范围 / 展开状态随会话保留）。数据只来自前端已有的 transcript 条目，不发请求。
 // 所有文件访问都经后端 /api/sessions/<sid>/local/*（token）与 /preview/<cap>/…（只读）；按钮只在用户点击时调用。
 import { h, icon, copyText, basename, fmtSize } from './dom.js';
+import { CREDENTIALS } from './api.js';
 import { isLocal, statMany, localOpen, toast, rootOf } from './viz.js';
 import { renderMarkdown } from './markdown.js';
 import { renderPatch, renderDiff } from './tools.js';
@@ -387,7 +388,7 @@ export class PreviewPanel {
       node = h('audio', { class: 'pv-media', src: url, controls: true, preload: 'metadata' });
     } else if (k === 'markdown' || k === 'text') {
       try {
-        const res = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+        const res = await fetch(url, { credentials: CREDENTIALS, cache: 'no-store' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         let text = await res.text();
         let cut = false;

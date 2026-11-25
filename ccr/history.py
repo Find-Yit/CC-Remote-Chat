@@ -267,31 +267,60 @@ def is_system_injected(d):
 
 
 def _trim_note_attachment(d):
-    """回复中途被吸收的子代理/后台任务通知（attachment / queued_command / commandMode=task-notification，
-    CLI 2.1.332 实测不再另写 user 条目）→ 精简的 attachment entry；其它 attachment 返回 None。"""
+    """回复中途被 CLI 吸收的排队命令（attachment / queued_command，CLI 2.1.330–2.1.332 实测只写 attachment、不另写 user 条目）
+    → 精简的 attachment entry，其它 attachment 返回 None（与 node_agent.note_attachment 同一口径）：
+    - 子代理/后台任务通知：commandMode 或 origin.kind 为 task-notification；
+    - 用户在回复进行中发出的消息：commandMode=prompt 且 origin.kind 为 human / 缺省（isMeta 的不要）或 peer；
+      prompt 是字符串或 [文字块, 图片块…]（大图片换成"已省略"文字，与 user 条目相同），带 source_uuid 供前端去重。"""
     a = d.get("attachment")
     if not isinstance(a, dict) or a.get("type") != "queued_command" or d.get("isSidechain"):
         return None
     origin = a.get("origin") if isinstance(a.get("origin"), dict) else {}
     kind = origin.get("kind") if isinstance(origin.get("kind"), str) else None
-    if a.get("commandMode") != "task-notification" and kind != "task-notification":
+    flag = [False]
+    if a.get("commandMode") == "task-notification" or kind == "task-notification":
+        mode = "task-notification"
+        prompt = a.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+        prompt, tr = _cut(prompt)
+        flag[0] = tr
+    elif a.get("commandMode") == "prompt" and kind in (None, "human", "peer"):
+        if a.get("isMeta") and kind != "peer":
+            return None
+        mode = "prompt"
+        prompt = a.get("prompt")
+        if isinstance(prompt, str):
+            if not prompt.strip():
+                return None
+            prompt, tr = _cut(prompt)
+            flag[0] = tr
+        elif isinstance(prompt, list):
+            prompt = [_trim_block(b, flag) for b in prompt
+                      if isinstance(b, dict) and b.get("type") in ("text", "image")][:200]
+            if not any(b.get("type") == "image" or str(b.get("text") or "").strip() for b in prompt):
+                return None
+        else:
+            return None
+    else:
         return None
-    prompt = a.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        return None
-    prompt, tr = _cut(prompt)
-    att = {"type": "queued_command", "commandMode": "task-notification", "prompt": prompt}
+    att = {"type": "queued_command", "commandMode": mode, "prompt": prompt}
     if kind:
         att["origin"] = {"kind": kind[:64]}
+        if kind == "peer" and isinstance(origin.get("name"), str) and origin["name"].strip():
+            att["origin"]["name"] = origin["name"][:80]
+    su = a.get("source_uuid")
+    if mode == "prompt" and isinstance(su, str) and 0 < len(su) <= 64:
+        att["source_uuid"] = su
     entry = {"type": "attachment", "uuid": d.get("uuid"), "timestamp": d.get("timestamp"), "attachment": att}
-    if tr:
+    if flag[0]:
         entry["truncated"] = True
     return entry
 
 
 def trim_entry(d):
     """把一条 transcript 记录变成 API entry；非 user/assistant、meta、sidechain 返回 None
-    （回复中途吸收的子代理通知 attachment 除外，见 _trim_note_attachment）。"""
+    （回复中途吸收的子代理通知 / 用户消息 attachment 除外，见 _trim_note_attachment）。"""
     if not isinstance(d, dict):
         return None
     typ = d.get("type")
@@ -342,7 +371,7 @@ def read_lines(lines):
             continue
         lt = _line_type(line)
         if lt is not None and lt not in ("user", "assistant") and not (
-                lt == "attachment" and b"task-notification" in line):
+                lt == "attachment" and b"queued_command" in line):
             continue
         d = _loads(line)
         if not d:

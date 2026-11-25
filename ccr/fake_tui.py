@@ -14,7 +14,10 @@ fixtures/tui_screens_*.ndjson（真实 Claude Code v2.1.330 的画面）。
   /bg    运行一个较慢的 Bash 命令，下方显示 "(ctrl+b ctrl+b (twice) to run in background)"；Ctrl+B 转入后台
          （"Ran 1 shell command"，底栏 "· 1 shell"，结束行 "… · 1 shell still running"）
 忙时提交的消息进入队列：显示连续的 "❯ <消息>" + 一行共用的 "⎿  Queued · ctrl+x ctrl+s to send now"，输入框占位
-"Press up to edit queued messages"；Ctrl+X Ctrl+S（1.5 秒内）= 中断当前生成并立即发送排队的消息。
+"Press up to edit queued messages"。仿 CLI 2.1.330–2.1.332（真机实测）：/tool、/bg 的工具结果之后，排队的消息被这一轮
+吸收——移到正文 "❯ <消息>"，transcript **只**写 attachment（queued_command、commandMode=prompt），不写 user 条目；
+没被吸收的在本轮结束后作为新的一轮发出（user 条目 promptSource=queued）。Ctrl+X Ctrl+S（1.5 秒内）= 立即发送：
+/bg 的命令还在跑 → 转入后台并吸收排队消息；否则截断当前输出、排队消息作为新的一轮发出（不写中断标记）。
   /agent 派一个"后台"子代理：写 Agent tool_use、"Async agent launched…agentId: …" 结果、
          <transcript 目录>/<sessionId>/subagents/agent-<id>.meta.json 与逐步写入的 agent-<id>.jsonl
          （几次工具调用，夹杂 api-request*/attachment 行），结束时 meta.finished=true 并写 <task-notification>；
@@ -47,6 +50,7 @@ import json
 import os
 import re
 import select
+import shlex
 import signal
 import socket
 import sys
@@ -122,6 +126,11 @@ QUEUED_PLACEHOLDER = "Press up to edit queued messages"
 CHORD_WINDOW = 1.5
 KILL_CONFIRM_WINDOW = 3.0    # 真机：Ctrl+X Ctrl+K 两次之间最多 3 秒
 KILL_HINT = "Press ctrl+x ctrl+k again to stop background agents"
+# 图片（仿 CLI 2.1.332 真机实测，fixtures/image_paste/）：单独一次粘贴的文字整段是图片路径（或空格分隔、反斜杠转义的多个路径）
+# → 输入框里变成 "[Image #N]"（N 在整个进程里递增）；Ctrl+V = 读剪贴板图片（fake 绝不读真实剪贴板：生成一张示意 PNG；
+# CCR_FAKE_CLIPBOARD=none 时什么都不发生，模拟剪贴板里没有图片）。
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+IMAGE_TOKEN_RE = re.compile(r"\[Image #(\d+)\]")
 
 PROBE_CMD = "touch /tmp/ccr_fake_probe"
 PROBE_DESC = "Create probe file in /tmp"
@@ -454,6 +463,18 @@ def fake_png(w, h, seed=1, style="page"):
 
 
 class FakeClaude(object):
+    # 输入框文字与插入点（仿 CLI 2.1.332 真机实测，SPEC §4.2「图片」删除单张）：直接给 input 赋值 = 光标放到末尾
+    # （与以前一样）；← / → 在 "[Image #N]" 上整块跳；退格删掉光标前的一个字符或整块 "[Image #N]"；粘贴 / 打字插在光标处；
+    # 屏幕上把（隐藏的）硬件光标停在插入点上（tmux #{cursor_x} #{cursor_y} 读得到）。
+    @property
+    def input(self):
+        return self._input
+
+    @input.setter
+    def input(self, v):
+        self._input = v
+        self.caret = len(v)
+
     def __init__(self, argv, env=None, size=None, out=None, cwd=None):
         env = os.environ if env is None else env
         self.env = env
@@ -492,6 +513,8 @@ class FakeClaude(object):
         self.turn_tip = None
         self.spinner_on = False
         self.queue = []
+        self.image_seq = 0      # [Image #N] 的 N（整个进程递增）
+        self.images = {}        # N -> {"path": 路径或 None（Ctrl+V）, "data": bytes, "media": "image/png"}
         self.bg_running = False   # /bg 的命令正在前台运行（屏幕上有 ctrl+b 提示）
         self.bg_flag = False      # 用户按了 Ctrl+B：转入后台
         self.bg_until = []        # 转入后台的 shell 的结束时间（底栏 "N shell"）
@@ -507,6 +530,8 @@ class FakeClaude(object):
         self.exit_code = None
         self.dirty = True
         self.last_frame = None
+        self.last_caret = None
+        self.caret_pos = None
         self.tpath = self._transcript_path()
         self.header()
         if self.resume:
@@ -668,18 +693,32 @@ class FakeClaude(object):
         self.last_uuid = e["uuid"]
         return e
 
-    def write_user_text(self, text, prompt=False):
+    def write_user_text(self, text, prompt=False, images=None, source="typed"):
+        """images：消息里的 [Image #N] 编号（仿真机：content = [文字块, 图片块…] + imagePasteIds，随后一条 isMeta 的
+        "[Image: source: <路径>]"；Ctrl+V 的图片没有路径，不写这条）。"""
         extra = {"promptId": str(uuid.uuid4())}
         if prompt:
             self.prompt_index += 1
             extra.update({"permissionMode": "default" if self.mode == "manual" else self.mode,
-                          "origin": {"kind": "human"}, "promptSource": "typed", "turnOrigin": "human",
+                          "origin": {"kind": "human"}, "promptSource": source, "turnOrigin": "human",
                           "turnPosition": {"promptIndex": self.prompt_index, "turnIndex": self.prompt_index}})
             if not os.path.exists(self.tpath):
                 self.append_raw({"type": "permission-mode", "permissionMode": "default", "sessionId": self.session_id})
             self.append_raw({"type": "file-history-snapshot", "messageId": str(uuid.uuid4()),
                              "snapshot": {"trackedFileBackups": {}, "timestamp": now_iso()}, "isSnapshotUpdate": False})
-        e = self.write_entry("user", {"role": "user", "content": text}, extra)
+        content = text
+        if images:
+            content = [{"type": "text", "text": text}] + [
+                {"type": "image", "source": {"type": "base64", "media_type": self.images[n]["media"],
+                                             "data": base64.b64encode(self.images[n]["data"]).decode("ascii")}}
+                for n in images]
+            extra["imagePasteIds"] = list(images)
+        e = self.write_entry("user", {"role": "user", "content": content}, extra)
+        srcs = [self.images[n]["path"] for n in images or () if self.images[n]["path"]]
+        if srcs:
+            self.write_entry("user", {"role": "user", "content": [
+                {"type": "text", "text": "[Image: source: %s]" % x} for x in srcs]},
+                {"promptId": extra["promptId"], "isMeta": True})
         if prompt:
             att = self._base("attachment")
             att["attachment"] = {"type": "date", "date": time.strftime("%Y-%m-%d")}
@@ -812,6 +851,7 @@ class FakeClaude(object):
     def frame(self):
         W, H = self.size()
         d = self.dialog
+        self.caret_pos = None
         if d is not None and d.kind == "trust":
             lines = self.trust_lines(W)
         else:
@@ -869,6 +909,9 @@ class FakeClaude(object):
             avail = max(0, H - len(bottom))
             body = body[-avail:] if len(body) > avail else body + [""] * (avail - len(body))
             lines = (body + bottom)[-H:]
+            if d is None and len(bottom) <= H:
+                r, c = self.caret_cell(W) if (self.input or not self.queue) else (0, 2)
+                self.caret_pos = (avail + len(sep) + 1 + r, min(c, W - 1))
         lines = (lines + [""] * H)[:H]
         return [clip(x, W) for x in lines]
 
@@ -958,14 +1001,17 @@ class FakeClaude(object):
 
     def draw(self, force=False):
         lines = self.frame()
-        if not force and lines == self.last_frame:
+        pos = self.caret_pos or (len(lines) - 1, 0)
+        if not force and lines == self.last_frame and pos == self.last_caret:
             return
         prev = self.last_frame or []
         buf = []
         for i, line in enumerate(lines):
             if force or i >= len(prev) or prev[i] != line:
                 buf.append("\x1b[%d;1H%s\x1b[K" % (i + 1, line))
+        buf.append("\x1b[%d;%dH" % (pos[0] + 1, pos[1] + 1))   # 隐藏的硬件光标停在输入框插入点（同真机）
         self.last_frame = lines
+        self.last_caret = pos
         self.write("".join(buf))
 
     def write(self, s):
@@ -1015,7 +1061,7 @@ class FakeClaude(object):
         self.update_status()
         self.dirty = True
         if self.queue:
-            self.submit(self.queue.pop(0))
+            self.submit(self.queue.pop(0), queued=True)
 
     def interrupt(self):
         if self.turn is None:
@@ -1065,7 +1111,9 @@ class FakeClaude(object):
     def turn_reply(self, msg):
         yield self.think
         first = msg.strip().split("\n")[0][:60]
-        paras = ["收到：%s" % first, "这是 fake claude 的回复（本地测试用，不会调用任何模型）。",
+        n_img = len(self.message_images(msg))
+        paras = ["收到：%s" % first + ("（含 %d 张图片）" % n_img if n_img else ""),
+                 "这是 fake claude 的回复（本地测试用，不会调用任何模型）。",
                  "当前模型 %s，effort %s，权限模式 %s。" % (self.model_display(), self.effort, self.mode)]
         for d in self.stream(paras):
             yield d
@@ -1136,18 +1184,65 @@ class FakeClaude(object):
         else:
             self.write_tool_result(tid, "\n".join(str(i) for i in range(BG_STEPS)) + "\nBG-DONE", False)
             paras = ["计数循环已运行完毕（fake：没有真正运行）。"]
+        paras += self.absorbed_reply(self.absorb_queue())
         yield self.delay
         for d in self.stream(paras):
             yield d
-        self.finish(paras[0])
+        self.finish("\n\n".join(paras))
 
     def send_now(self):
-        """Ctrl+X Ctrl+S：中断当前生成，立即发送排队的消息。"""
+        """Ctrl+X Ctrl+S 立即发送排队的消息（真机 2.1.332 实测）：正在跑 Bash 命令时 → 命令转入后台，排队消息在这一轮中途
+        被吸收（absorb_queue：只写 attachment）；其它时候 → 截断当前输出（不写中断标记、没有 "Interrupted"），排队消息
+        作为新的一轮发送（user 条目，promptSource=queued）。"""
         if self.turn is None or not self.queue:
             return
+        if self.bg_running:
+            self.bg_flag = True
+            return
         q, self.queue = list(self.queue), []
-        self.interrupt()
-        self.submit("\n".join(q))
+        try:
+            self.turn.close()
+        except Exception:
+            pass
+        self.turn = None
+        self.dialog = None
+        self.end_turn()
+        self.submit("\n".join(q), queued=True)
+
+    def absorb_queue(self):
+        """真机 2.1.330–2.1.332：回复进行中提交（排队）的消息在下一个工具结果之后被这一轮吸收——屏幕上从排队区移到正文
+        （"❯ <消息>"，带图片时下面每张一行 "⎿  [Image #N]"），transcript **只**写一条 attachment（queued_command、
+        commandMode=prompt、origin.kind=human、humanTurn；带图片时 prompt = [文字块, 图片块…] + imagePasteIds），
+        不写 user 条目。以 / 开头的（本地命令）不吸收，留到本轮结束后再发。返回吸收的消息文字。"""
+        q = [t for t in self.queue if not t.strip().startswith("/")]
+        self.queue = [t for t in self.queue if t.strip().startswith("/")]
+        for text in q:
+            self.add_block("❯ ", "  ", text)
+            imgs = self.message_images(text)
+            for n in imgs:
+                self.add(RES, "     ", "[Image #%d]" % n)
+            att = self._base("attachment")
+            att["attachment"] = {
+                "type": "queued_command",
+                "prompt": [{"type": "text", "text": text}] + [
+                    {"type": "image", "source": {"type": "base64", "media_type": self.images[n]["media"],
+                                                 "data": base64.b64encode(self.images[n]["data"]).decode("ascii")}}
+                    for n in imgs] if imgs else text,
+                "source_uuid": str(uuid.uuid4()), "delivery_id": uuid.uuid4().hex[:16],
+                "imagePasteIds": list(imgs) if imgs else None, "commandMode": "prompt", "origin": {"kind": "human"},
+                "timestamp": att["timestamp"], "humanTurn": True}
+            if not imgs:
+                del att["attachment"]["imagePasteIds"]
+            att["renderedRole"] = "system"
+            self.append_raw(att)
+            self.last_uuid = att["uuid"]
+        if q:
+            self.dirty = True
+        return q
+
+    @staticmethod
+    def absorbed_reply(texts):
+        return ["收到回复进行中发来的消息：%s" % t.strip().split("\n")[0][:60] for t in texts]
 
     def tool_use(self, name, inp):
         tid = "toolu_fake" + uuid.uuid4().hex[:16]
@@ -1328,11 +1423,11 @@ class FakeClaude(object):
         self.write_tool_result(tid, "(fake：命令没有真正执行)", False)
         self.blank()
         self.add("  ", "  ", "Ran 1 shell command")
+        paras = ["已执行 %s（fake：没有真正运行，命令没有输出）。" % PROBE_CMD] + self.absorbed_reply(self.absorb_queue())
         yield self.delay
-        paras = ["已执行 %s（fake：没有真正运行，命令没有输出）。" % PROBE_CMD]
         for d in self.stream(paras):
             yield d
-        self.finish(paras[0])
+        self.finish("\n\n".join(paras))
 
     def bash_options(self):
         opts = ["Yes", "Yes, and always allow access to /tmp from this project"]
@@ -1401,7 +1496,8 @@ class FakeClaude(object):
         self.finish(paras[0])
 
     # ---------------------------------------------------------- 提交
-    def submit(self, text):
+    def submit(self, text, queued=False):
+        """queued=True：排队的消息在上一轮结束后才发出（真机 user 条目 promptSource=queued）。"""
         cmd = text.strip()
         if self.turn is not None:
             self.queue.append(text)
@@ -1437,7 +1533,10 @@ class FakeClaude(object):
             self.context_usage()
             return
         self.add_block("❯ ", "  ", text)
-        self.write_user_text(text, prompt=True)
+        imgs = self.message_images(text)
+        for n in imgs:   # 真机：回显下面每张图一行 "  ⎿  [Image #N]"
+            self.add(RES, "     ", "[Image #%d]" % n)
+        self.write_user_text(text, prompt=True, images=imgs, source="queued" if queued else "typed")
         if "/tool" in text:
             gen = self.turn_tool(text)
         elif "/write" in text:
@@ -1680,13 +1779,26 @@ class FakeClaude(object):
                 self.popup_hidden = False
                 self.submit(text)
             return
+        if k == "C-v":
+            # Ctrl+V = 粘贴剪贴板图片。fake 绝不读真实剪贴板：生成一张示意 PNG（CCR_FAKE_CLIPBOARD=none = 剪贴板里没有图片）
+            if self.env.get("CCR_FAKE_CLIPBOARD") != "none":
+                self.add_image(None, fake_png(48, 32, seed=self.image_seq + 7))
+            return
         if k == "BSpace":
-            self.input = self.input[:-1]
+            before = self._input[:self.caret]
+            m = re.search(r"\[Image #\d+\]$", before)
+            cut = m.start() if m else max(0, len(before) - 1)   # 真机：退格整块删掉光标前的图片占位，两边空格留着
+            self._input = before[:cut] + self._input[self.caret:]
+            self.caret = cut
             self.popup_hidden = False
             return
-        if k == "C-u":
-            head, sep, _ = self.input.rpartition("\n")
-            self.input = head + sep
+        if k in ("Left", "Right"):
+            self.move_caret(-1 if k == "Left" else 1)
+            return
+        if k == "C-u":   # 删到本行行首（光标在末尾时 = 以前的"删掉最后一行"）
+            ls = self._input.rfind("\n", 0, self.caret) + 1
+            self._input = self._input[:ls] + self._input[self.caret:]
+            self.caret = ls
             return
         if k == "C-c":
             if self.input:
@@ -1697,7 +1809,7 @@ class FakeClaude(object):
                 self.ctrl_c_at = time.time()
             return
 
-    def on_text(self, s):
+    def on_text(self, s, paste=False):
         self.dirty = True
         d = self.dialog
         if d is not None:
@@ -1708,8 +1820,82 @@ class FakeClaude(object):
                 if ch in "123456789sync ":
                     self.on_key("Space" if ch == " " else ch)
             return
-        self.input += s.replace("\r\n", "\n").replace("\r", "\n")
+        paths = self.drop_paths(s) if paste else None
+        if paths:   # 粘贴的整段是图片路径（= 终端里拖入图片）：变成 [Image #N]
+            for path in paths:
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                self.add_image(path, data)
+            return
+        self.insert_text(s.replace("\r\n", "\n").replace("\r", "\n"))
         self.popup_hidden = False
+
+    def insert_text(self, t):
+        self._input = self._input[:self.caret] + t + self._input[self.caret:]
+        self.caret += len(t)
+
+    def move_caret(self, step):
+        """← / →：图片占位整块跳过（真机实测），其余字符一步一个；到头不动。"""
+        t, c = self._input, self.caret
+        if step < 0 and c > 0:
+            m = re.search(r"\[Image #\d+\]$", t[:c])
+            self.caret = m.start() if m else c - 1
+        elif step > 0 and c < len(t):
+            m = re.match(r"\[Image #\d+\]", t[c:])
+            self.caret = c + (m.end() if m else 1)
+
+    def caret_cell(self, W):
+        """插入点在输入框里的 (第几行, 显示列)：按与 frame() 相同的折行规则算光标前的文字。"""
+        before = self._input[:self.caret]
+        lines = self._input.split("\n")
+        li = before.count("\n")
+        off = len(before) - (before.rfind("\n") + 1)
+        row = sum(len(wrap(l, W, "❯" + NB if i == 0 else "  ", "  ")) for i, l in enumerate(lines[:li]))
+        part = wrap(lines[li][:off], W, "❯" + NB if li == 0 else "  ", "  ")
+        return row + len(part) - 1, dwidth(part[-1])
+
+    # ---------------------------------------------------------- 图片（[Image #N]）
+    @staticmethod
+    def _image_file(p):
+        return p.startswith("/") and p.lower().endswith(IMAGE_EXTS) and os.path.isfile(p)
+
+    def drop_paths(self, text):
+        """一次粘贴的文字是不是图片路径（真机实测）：整段就是一个存在的图片文件（路径里的空格可不转义）；或空格分隔、
+        反斜杠转义（终端拖放的写法）、每个都是图片文件。换行分隔、夹带别的文字 → None（按普通文字处理）。"""
+        t = text.strip()
+        if not t or "\n" in t or "\r" in t:
+            return None
+        if self._image_file(t):
+            return [t]
+        try:
+            parts = shlex.split(t)   # 反斜杠转义、引号（真机实测 "my\\ shot.png"、"'my shot.png'" 都识别）
+        except ValueError:
+            return None
+        return parts if parts and all(self._image_file(x) for x in parts) else None
+
+    def add_image(self, path, data):
+        """输入框末尾加一个 [Image #N]（紧跟在另一张图后面时 CLI 自己补一个空格）。"""
+        self.image_seq += 1
+        n = self.image_seq
+        media = "image/png"
+        if data[:3] == b"\xff\xd8\xff":
+            media = "image/jpeg"
+        elif data[:6] in (b"GIF87a", b"GIF89a"):
+            media = "image/gif"
+        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            media = "image/webp"
+        self.images[n] = {"path": path, "data": data, "media": media}
+        at_end = self.caret == len(self._input)
+        # 真机：接在末尾、前一张也是图片时补一个空格；插在中间（光标被挪过）原样插入（实测 "[Image #1][Image #4] [Image #3]"）
+        self.insert_text((" " if at_end and self._input.endswith("]") else "") + "[Image #%d]" % n)
+        self.popup_hidden = False
+        self.dirty = True
+
+    def message_images(self, text):
+        return [int(x) for x in IMAGE_TOKEN_RE.findall(text) if int(x) in self.images]
 
     def resolve(self, value):
         self.dialog = None
@@ -1823,7 +2009,8 @@ class FakeClaude(object):
     SEQ = {b"\x1b[A": "Up", b"\x1b[B": "Down", b"\x1b[C": "Right", b"\x1b[D": "Left", b"\x1b[Z": "BTab",
            b"\x1bOA": "Up", b"\x1bOB": "Down", b"\x1bOC": "Right", b"\x1bOD": "Left"}
     CTRL = {b"\r": "Enter", b"\n": "Enter", b"\x7f": "BSpace", b"\x08": "BSpace", b"\t": "Tab",
-            b"\x03": "C-c", b"\x15": "C-u", b"\x02": "C-b", b"\x18": "C-x", b"\x13": "C-s", b"\x0b": "C-k"}
+            b"\x03": "C-c", b"\x15": "C-u", b"\x02": "C-b", b"\x18": "C-x", b"\x13": "C-s", b"\x0b": "C-k",
+            b"\x16": "C-v"}
 
     def feed(self, buf, final=False):
         """解析输入字节，返回未消费的剩余部分。final=True 时单独的 ESC 视为 Escape 键。"""
@@ -1832,7 +2019,7 @@ class FakeClaude(object):
                 end = buf.find(b"\x1b[201~")
                 if end < 0:
                     return buf
-                self.on_text(buf[6:end].decode("utf-8", "replace"))
+                self.on_text(buf[6:end].decode("utf-8", "replace"), paste=True)
                 buf = buf[end + 6:]
                 continue
             if buf[:1] == b"\x1b":

@@ -27,7 +27,7 @@ export function collectTurn(s) {
   for (let k = s.items.length - 1; k >= 0; k--) {
     const it = s.items[k];
     if (it.kind === 'turnsum') return null;
-    if (it.kind === 'user') break;
+    if (it.kind === 'user' && !it.midTurn) break;   // 回复中发送的消息属于这一轮，不是边界
     if (it.kind === 'tool') tools.unshift(it);
   }
   if (!tools.some((t) => EDIT_TOOLS.has(t.name) || t.name === 'Bash')) return null;

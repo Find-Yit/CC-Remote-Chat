@@ -18,7 +18,9 @@
   仍在同一个对话框（指纹相同）就播放，中间短暂闪成 busy 再回来不影响（真机实测会闪）；全局 GLOBAL_GAP 秒内最多
   响一次；reset()（启动 / 重启 / 重新附着时）之后的首次状态同步、以及 QUIET_AFTER_RESET 秒内的状态都只当基线、不响。
 - 回调（add_listener）：完成确认后（不论最终响不响）在锁外回调 fn(sid, "done")，SessionManager 据此记 done_at
-  （侧栏"新回复"），保证"响一声"与"变红"出自同一个判定。"需要操作"不回调。
+  （侧栏"新回复"），保证"响一声"与"变红"出自同一个判定。"需要操作"只回调用 kinds 明确订阅了 "attention" 的监听者
+  （SessionManager 据此记 attn_at，原生窗口的系统通知用，SPEC §12.1）：确认时仍停在同一个对话框、不是重复提醒即回调，
+  同样不看响不响。
 """
 from __future__ import annotations
 
@@ -190,14 +192,18 @@ class Notifier:
         self.history: list = []   # 最近的播放 / 跳过记录（调试与测试用，最多 50 条）
 
     # ------------------------------------------------------------ 事件回调
-    def add_listener(self, fn: Callable[[str, str], None]) -> None:
-        """注册 fn(sid, kind)。kind 目前只有 "done"：本轮完成**确认**（通过 muted / 状态没变两步检查）时调用，
+    def add_listener(self, fn: Callable[[str, str], None], kinds=("done",)) -> None:
+        """注册 fn(sid, kind)。kinds 默认只有 "done"：本轮完成**确认**（通过 muted / 状态没变两步检查）时调用，
         与提示音同一个触发点；声音被设置关掉、被全局间隔合并、或本机由 CLI 自己的 Stop hook 去响时照样调用。
+        kinds 含 "attention"：需要操作的提示**确认**（此刻仍停在同一个对话框、不是已提醒过的同一个对话框）时调用，
+        同样不看响不响（系统通知用，SPEC §12.1）。
         在 Notifier._lock 之外调用（定时器线程里），回调里可以再拿 SessionManager / 会话的锁。"""
-        self._listeners.append(fn)
+        self._listeners.append((fn, frozenset(kinds or ())))
 
     def _emit(self, sid: str, kind: str) -> None:
-        for fn in list(self._listeners):
+        for fn, kinds in list(self._listeners):
+            if kind not in kinds:
+                continue
             try:
                 fn(sid, kind)
             except Exception:  # noqa: BLE001  回调出错不能影响提示音
@@ -306,7 +312,7 @@ class Notifier:
                 dup_local = bool(self._local_hook())   # 只读检查（结果按 mtime 缓存）
             except Exception:  # noqa: BLE001
                 dup_local = False
-        done = play = False
+        done = attn = play = False
         with self._lock:
             st = self._st.get(sid)
             if st is None:
@@ -327,6 +333,7 @@ class Notifier:
                 if sig == st.last_wait_sig and not st.acted:
                     self._note("skip", sid=sid, event=event, reason="duplicate")
                     return
+                attn = True
             now = self._clock()
             if not cfg["enabled"] or not cfg["on_" + event]:
                 if event == "attention":
@@ -343,6 +350,8 @@ class Notifier:
                     st.last_wait_sig, st.acted = sig, False
         if done:
             self._emit(sid, "done")   # 锁外：回调里会拿会话锁（锁顺序 s.lock → Notifier._lock，反过来会死锁）
+        if attn:
+            self._emit(sid, "attention")
         if play:
             self._do_play(cfg, sid=sid, event=event)
 

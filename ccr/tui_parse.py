@@ -36,6 +36,7 @@ _AGENT_INFO_RE = re.compile(r"^(?:([a-z]+)\s+·\s+)?\d+(?:\.\d+)?[smh]\b")
 # "enter to view · x to stop · ctrl+x ctrl+k to stop all agents"、"enter to view · x to clear"（已停止的行）
 _AGENTS_FOCUS_RE = re.compile(r"^(?:↑/↓ to select|enter to view)\b")
 _POPUP_RE = re.compile(r"^\s{2,4}(❯\s)?\s*(/[\w:.\-]+)(?:\s{2,}(.*))?$")
+_POPUP_CONT_RE = re.compile(r"^\s{10,}\S")   # 补全项说明的折行（与 node_agent.G_HINT_RE 同一写法）
 _MORE_RE = re.compile(r"^\s*([↑↓])\s*(\d+)\s+more\s*$")
 # /model 面板的 effort 行（实测）："  ○ Low effort ←/→ to adjust"、"  ◉ xHigh effort …"、"  ◈ Max effort …"；
 # 图标会变且可省略，档位名整体识别（xHigh / Extra high → xhigh），识别不了 level=None
@@ -1214,13 +1215,20 @@ def parse_screen(text: str) -> Dict:
                     content.pop()
         pop = []
         k = len(content) - 1
-        while k >= 0 and content[k].strip() and _POPUP_RE.match(content[k]):
+        # 说明太长时 CLI 把它折到下一行（缩进到说明列，实测 2.1.332 的 skill）：续行也属于补全列表
+        while k >= 0 and content[k].strip() and (_POPUP_RE.match(content[k]) or _POPUP_CONT_RE.match(content[k])):
             pop.append(content[k])
             k -= 1
+        while pop and not _POPUP_RE.match(pop[-1]):   # 最上面必须是一项命令，多扫的续行样子的行还回去
+            pop.pop()
+            k += 1
         if pop and any(re.match(r"^\s{2,4}❯\s", p) for p in pop):
             items = []
             for p in reversed(pop):
                 m = _POPUP_RE.match(p)
+                if not m:
+                    items[-1]["desc"] = (items[-1]["desc"] + " " + p.strip()).strip()
+                    continue
                 items.append({"cmd": m.group(2), "desc": (m.group(3) or "").strip(),
                               "selected": bool(m.group(1))})
             res["popup"] = items

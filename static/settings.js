@@ -5,6 +5,9 @@ import { h, icon, spinner } from './dom.js';
 import { modal, toast } from './dialogs.js';
 import { updateSettingsField } from './update.js';
 import { BASE_URL_RE, setDefaultBaseUrl, loadUsage } from './apikeys.js';
+import { sysNotifySection } from './sysnotify.js';   // 系统通知（只在原生窗口里可用，SPEC §12.1）
+import { keepAwakeSection } from './keepawake.js';   // 防休眠（SPEC §12.2）
+import { chatWidthField } from './chatwidth.js';   // 聊天宽度（只存在本机 localStorage，立即生效）
 
 // dmg 版自动更新：app.js 在后端开启了自动更新时调用（之后设置弹窗多一节「更新」）；没调用时与以前完全相同
 let updateStore = null;
@@ -99,6 +102,8 @@ export function settingsDialog(api, { config, onSaved }) {
     });
     done.addEventListener('click', () => dlg.close());
 
+    const sysn = sysNotifySection();
+    const kawake = keepAwakeSection(api, { config: cfg, save, getConfig: () => cfg });
     const body = h('div', { class: 'form-grid' },
       h('div', { class: 'field' }, h('label', { class: 'field-label' }, '服务器（SSH 主机别名）'), hostInput,
         h('div', { class: 'field-hint' }, '服务器会话 = ssh <主机> → srun --jobid=<作业> --overlap（需要 Slurm 集群，且这台 Mac 能免密 ssh 登录）。只用本机模式可以留空。')),
@@ -109,6 +114,7 @@ export function settingsDialog(api, { config, onSaved }) {
         h('div', { class: 'field-hint' }, '/System/Library/Sounds 里的系统声音；默认 Blow')),
       h('div', { class: 'muted small-text' }, '声音由本机后端用 /usr/bin/afplay 播放（服务器会话也在这台 Mac 上响）。app 启动或重连后的首次状态同步不响；同一时刻多个会话最多响一次。'),
       localNote,
+      sysn ? sysn.el : null, kawake.el,
       h('div', { class: 'field' }, h('label', { class: 'field-label' }, '默认 base_url（API key）'),
         h('div', { class: 'row' }, baseUrl, baseSave),
         h('div', { class: 'field-hint' }, '已保存的 API key 没有单独填写 base_url 时用这个地址：查询近 7 天用量（GET <base_url>/v1/usage），'
@@ -116,13 +122,14 @@ export function settingsDialog(api, { config, onSaved }) {
           + '只保存在本程序的 config.json，不读写 ~/.claude；选「默认（settings.json）」启动的会话不受影响。'),
         baseErr),
       h('div', { class: 'row' }, status));
+    body.prepend(chatWidthField().el);   // 聊天宽度：标准 / 宽 / 很宽 / 全宽（纯前端）
     // dmg 版自动更新（只有后端开启时 update 才不为 null）
     const upd = update ? updateSettingsField(api, update, { onError: (e) => toast('操作失败：' + e.message, 'error') }) : null;
     if (upd) body.appendChild(upd.el);
     const extra = extraSection ? extraSection(api) : null;
     if (extra) body.appendChild(extra.el);
     if (extra && extra.hideTest) test.hidden = true;
-    const dlg = modal({ title: '设置', body, actions: [done], onClose: () => { if (upd) upd.dispose(); if (extra) extra.dispose(); resolve(cfg); } });
+    const dlg = modal({ title: '设置', body, actions: [done], onClose: () => { if (upd) upd.dispose(); if (extra) extra.dispose(); if (sysn) sysn.dispose(); kawake.dispose(); resolve(cfg); } });
     syncDisabled();
     api.get('/api/notify').then((info) => {
       const names = Array.isArray(info.sounds) ? info.sounds : [];

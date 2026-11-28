@@ -36,7 +36,7 @@ export function toolCategory(name) {
   if (n.startsWith('mcp__')) return 'mcp';
   if (n === 'WebFetch' || n === 'WebSearch') return 'web';
   if (n === 'Task' || n === 'Agent') return 'agent';
-  if (n === 'TodoWrite') return 'todo';
+  if (n === 'TodoWrite' || n === 'TaskCreate' || n === 'TaskUpdate' || n === 'TaskList' || n === 'TaskGet') return 'todo';   // 任务清单（todopin.js）
   if (n === 'AskUserQuestion') return 'ask';
   return 'other';
 }
@@ -78,6 +78,18 @@ export function toolInfo(name, input) {
     }
     case 'Task': case 'Agent':
       return { icon: 'agent', label: n === 'Task' ? '子任务' : 'Agent', summary: str(i.description) + (i.subagent_type ? '  ·  ' + i.subagent_type : '') };
+    // CLI 2.1.332 的任务清单工具（实测 transcript：模型可能把 subject 写成 title、taskId 写成 task_id）
+    case 'TaskCreate':
+      return { icon: 'list', label: '新建任务', summary: str(i.subject || i.title || i.content) };
+    case 'TaskUpdate': {
+      const st = { pending: '待办', in_progress: '进行中', completed: '已完成', deleted: '删除' }[i.status] || '';
+      const id = str(i.taskId ?? i.task_id);
+      return { icon: 'list', label: '更新任务', summary: (id ? '#' + id : '') + (st ? ' → ' + st : '') + (i.subject ? '  ·  ' + str(i.subject) : '') };
+    }
+    case 'TaskList':
+      return { icon: 'list', label: '任务清单', summary: '查看全部任务' };
+    case 'TaskGet':
+      return { icon: 'list', label: '查看任务', summary: '#' + str(i.taskId ?? i.task_id) };
     case 'AskUserQuestion': {
       const qs = Array.isArray(i.questions) ? i.questions : [];
       return { icon: 'question', label: '提问', summary: qs.map((q) => str(q && (q.header || q.question))).join('；') };

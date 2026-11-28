@@ -158,3 +158,13 @@
   apply();
   applyColorful();
 })();
+
+// 聊天宽度（static/chatwidth.js，SPEC §7「聊天宽度」）：首帧前写好 <html data-chatw>，消息列不会先按 800px 排一遍再变宽。
+// 偏好存 localStorage「ccr.chatw」：wide | wider | full；缺省 / 非法 = 标准（不写属性，与以前完全相同）。切换由 chatwidth.js 负责。
+(function () {
+  'use strict';
+  try {
+    var v = localStorage.getItem('ccr.chatw');
+    if (v === 'wide' || v === 'wider' || v === 'full') document.documentElement.setAttribute('data-chatw', v);
+  } catch (e) { /* 隐私模式等 */ }
+})();

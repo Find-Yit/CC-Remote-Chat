@@ -244,6 +244,9 @@ class _Session:
         self.title_user: Optional[bool] = False
         # 侧栏手动排序：数字小的在上；None = 没排过（按创建时间，新的在最上）
         self.order: Optional[float] = None
+        # 侧栏归属（SPEC §15.2）：True = 在项目里（侧栏按 运行位置 + cwd 归组）；False = 在「聊天」里（不归组）。
+        # 新建时由入口决定（项目的「+」/「新建项目」= True，侧栏顶部「新建聊天」= False）；升级前的旧记录没有这个字段 = True
+        self.in_project: bool = True
         # 完成但未看（侧栏"新回复"，SPEC §15）：done_at = 最近一次确认完成的时间（与提示音同一个判定，
         # 见 _on_notify_event）；seen_at = 已看水位（用户点过 / 发消息 / 回答对话框）。unread = done_at > seen_at
         self.done_at: Optional[float] = None
@@ -251,6 +254,8 @@ class _Session:
         # app 停止期间可能完成的回复：持久化时还在 busy → 重新附着后第一次稳定看到 idle 时补记 done_at（不响）
         self.done_pending = False
         self.done_pending_since: Optional[float] = None   # 满足条件的起点（monotonic）；None = 当前不满足
+        # 最近一次确认"需要操作"（与提示音同一个判定，见 _on_notify_event）的时间：原生窗口的系统通知用（SPEC §12.1）
+        self.attn_at: Optional[float] = None
         # 重启 / 续接 / 新建 / 换 API 重启的阶段进度（meta.op，见 ccr.opprogress）；只在内存里，不落盘
         self.op: Optional[dict] = None
         self.op_timer: Optional[threading.Timer] = None
@@ -281,7 +286,7 @@ class _Session:
         return {
             "sid": self.sid, "title": self.title, "jobid": self.jobid, "cwd": self.cwd,
             "display_title": self.display_title(), "cli_title": self.cli_title, "title_user": self.title_user,
-            "order": self.order, "working": self.working(sub_counts["running"]),
+            "order": self.order, "in_project": self.in_project, "working": self.working(sub_counts["running"]),
             "done_at": self.done_at, "seen_at": self.seen_at, "unread": self.unread(),
             "launch": dict(self.launch), "claude_session_id": self.claude_session_id,
             "claude_pid": self.claude_pid, "state": self.state, "status": self.status,
@@ -295,6 +300,7 @@ class _Session:
             # 本次启动后 Shift+Tab 能循环到的模式；不在里面的（如没带跳过权限时的 bypass、dontAsk）需要重启才能切换
             "mode_cycle": mode_cycle(self.launch, self.modes_seen),
             "op": ccr_op.public(self.op),
+            "attn_at": self.attn_at,
         }
 
     def live(self) -> bool:
@@ -516,7 +522,7 @@ class SessionManager:
         self.notifier = notifier if notifier is not None else ccr_notify.NullNotifier()
         add = getattr(self.notifier, "add_listener", None)
         if callable(add):
-            add(self._on_notify_event)
+            add(self._on_notify_event, kinds=("done", "attention"))
         self.data_dir = pathlib.Path(data_dir).expanduser()
         self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._sessions_path = self.data_dir / "sessions.json"
@@ -717,9 +723,10 @@ class SessionManager:
 
     # ---------------------------------------------------------------- 完成但未看（侧栏"新回复"）
     def _on_notify_event(self, sid: str, kind: str) -> None:
-        """Notifier 回调（定时器线程、Notifier 锁之外）：本轮完成确认 → 记 done_at（与提示音同一个判定）。"""
-        if kind != "done":
-            return   # "需要操作"（对话框）不算新回复：侧栏按实时状态显示"待处理"
+        """Notifier 回调（定时器线程、Notifier 锁之外）：本轮完成确认 → 记 done_at（与提示音同一个判定）；
+        需要操作确认 → 只记 attn_at（系统通知用，SPEC §12.1；对话框不算新回复：侧栏按实时状态显示"待处理"）。"""
+        if kind not in ("done", "attention"):
+            return
         with self._lock:
             s = self._sessions.get(sid)
         if s is None or self._shutdown:
@@ -727,7 +734,11 @@ class SessionManager:
         with s.lock:
             if s.exited:
                 return
-            self._mark_done_locked(s)
+            if kind == "attention":
+                now = time.time()
+                s.attn_at = now if s.attn_at is None or now > s.attn_at else s.attn_at + 0.001   # 单调递增
+            else:
+                self._mark_done_locked(s)
         self._emit_meta(s)
 
     @staticmethod
@@ -1371,6 +1382,15 @@ class SessionManager:
         # 独立的较长超时：远端在 NFS 上、链路慢时一张大图要传好几秒（agent 端 blob 在独立线程，不影响 ping/按键）
         return self._req(jobid, "blob", timeout=BLOB_TIMEOUT, sid=sid, ref=ref, session_id=cid)
 
+    def file_op(self, sid, op, timeout=30.0, **params):
+        """（服务器文件预览，ccr/srvfiles.py）只读的 file_stat / file_read，发给该会话所在作业的 agent。"""
+        if op not in ("file_stat", "file_read"):
+            raise ValueError("不支持的文件操作")
+        s = self._get(sid)
+        with s.lock:
+            jobid = s.jobid
+        return self._req(jobid, op, timeout=timeout, **params)
+
     def _apply_session(self, s: _Session, data: dict) -> None:
         with s.lock:
             st = data.get("status")
@@ -1877,9 +1897,12 @@ class SessionManager:
         remote.validate_host(cfg.get("host") or "")
 
     def create(self, jobid, cwd, title=None, model=None, permission_mode=None, skip_permissions=False,
-               effort=None, resume=None, api_key_id=None) -> dict:
+               effort=None, resume=None, api_key_id=None, project=False) -> dict:
+        """project：侧栏归属（True = 放进项目；默认 False = 在「聊天」里，老前端不带这个参数时也是 False）。"""
         if self._shutdown:
             raise OpError("服务正在关闭")
+        if not isinstance(project, bool):
+            raise ValueError("project 必须是布尔值")
         if jobid is None or str(jobid).strip() == "":
             raise ValueError("请先设置 jobid")
         j = remote.validate_target(str(jobid).strip())   # 作业 jobid，或本机 LOCAL_JOBID
@@ -1903,6 +1926,7 @@ class SessionManager:
         s.title = _clean_title(title, default_title)
         s.title_user = bool(_clean_title(title, ""))
         s.jobid, s.cwd, s.launch = j, cwd_v, launch
+        s.in_project = project
         s.api_key_name = key_name
         s.claude_session_id = r
         s.attached = True
@@ -3356,6 +3380,17 @@ class SessionManager:
         self._emit_meta(s)
         return {"ok": True}
 
+    def set_in_project(self, sid, value) -> dict:
+        """侧栏归属（SPEC §15.2）：移入项目（True，归入它 运行位置 + cwd 对应的项目）/ 移出项目（False，到「聊天」里）。
+        只改显示归属：不碰 claude、不改 cwd、不发任何键。"""
+        if not isinstance(value, bool):
+            raise ValueError("in 必须是布尔值")
+        s = self._get(sid)
+        with s.lock:
+            s.in_project = value
+        self._emit_meta(s)
+        return {"ok": True, "in_project": value}
+
     def reorder(self, sids) -> dict:
         """侧栏手动排序：sids = 从上到下的会话 id（可以只是一部分，没列出的保持原值）。"""
         if not isinstance(sids, list) or len(sids) > 1000 or not all(isinstance(x, str) for x in sids):
@@ -3477,6 +3512,8 @@ class SessionManager:
         s.title_user = tu if isinstance(tu, bool) else None   # 旧记录：下面按"像不像默认标题"判断
         od = m.get("order")
         s.order = float(od) if isinstance(od, (int, float)) and not isinstance(od, bool) and abs(od) < 1e9 else None
+        ip = m.get("in_project")
+        s.in_project = ip if isinstance(ip, bool) else True   # 升级前的记录没有这个字段：都算在项目里（按 cwd 归组）
         try:
             s.jobid = remote.validate_target(m.get("jobid") or "")   # 作业 jobid 或本机 LOCAL_JOBID
         except ValueError:

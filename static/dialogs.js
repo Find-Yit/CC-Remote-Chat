@@ -285,8 +285,10 @@ export const LAUNCH_MODES = ['acceptEdits', 'auto', 'bypassPermissions', 'manual
 export const LAUNCH_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
- * preset: {jobid, cwd, model, permission_mode, skip_permissions, effort, title, resume, target}
+ * preset: {jobid, cwd, model, permission_mode, skip_permissions, effort, title, resume, target, project, heading, project_name}
  *   target：'server' | 'local'（运行位置；不给 = 上次的选择）。续接历史会话时固定为该历史所在的机器（不能切换）。
+ *   project：「放进项目」默认勾不勾（SPEC §15.2：项目的「+」/「新建项目」= true，「新建聊天」/ 从历史续接 = false）；
+ *   heading：对话框标题；project_name：项目的显示名（目录没改时提示里用它）。
  * modelHints: 额外的模型候选（来自最近一次 model_list）
  * 内部 POST /api/sessions（字段见 SPEC §4.2 create；本机 = jobid "local"，SPEC §9），成功后 resolve(meta)；取消 resolve(null)
  */
@@ -315,7 +317,7 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
         browse.replaceChildren(spinner(), ' 在 Finder 对话框中选择…');
         try {
           const p = await chooseLocalFolder(api, cwd.value.trim() || '~');
-          if (p) cwd.value = p;
+          if (p) { cwd.value = p; renderProj(); }
         } finally {
           browse.disabled = false;
           renderBrowse();
@@ -324,12 +326,12 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
         return;
       }
       const p = await pickDirectory(api, cwd.value.trim() || '~', target);
-      if (p) cwd.value = p;
+      if (p) { cwd.value = p; renderProj(); }
     });
     const inApp = h('button', { class: 'linklike small-text', type: 'button', title: '在应用内浏览本机目录（不弹系统对话框）' }, '应用内浏览');
     inApp.addEventListener('click', async () => {
       const p = await pickDirectory(api, cwd.value.trim() || '~', target);
-      if (p) cwd.value = p;
+      if (p) { cwd.value = p; renderProj(); }
     });
     const renderBrowse = () => {
       const local = target === 'local' && !REMOTE;
@@ -358,6 +360,19 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
     const hints = [...new Set([...MODEL_SUGGESTIONS, ...modelHints.filter((m) => MODEL_RE.test(m))])];
     const dl = h('datalist', { id: listId }, hints.map((m) => h('option', { value: m })));
     const title = h('input', { class: 'input', type: 'text', name: 'title', 'aria-label': '标题', value: preset.title ?? '', placeholder: '可留空（默认显示 Claude Code 里的会话标题）' });
+    // 侧栏归属（SPEC §15.2）：勾上 = 放进项目（按 运行位置 + 工作目录 归组）；不勾 = 在「聊天」里
+    const projBox = h('input', { type: 'checkbox', name: 'project', checked: !!preset.project });
+    const projHint = h('div', { class: 'field-hint' });
+    const renderProj = () => {
+      const c = cwd.value.trim() || '~';
+      const nm = preset.project_name && c === String(preset.cwd ?? '') ? preset.project_name
+        : c === '~' || c === '~/' ? '~' : basename(c.replace(/\/+$/, '')) || c;
+      projHint.textContent = projBox.checked
+        ? '会出现在侧栏的项目「' + nm + '」里（' + (target === 'local' ? '本机' : '服务器') + '上同一个工作目录的会话归为一个项目）'
+        : '显示在侧栏的「聊天」里，不归入项目（以后可以在会话的右键菜单里移入项目）';
+    };
+    projBox.addEventListener('change', renderProj);
+    cwd.addEventListener('input', renderProj);
     // API：默认 = 那台机器 settings.json 里的 key（不加 --settings）；选已保存的 key = agent 写 0600 文件后 --settings。
     // 从历史续接：默认选中该 claude 会话上次用的 key（preset.api_key_id / api_note / api_missing_text 由 app.js 给出）
     const apiPick = apiKeySelect(api, {
@@ -389,6 +404,7 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
         : '启动命令 = claude + 上面明确选择的参数；全部留默认就等同于你直接敲 claude。选了 API key 时额外加 --settings <计算节点上的 0600 key 文件>（只覆盖 ANTHROPIC_AUTH_TOKEN 及该 key 的 base_url）。';
       apiPick.setLocal(local);
       renderBrowse();
+      renderProj();
     };
     const setTarget = (t) => {
       if (locked || t === target) return;
@@ -411,6 +427,7 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
       h('div', { class: 'field' }, h('label', { class: 'field-label' }, '运行位置'), seg, targetHint),
       jobField,
       h('div', { class: 'field' }, h('label', { class: 'field-label' }, '工作目录'), h('div', { class: 'row' }, cwd, browse), inApp),
+      h('div', { class: 'field' }, h('label', { class: 'field-label' }, '侧栏'), h('label', { class: 'check' }, projBox, '放进项目'), projHint),
       field('模型（可选）', model, dl),
       field('权限', perm),
       field('Effort', effort),
@@ -439,6 +456,7 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
       const t = title.value.trim();
       if (t) req.title = t;
       if (preset.resume) req.resume = preset.resume;
+      if (projBox.checked) req.project = true;
       ok.disabled = true;
       ok.replaceChildren(spinner(), ' 创建中…');
       try {
@@ -457,7 +475,7 @@ export function newSessionDialog(api, { config, preset = {}, modelHints = [] }) 
     for (const inp of [jobid, cwd, model, title]) {
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submit(); } });
     }
-    const dlg = modal({ title: preset.resume ? (target === 'local' ? '续接历史会话（本机）' : '续接历史会话') : '新建会话', body, actions: [cancel, ok], onClose: () => resolve(result) });
+    const dlg = modal({ title: preset.heading || (preset.resume ? (target === 'local' ? '续接历史会话（本机）' : '续接历史会话') : '新建会话'), body, actions: [cancel, ok], onClose: () => resolve(result) });
     (target === 'server' && !jobid.value ? jobid : cwd).focus();
   });
 }

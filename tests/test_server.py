@@ -128,10 +128,10 @@ class StubManager:
         return dict(self.metas[sid])
 
     def create(self, *, jobid, cwd, title=None, model=None, permission_mode=None, skip_permissions=False,
-               effort=None, resume=None):
+               effort=None, resume=None, **extra):
         self.calls.append(("create", dict(jobid=jobid, cwd=cwd, title=title, model=model,
                                           permission_mode=permission_mode, skip_permissions=skip_permissions,
-                                          effort=effort, resume=resume)))
+                                          effort=effort, resume=resume, **extra)))
         if getattr(self, "create_error", None) is not None:
             raise self.create_error
         if not jobid.isdigit():
@@ -232,6 +232,11 @@ class StubManager:
     def mark_unseen(self, sid):
         self._act("mark_unseen", sid)
         return {"ok": True, "done_at": 1.7e9, "seen_at": 1.7e9 - 0.001, "unread": True}
+
+    def set_in_project(self, sid, value):
+        self._act("set_in_project", sid, value)
+        self.metas[sid]["in_project"] = value
+        return {"ok": True, "in_project": value}
 
     def reorder(self, sids):
         if not isinstance(sids, list):
@@ -844,6 +849,35 @@ class TestApi(Base):
             self.assertErr(self.req("POST", P + path, body, headers={"Sec-Fetch-Site": "cross-site"}), 403)
             self.assertErr(self.req("POST", "/api/sessions/zz/" + path, body), 404)
         self.assertErr(self.req("GET", P + "seen"), 404)
+        self.assertEqual(len(self.mgr.calls), n)
+
+    def test_project_membership(self):
+        """侧栏归属（SPEC §15.2）：新建时 project（只在 true 时传给 manager，老前端不带 = 与以前完全一致）；
+        POST /sessions/<sid>/project {in: bool}：类型校验、鉴权、未知会话。"""
+        self.create()
+        self.assertNotIn("project", self.mgr.calls[-1][1])                 # 不带 = 在「聊天」里（manager 默认 False）
+        self.create(project=False)
+        self.assertNotIn("project", self.mgr.calls[-1][1])
+        self.create(project=None)
+        self.assertNotIn("project", self.mgr.calls[-1][1])
+        sid = self.create(project=True)["sid"]
+        self.assertIs(self.mgr.calls[-1][1]["project"], True)
+        n = len(self.mgr.calls)
+        for bad in ("true", 1, 0, [True], {"x": 1}):
+            self.assertErr(self.req("POST", "/api/sessions", {"jobid": "276403", "project": bad}), 400)
+        self.assertEqual(len(self.mgr.calls), n)                            # 类型不对：没有到达 manager
+        P = "/api/sessions/%s/project" % sid
+        for v in (False, True):
+            st, js, _, _ = self.req("POST", P, {"in": v})
+            self.assertEqual((st, js), (200, {"ok": True, "in_project": v}))
+            self.assertEqual(self.mgr.calls[-1], ("set_in_project", sid, v))
+        n = len(self.mgr.calls)
+        for bad in ({}, {"in": None}, {"in": 1}, {"in": "false"}, {"in": [True]}, {"project": True}):
+            self.assertErr(self.req("POST", P, bad), 400)
+        self.assertErr(self.req("POST", P, {"in": True}, auth=False), 401)
+        self.assertErr(self.req("POST", P, {"in": True}, headers={"Origin": "http://evil.com"}), 403)
+        self.assertErr(self.req("POST", "/api/sessions/zz/project", {"in": True}), 404)
+        self.assertErr(self.req("GET", P), 404)
         self.assertEqual(len(self.mgr.calls), n)
 
     def test_unknown_session_404(self):

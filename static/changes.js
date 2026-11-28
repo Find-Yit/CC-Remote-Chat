@@ -646,7 +646,7 @@ export class ChangesView {
     const f = node.file;
     const acts = [];
     if (this.opts.local && this.opts.local() && this.opts.onOpenFile) {
-      const b = h('button', { class: 'btn ghost small pv-act', type: 'button', title: '在预览面板中打开当前文件（本机）' }, icon('file'), h('span', null, '打开文件'));
+      const b = h('button', { class: 'btn ghost small pv-act', type: 'button', title: '在预览面板中打开当前文件（本机文件，或经 agent 只读取回的服务器文件）' }, icon('file'), h('span', null, '打开文件'));
       b.addEventListener('click', () => this.opts.onOpenFile(f.abs));
       acts.push(b);
     }

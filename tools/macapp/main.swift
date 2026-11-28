@@ -12,6 +12,8 @@
 // - 内置模式（Info.plist CCRBundled=true，tools/make_dmg.sh 生成的 dmg 版，SPEC §14.10）：Python、app 代码、tmux 都在
 //   .app 的 Resources 里，后端 = <Resources>/python/bin/python3 -I -B <Resources>/app/app.py --bundled --data-dir <目录>；
 //   从 dmg / 隔离位置（AppTranslocation）/ 只读卷直接运行时不启动后端，只提示先拖到「应用程序」。没有 CCRBundled 时一切照旧。
+// - 系统通知（SPEC §14.12，默认关闭）：页面经页面世界的 ccrNotify handler 请求发通知；开关存 UserDefaults CCRSysNotify，
+//   只有用户在设置里第一次打开开关时才请求通知授权（启动时绝不请求）；点通知 → 激活窗口并打开对应会话。
 //
 // 编译（tools/make_app.sh 会做）：xcrun swiftc -O -swift-version 5 -target arm64-apple-macos12.0 \
 //   -framework Cocoa -framework WebKit -o "CC Remote Chat" tools/macapp/main.swift
@@ -19,6 +21,7 @@
 
 import Cocoa
 import Darwin
+import UserNotifications
 import WebKit
 
 let kAppName = "CC Remote Chat"
@@ -531,6 +534,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
     var autoReconnects: [Date] = []
     var hideAfterFullScreen = false
     var downloads: [ObjectIdentifier: URL] = [:]
+    let sysNotifier = SysNotifier()     // 系统通知（页面世界的 ccrNotify handler，SPEC §14.12）
     #if CCR_SELFTEST
     var selfTest: SelfTest?
     #endif
@@ -541,6 +545,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
         try? Backend.ensureDir(cfg.dataDir)
         try? Backend.ensureDir(cfg.logsDir)
         UserDefaults.standard.register(defaults: ["NSFullScreenMenuItemEverywhere": false])
+        sysNotifier.setUp(self)   // 只在开关打开过时设 delegate（点通知打开会话）；不请求授权
         buildMenu()
         buildWindow()
         window.makeKeyAndOrderFront(nil)
@@ -596,6 +601,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
         ucc.addUserScript(WKUserScript(source: js, injectionTime: .atDocumentEnd, forMainFrameOnly: true,
                                        in: .defaultClient))
         ucc.add(self, contentWorld: .defaultClient, name: "ccrNative")
+        // 系统通知：页面脚本要能调用，所以在页面世界；消息只认主框架、本应用 origin（SysNotifier 里校验）
+        ucc.addScriptMessageHandler(sysNotifier, contentWorld: .page, name: "ccrNotify")
 
         let wv = CCRWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 820), configuration: conf)
         // 拖入文件：只在显示本应用页面时把路径交给页面（错误页 / 连接中页面照常交给 WebKit，file: 导航会被下面的策略拦掉）
@@ -646,6 +653,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
         guard (1...6).contains(digits.count), digits.allSatisfy({ $0.isASCII && $0.isNumber }),
               rest.hasPrefix(" "), let n = Int(digits) else { return 0 }
         return n
+    }
+
+    /// 窗口在前台：应用是活动的、窗口是主窗口、看得见（没关、没最小化、没被完全挡住）
+    func isForeground() -> Bool {
+        return NSApp.isActive && window.isKeyWindow && window.isVisible && !window.isMiniaturized
+            && window.occlusionState.contains(.visible)
     }
 
     func showWindow() {
@@ -707,6 +720,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
             item("拷贝", #selector(NSText.copy(_:)), "c"),
             item("粘贴", #selector(NSText.paste(_:)), "v"),
             item("全选", #selector(NSText.selectAll(_:)), "a"),
+            .separator(),
+            // 会话内查找（static/finder.js）：按键先交给网页（网页处理了就不会走到菜单）；从菜单栏点 = 派发 ccr-find 事件
+            item("查找…", #selector(findInPage(_:)), "f", target: self),
+            item("查找下一个", #selector(findNextInPage(_:)), "g", target: self),
+            item("查找上一个", #selector(findPrevInPage(_:)), "g", [.command, .shift], target: self),
         ])
         _ = submenu("显示", [
             item("重新载入", #selector(reloadPage(_:)), "r", target: self),
@@ -736,6 +754,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
         NSApp.orderFrontStandardAboutPanel(options: [.applicationName: kAppName, .applicationVersion: ver,
                                                      .version: "", .credits: credits])
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // 查找（⌘F / ⌘G / ⇧⌘G）：WKWebView 把带 ⌘ 的按键先交给网页，网页的查找栏 preventDefault 后菜单不会再收到；
+    // 从菜单栏点（或网页没处理）时把动作以 ccr-find 事件交给页面（action 只是这三个常量，不拼接外部输入）
+    @objc func findInPage(_ sender: Any?) { sendFind("open") }
+    @objc func findNextInPage(_ sender: Any?) { sendFind("next") }
+    @objc func findPrevInPage(_ sender: Any?) { sendFind("prev") }
+    func sendFind(_ action: String) {
+        guard pageState == .app, ["open", "next", "prev"].contains(action) else { return }
+        webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('ccr-find', { detail: { action: '\(action)' } }));", completionHandler: nil)
     }
 
     @objc func reloadPage(_ sender: Any?) {
@@ -1008,6 +1036,271 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, WK
         a.informativeText = (dest.map { $0.lastPathComponent + "：" } ?? "") + error.localizedDescription
         a.addButton(withTitle: "好")
         presentAlert(a) { _ in }
+    }
+}
+
+// MARK: - 系统通知（UNUserNotificationCenter，SPEC §14.12）
+// 页面（static/sysnotify.js）决定什么时候通知：复用后端与提示音同一个判定的 meta.done_at / meta.attn_at（不另造一套），
+// 经**页面世界**的 `ccrNotify` handler（WKScriptMessageHandlerWithReply，页面拿到 Promise）交给这里：
+// 只接受主框架、本应用 origin、当前显示本应用页面时的消息 → 字段校验（ccrParseNotify）→ 开关（UserDefaults CCRSysNotify，
+// 默认关）→ 「当前会话 + 窗口在前台」不弹 → 每分钟最多 kMaxNotifyPerMinute 条 → UNUserNotificationCenter。
+// - 授权只在用户第一次打开开关时请求（op=enable）；启动时只在开关已经打开过时设 delegate（不请求、不弹框）。
+// - 同一会话用同一个 identifier（ccr.<sid>）：新的替换旧的，通知中心里每个会话只留一条；不带声音（提示音由后端 afplay 负责）。
+// - 点通知 → 激活窗口 → 页面派发 ccr-native-open-session（页面还没准备好就先记下，等它 op=status 时取走，60 秒内有效）。
+// - 不读写剪贴板、不碰 ~/.claude*；日志只记失败原因，不记通知内容。
+
+let kSysNotifyKey = "CCRSysNotify"
+let kMaxNotifyPerMinute = 30
+let kOpenPendingTTL: TimeInterval = 60
+
+// BEGIN ccr-notify-script（tests/test_sysnotify.py 抽出这段单独编译，核对校验规则与事件脚本）
+struct CCRNotifyRequest {
+    let sid: String
+    let kind: String      // done | attention
+    let title: String
+    let body: String
+    let current: Bool     // 页面当前打开的就是这个会话（窗口在前台时不弹）
+}
+
+/// 会话 id：与 ccr/server.py 的 SID_RE 相同（[A-Za-z0-9_.-]{1,80}）
+func ccrValidSid(_ s: String) -> Bool {
+    let u = Array(s.utf8)
+    guard (1...80).contains(u.count) else { return false }
+    return u.allSatisfy { c in
+        (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46 || c == 45
+    }
+}
+
+/// 控制字符 / 换行 / U+2028/2029 换成空格、合并空白、去首尾空白，超过 max 个字符截断加 …
+func ccrCleanText(_ s: String, max: Int) -> String {
+    var out = String.UnicodeScalarView()
+    var space = true
+    for ch in s.unicodeScalars {
+        let v = ch.value
+        if v < 0x20 || (v >= 0x7f && v <= 0x9f) || v == 0x2028 || v == 0x2029 || CharacterSet.whitespacesAndNewlines.contains(ch) {
+            if !space { out.append(" "); space = true }
+        } else {
+            out.append(ch)
+            space = false
+        }
+    }
+    var t = String(out).trimmingCharacters(in: .whitespaces)
+    if t.count > max { t = String(t.prefix(Swift.max(0, max - 1))).trimmingCharacters(in: .whitespaces) + "…" }
+    return t
+}
+
+/// 页面发来的 op=post 消息 → 校验后的请求；字段缺失 / 类型不对 / 太长 → nil
+func ccrParseNotify(_ raw: Any?) -> CCRNotifyRequest? {
+    guard let b = raw as? [String: Any], b.count <= 8,
+          let sid = b["sid"] as? String, ccrValidSid(sid),
+          let kind = b["kind"] as? String, kind == "done" || kind == "attention",
+          let title = b["title"] as? String, title.utf16.count <= 2000,
+          let body = b["body"] as? String, body.utf16.count <= 2000 else { return nil }
+    var current = false
+    if let c = b["current"] {
+        guard let v = c as? Bool else { return nil }
+        current = v
+    }
+    let t = ccrCleanText(title, max: 120)
+    let x = ccrCleanText(body, max: 160)
+    return CCRNotifyRequest(sid: sid, kind: kind, title: t.isEmpty ? "会话" : t,
+                            body: x.isEmpty ? (kind == "done" ? "完成" : "需要你处理") : x, current: current)
+}
+
+/// 点了通知 → 交给页面打开会话的脚本（JSON 由 JSONSerialization 生成，sid 只是字符串内容）。
+/// 结果 = 页面的监听者是否接手了（它会 preventDefault）；没接手（页面还在加载）时由调用方先记下。
+func ccrOpenSessionScript(_ sid: String) -> String? {
+    guard ccrValidSid(sid), let data = try? JSONSerialization.data(withJSONObject: ["sid": sid]),
+          let json = String(data: data, encoding: .utf8) else { return nil }
+    return "(function () { var e = new CustomEvent('ccr-native-open-session', { detail: \(json), cancelable: true });"
+        + " return !window.dispatchEvent(e); })();"
+}
+// END ccr-notify-script
+
+/// UNUserNotificationCenter 的回调在任意线程：转到主线程交给 SysNotifier
+final class SysNotifyDelegate: NSObject, UNUserNotificationCenterDelegate {
+    var onOpen: ((String) -> Void)?
+
+    // 窗口在前台时系统默认不显示横幅：页面已经判断过（不是当前会话才会发），这里照样显示
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let sid = response.notification.request.content.userInfo["sid"] as? String
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier, let sid = sid, ccrValidSid(sid) {
+            let cb = onOpen
+            DispatchQueue.main.async { cb?(sid) }
+        }
+        completionHandler()
+    }
+}
+
+@MainActor
+final class SysNotifier: NSObject, WKScriptMessageHandlerWithReply {
+    weak var controller: AppController?
+    let delegate = SysNotifyDelegate()
+    var pendingOpen: (sid: String, at: Date)?
+    var sentTimes: [Date] = []
+    var lastError: String?
+
+    /// 正常安装的 .app（有 bundle id）才能用 UNUserNotificationCenter；否则 current() 会直接抛异常让进程崩溃
+    static var supported: Bool {
+        return Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
+    }
+
+    var enabled: Bool {
+        get { UserDefaults.standard.bool(forKey: kSysNotifyKey) }
+        set { UserDefaults.standard.set(newValue, forKey: kSysNotifyKey) }
+    }
+
+    /// 启动时调用：开关打开过才设 delegate（点通知能打开会话）。不请求授权、不弹任何框
+    func setUp(_ c: AppController) {
+        controller = c
+        delegate.onOpen = { [weak self] sid in
+            MainActor.assumeIsolated { self?.open(sid) }
+        }
+        if Self.supported && enabled { UNUserNotificationCenter.current().delegate = delegate }
+    }
+
+    nonisolated static func authName(_ s: UNAuthorizationStatus) -> String {
+        switch s {
+        case .notDetermined: return "notDetermined"
+        case .denied: return "denied"
+        case .authorized: return "authorized"
+        case .provisional: return "provisional"
+        default: return "authorized"   // ephemeral 等（macOS 上不会出现）
+        }
+    }
+
+    // MARK: 页面消息（只接受主框架、本应用 origin、正在显示本应用页面）
+    func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage,
+                               replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void) {
+        guard let c = controller, message.frameInfo.isMainFrame, c.pageState == .app,
+              c.isAppOrigin(message.frameInfo.securityOrigin),
+              let body = message.body as? [String: Any], body.count <= 8, let op = body["op"] as? String else {
+            replyHandler(nil, "rejected")
+            return
+        }
+        switch op {
+        case "status":
+            status { replyHandler($0, nil) }
+        case "enable":
+            guard let on = body["on"] as? Bool else { return replyHandler(nil, "bad request") }
+            enable(on) { replyHandler($0, nil) }
+        case "post":
+            guard let req = ccrParseNotify(body) else { return replyHandler(nil, "bad request") }
+            post(req) { replyHandler($0, nil) }
+        case "clear":
+            guard let sid = body["sid"] as? String, ccrValidSid(sid) else { return replyHandler(nil, "bad request") }
+            if Self.supported && enabled {
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["ccr." + sid])
+            }
+            replyHandler(["ok": true], nil)
+        default:
+            replyHandler(nil, "unknown op")
+        }
+    }
+
+    /// {available, enabled, auth, open?, error?}；open = 点通知时页面还没准备好、记下来的会话（取走即清）
+    func status(_ done: @escaping @MainActor ([String: Any]) -> Void) {
+        var open: String? = nil
+        if let p = pendingOpen {
+            if Date().timeIntervalSince(p.at) < kOpenPendingTTL { open = p.sid }
+            pendingOpen = nil
+        }
+        let on = enabled
+        let err = lastError
+        guard Self.supported else {
+            done(["available": false, "enabled": false, "auth": "unavailable", "open": open ?? NSNull()])
+            return
+        }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            let auth = Self.authName(s.authorizationStatus)
+            DispatchQueue.main.async {
+                var r: [String: Any] = ["available": true, "enabled": on && auth != "denied", "auth": auth,
+                                        "open": open ?? NSNull()]
+                if let e = err { r["error"] = e }
+                done(r)
+            }
+        }
+    }
+
+    /// 打开 / 关闭开关。打开且从没问过 → 这时才请求授权（系统弹「是否允许通知」）；被拒绝过 → 保持关闭（页面提示去系统设置）
+    func enable(_ on: Bool, _ done: @escaping @MainActor ([String: Any]) -> Void) {
+        lastError = nil
+        guard Self.supported else { enabled = false; return status(done) }
+        if !on {
+            enabled = false
+            NativeLog.write("系统通知：已关闭")
+            return status(done)
+        }
+        UNUserNotificationCenter.current().delegate = delegate
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            let st = s.authorizationStatus
+            DispatchQueue.main.async {
+                switch st {
+                case .notDetermined:
+                    NativeLog.write("系统通知：用户打开了开关，请求授权")
+                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, error in
+                        let msg = error?.localizedDescription
+                        DispatchQueue.main.async {
+                            NativeLog.write("系统通知：授权结果 = \(granted ? "允许" : "不允许")\(msg.map { "（\($0)）" } ?? "")")
+                            self.enabled = granted
+                            self.lastError = granted ? nil : msg
+                            self.status(done)
+                        }
+                    }
+                case .denied:
+                    self.enabled = false
+                    self.status(done)
+                default:
+                    self.enabled = true
+                    NativeLog.write("系统通知：已打开")
+                    self.status(done)
+                }
+            }
+        }
+    }
+
+    func post(_ req: CCRNotifyRequest, _ done: @escaping @MainActor ([String: Any]) -> Void) {
+        guard Self.supported, enabled else { return done(["ok": false, "reason": "disabled"]) }
+        if req.current, let c = controller, c.isForeground() { return done(["ok": false, "reason": "foreground"]) }
+        let now = Date()
+        sentTimes = sentTimes.filter { now.timeIntervalSince($0) < 60 }
+        guard sentTimes.count < kMaxNotifyPerMinute else { return done(["ok": false, "reason": "rate"]) }
+        sentTimes.append(now)
+        let content = UNMutableNotificationContent()
+        content.title = req.title
+        content.body = req.body
+        content.threadIdentifier = req.sid
+        content.userInfo = ["sid": req.sid, "kind": req.kind]
+        let request = UNNotificationRequest(identifier: "ccr." + req.sid, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            let msg = error?.localizedDescription
+            DispatchQueue.main.async {
+                if let m = msg { NativeLog.write("系统通知发送失败：\(m)") }
+                done(msg == nil ? ["ok": true] : ["ok": false, "reason": "error"])
+            }
+        }
+    }
+
+    /// 点了通知：窗口提到前面，交给页面打开会话；页面还没准备好（加载中 / 刚启动）就先记下
+    func open(_ sid: String) {
+        guard ccrValidSid(sid), let c = controller else { return }
+        NativeLog.write("系统通知：点了通知，打开会话")
+        c.showWindow()
+        guard c.pageState == .app, !c.webView.isLoading, let js = ccrOpenSessionScript(sid) else {
+            pendingOpen = (sid, Date())
+            return
+        }
+        c.webView.evaluateJavaScript(js) { [weak self] result, _ in
+            MainActor.assumeIsolated {
+                if (result as? Bool) != true { self?.pendingOpen = (sid, Date()) }
+            }
+        }
     }
 }
 

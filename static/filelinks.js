@@ -5,11 +5,13 @@
 //   - markdown 链接 [x](path)：不是外部 scheme、不是 #锚点，像文件路径；
 //   - Bash 命令里的参数、Bash 输出里的绝对路径；
 //   - 相对路径按会话 cwd 解析。
-// 本机会话：chip 经 /local/stat 确认存在后可点 → 右侧预览面板；服务器会话：chip 只提供复制路径。
+// 本机会话：chip 经 /local/stat 确认存在后可点 → 右侧预览面板；服务器会话：点击 → 右侧面板预览服务器上的文件
+// （srvfiles.js，经 agent 只读取回；渲染时不发请求，点了才查）。
 // 另外识别 http://localhost:PORT/… 与 http://127.0.0.1:PORT/…（排除本 app 自己的端口），本机会话可"在面板中预览"。
 import { h, icon, copyText, basename } from './dom.js';
 import { isLocal, statPath, openPanel, sessionCwd, toast, vizCtx, localOpen, rootOf } from './viz.js';
 import { chatImage } from './blobimg.js';
+import { isSrv } from './srvfiles.js';
 
 const POSITION_SUFFIX = /:\d+(?::\d+|-\d+)?$/;
 const POSITION_CAPTURE = /:(\d+)(?::(\d+)|-(\d+))?$/;
@@ -247,18 +249,19 @@ export function displayPath(abs, cwd) {
 
 /**
  * 文件 chip。本机会话：stat 确认存在 → 点击在右侧面板预览（目录 → 在 Finder 中显示）；不存在 → 灰色，点击复制路径。
- * 服务器会话：点击复制路径。opts.code = 渲染成行内代码样式（markdown 行内代码）；opts.label = 显示文字。
+ * 服务器会话：点击 → 右侧面板预览服务器文件（srvfiles.js）。opts.code = 渲染成行内代码样式（markdown 行内代码）；opts.label = 显示文字。
  */
 export function fileChip(s, raw, opts = {}) {
   const pos = splitPosition(String(raw));
   const cwd = sessionCwd(s);
   const abs = resolvePath(pos.path, cwd);
   const local = isLocal(s);
+  const srv = !local && isSrv(s);   // 服务器会话：点了才经 agent 查 / 取（§10.10）
   let label = opts.label != null ? opts.label : opts.code ? String(raw) : displayPath(abs, cwd) + (pos.line ? ':' + pos.line : '');
   let ic = opts.icon || 'file';
-  if (opts.tool) { label = local ? '预览' : '复制路径'; ic = local ? 'eye' : 'copy'; }   // 工具卡标题行右侧的小 chip
-  const el = h('button', { class: 'fchip' + (opts.code ? ' md-inline code' : '') + (local ? ' local checking' : ' remote') + (opts.cls ? ' ' + opts.cls : ''),
-    type: 'button', title: local ? '检查文件…' : '复制路径：' + abs },
+  if (opts.tool) { label = local || srv ? '预览' : '复制路径'; ic = local || srv ? 'eye' : 'copy'; }   // 工具卡标题行右侧的小 chip
+  const el = h('button', { class: 'fchip' + (opts.code ? ' md-inline code' : '') + (local ? ' local checking' : srv ? ' remote srv' : ' remote') + (opts.cls ? ' ' + opts.cls : ''),
+    type: 'button', title: local ? '检查文件…' : srv ? '在右侧面板预览服务器上的文件：' + abs : '复制路径：' + abs },
   opts.code ? null : icon(ic), label ? h('span', { class: 'fchip-t' }, label) : null);
   el.dataset.path = abs;
   let info = null;
@@ -281,6 +284,7 @@ export function fileChip(s, raw, opts = {}) {
   el.addEventListener('click', (e) => {
     e.stopPropagation();
     e.preventDefault();
+    if (srv) { openPanel(s, { kind: 'file', path: abs, line: pos.line || null }); return; }
     if (local && info && info.exists && info.type === 'file' && info.ok) {
       openPanel(s, { kind: 'file', path: info.real || abs, line: pos.line || null, info });
       return;

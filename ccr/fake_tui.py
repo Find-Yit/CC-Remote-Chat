@@ -1119,6 +1119,34 @@ class FakeClaude(object):
             yield d
         self.finish("\n\n".join(paras))
 
+    def turn_todo(self, msg):
+        """/todo：仿 CLI 2.1.332 真机的任务清单（TaskCreate ×3 → TaskUpdate in_progress / completed），
+        条目格式与 fixtures/transcript_tasks_2_1_332.jsonl 一致（模型把 subject 写成 title，结果里是规范的 subject）。"""
+        yield self.think
+        steps = ["检查输入", "生成报告", "整理结论"]
+        for i, t in enumerate(steps, 1):
+            tid = self.tool_use("TaskCreate", {"title": t, "description": "fake：第 %d 步" % i})
+            self._tool_result_full(tid, "Task #%d created successfully: %s" % (i, t),
+                                   {"task": {"id": str(i), "subject": t, "description": "fake：第 %d 步" % i}})
+            yield self.delay
+        self.blank()
+        self.add("● ", "  ", "建好了 3 项任务，逐个完成。")
+        for i, t in enumerate(steps, 1):
+            for st, frm in (("in_progress", "pending"), ("completed", "in_progress")):
+                inp = {"taskId": str(i), "status": st}
+                if st == "in_progress":
+                    inp["activeForm"] = "正在" + t
+                tid = self.tool_use("TaskUpdate", inp)
+                self._tool_result_full(tid, "Updated task #%d %s" % (i, "activeForm, status" if st == "in_progress" else "status"),
+                                       {"success": True, "taskId": str(i),
+                                        "updatedFields": ["activeForm", "status"] if st == "in_progress" else ["status"],
+                                        "statusChange": {"from": frm, "to": st}})
+                yield self.delay * 3
+        paras = ["3 项任务都完成了（fake：任务清单演示）。"]
+        for d in self.stream(paras):
+            yield d
+        self.finish("\n\n".join(paras))
+
     def turn_long(self, msg):
         yield self.think
         self.blank()
@@ -1557,6 +1585,8 @@ class FakeClaude(object):
             gen = self.turn_shot(text)
         elif "/bg" in text:
             gen = self.turn_bg(text)
+        elif "/todo" in text:
+            gen = self.turn_todo(text)
         else:
             gen = self.turn_reply(text)
         self.start_turn(gen)

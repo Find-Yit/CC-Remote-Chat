@@ -1,8 +1,9 @@
 // 右侧预览面板（docs/SPEC_V2_TUI.md §10.4）：可拖拽改宽度、可收起/关闭、多标签，每个会话一组标签。
 // 标签类型：
-//   file（仅本机会话）：图片 / SVG（当图片显示）/ HTML（沙箱 iframe，绝不 allow-same-origin）/ Markdown（markdown.js）/
-//        文本代码（带行号，大文件截断）/ PDF / 音视频 / 二进制（给"用默认应用打开"）。打开期间每 1.5s 查一次 mtime，
-//        变了自动刷新（HTML 页面连同本会话改过的同目录文件一起盯）。
+//   file（本机会话 + 服务器会话）：图片 / SVG（当图片显示）/ HTML（沙箱 iframe，绝不 allow-same-origin）/ Markdown（markdown.js）/
+//        文本代码（带行号，大文件截断；UTF-8 解不了时试 GB18030，预览头标出，textdecode.js）/ PDF / 音视频 /
+//        二进制（本机给"用默认应用打开"，服务器给"下载到本机"）。打开期间每 1.5s（服务器文件 5s）查一次 mtime，
+//        变了自动刷新（HTML 页面连同本会话改过的同目录文件一起盯）。服务器文件经 agent 只读取回（srvfiles.js，§10.10）。
 //   url（仅本机会话）：http://localhost:PORT/…（不同端口 = 不同 origin），沙箱 iframe；可选"兼容模式"（仅对这类页面
 //        加 allow-same-origin，给 Vite 等模块脚本页面用；/preview/ 同源页面永远不给）。
 //   diff（服务器 + 本机）：本轮改动的 unified diff，数据全部来自 transcript 的 structuredPatch，不读文件。
@@ -19,6 +20,8 @@ import { markdownCtx, displayPath, resolvePath } from './filelinks.js';
 import { chatImage } from './blobimg.js';
 import { highlightInto } from './highlight.js';
 import { ChangesView, trackerOf, compactCount } from './changes.js';
+import { isSrv, canOpenFiles, srvLoad, srvStatMany, srvObjectUrl, srvProbe, srvDownload, errorBox, noPreviewBox, SRV_POLL_MS, SRV_TEXT_HEAD } from './srvfiles.js';
+import { fetchText } from './textdecode.js';
 
 const POLL_MS = 1500;
 const MAX_TEXT = 2 * 1024 * 1024;
@@ -143,7 +146,7 @@ export class PreviewPanel {
       st.chg = new ChangesView(s, {
         session: () => st.s,
         cwd: () => (st.s.absCwd || (st.s.meta && st.s.meta.cwd) || ''),
-        local: () => isLocal(st.s),
+        local: () => canOpenFiles(st.s),   // 本机文件或服务器文件（§10.10）都能「打开文件」
         onOpenFile: (abs) => this.open(st.s, { kind: 'file', path: abs }),
         toast: (t) => toast(t),
       });
@@ -187,8 +190,8 @@ export class PreviewPanel {
   open(s, target) {
     s = rootOf(s);
     if (!s || !target) return;
-    if ((target.kind === 'file' || target.kind === 'url') && !isLocal(s)) {
-      toast('服务器会话不能预览本机文件', 'warn');
+    if ((target.kind === 'url' && !isLocal(s)) || (target.kind === 'file' && !canOpenFiles(s))) {
+      toast(target.kind === 'url' ? '服务器会话不能预览本机网页' : '这个会话不能预览文件', 'warn');
       return;
     }
     const st = this.stateOf(s);
@@ -309,7 +312,15 @@ export class PreviewPanel {
     };
     const acts = [];
     let where = '';
-    if (tab.kind === 'file') {
+    if (tab.kind === 'file' && !isLocal(s)) {
+      // 服务器文件：刷新 / 下载到本机 / 在浏览器中打开（同一个 /preview 地址）/ 复制路径；没有 Finder 与默认应用
+      where = tab.path;
+      const inf = tab.info;
+      acts.push(btn('refresh', '刷新', () => this.reload(tab, true)));
+      if (!inf || inf.downloadable) acts.push(btn('download', '下载', () => srvDownload(s, tab.path)));
+      if (inf && inf.url && inf.kind !== 'binary' && !inf.too_large) acts.push(btn('external', '在浏览器中打开', () => window.open(inf.url, '_blank', 'noopener,noreferrer')));
+      acts.push(btn('copy', '复制路径', () => copyPath(tab.path)));
+    } else if (tab.kind === 'file') {
       where = tab.path;
       acts.push(btn('refresh', '刷新', () => this.reload(tab, true)));
       if (tab.info && tab.info.url && tab.info.kind !== 'binary') acts.push(btn('external', '在浏览器中打开', () => window.open(tab.info.url, '_blank', 'noopener,noreferrer')));
@@ -330,13 +341,15 @@ export class PreviewPanel {
       }, tab.sameOrigin));
     } else {
       where = tab.path;
-      if (isLocal(s)) acts.push(btn('file', '打开文件', () => this.open(s, { kind: 'file', path: tab.path })));
+      if (canOpenFiles(s)) acts.push(btn('file', '打开文件', () => this.open(s, { kind: 'file', path: tab.path })));
       acts.push(btn('copy', '复制路径', () => copyPath(tab.path)));
     }
     const meta = tab.kind === 'file' && tab.size != null ? fmtSize(tab.size) : '';
     const short = where.length > 64 ? '…' + where.slice(-63) : where;
     const parts = [h('div', { class: 'pv-where mono', title: where }, short)];
+    if (tab.kind === 'file' && isSrv(s)) parts.unshift(h('span', { class: 'pv-srv-tag', title: '服务器上的文件（经计算节点的 agent 只读取回）' }, icon('server'), '服务器'));
     if (meta) parts.push(h('span', { class: 'pv-meta muted' }, meta));
+    if (tab.kind === 'file' && tab.enc) parts.push(h('span', { class: 'pv-enc' + (tab.enc.lossy ? ' lossy' : ''), title: tab.enc.title }, tab.enc.label));
     parts.push(h('div', { class: 'pv-acts' }, acts));
     this.barEl.replaceChildren(...parts);
   }
@@ -356,6 +369,7 @@ export class PreviewPanel {
   }
 
   async loadFile(s, tab, box) {
+    if (!isLocal(s)) { await srvLoad(this, s, tab, box); return; }   // 服务器文件（srvfiles.js）
     const [r] = await statMany(s, [tab.path]);
     if (!r || !r.ok || !r.url) {
       box.replaceChildren(h('div', { class: 'pv-empty' }, icon('file'), h('div', null, (r && r.reason) || '文件不存在'),
@@ -372,37 +386,53 @@ export class PreviewPanel {
 
   async fillFile(s, tab, box) {
     const r = tab.info;
+    const srv = !isLocal(s);   // 服务器文件（srvfiles.js）：图片 / 页面先取一次，失败能说明原因并重试
     const url = r.url + (tab.v ? '?ccr_v=' + tab.v : '');
     const k = r.kind;
     let node;
-    if (k === 'image' || k === 'svg') {
-      node = h('div', { class: 'pv-img' }, chatImage(s, null, { desc: { s, url, name: basename(tab.path), path: tab.path }, cls: 'pv-imgbtn', alt: basename(tab.path) }));
-    } else if (k === 'html') {
-      node = h('iframe', { class: 'pv-frame', src: url, title: tab.path, referrerpolicy: 'no-referrer', sandbox: SANDBOX });
-    } else if (k === 'pdf') {
-      // Chrome 的 PDF 查看器不能在沙箱 iframe 里运行；PDF 以 application/pdf + nosniff 返回，不会被当成 HTML
-      node = h('iframe', { class: 'pv-frame pdf', src: url, title: tab.path });
-    } else if (k === 'video') {
-      node = h('video', { class: 'pv-media', src: url, controls: true, preload: 'metadata' });
-    } else if (k === 'audio') {
-      node = h('audio', { class: 'pv-media', src: url, controls: true, preload: 'metadata' });
-    } else if (k === 'markdown' || k === 'text') {
-      try {
-        const res = await fetch(url, { credentials: CREDENTIALS, cache: 'no-store' });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        let text = await res.text();
-        let cut = false;
-        if (text.length > MAX_TEXT) { text = text.slice(0, MAX_TEXT); cut = true; }
-        node = k === 'markdown' ? markdownView(s, tab, text, cut) : textView(tab, text, cut);
-      } catch (e) {
-        node = h('div', { class: 'pv-empty' }, '读取失败：' + ((e && e.message) || e));
+    try {
+      if (srv && k !== 'binary' && !box.querySelector('.pv-frame, .pv-img, .pv-media, .pv-scroll')) {
+        box.replaceChildren(h('div', { class: 'pv-loading pv-srv-loading' }, h('span', { class: 'spin', 'aria-hidden': 'true' }),
+          h('div', null, '正在从服务器读取…' + (r.size != null ? '（' + fmtSize(r.size) + '）' : ''))));
       }
-    } else {
-      const b = r.openable
-        ? h('button', { class: 'btn small', type: 'button' }, icon('eye'), '用默认应用打开')
-        : h('button', { class: 'btn small', type: 'button', title: '这种类型不会被直接打开' }, icon('folder'), '在 Finder 中显示');
-      b.addEventListener('click', () => localOpen(s, tab.path, r.openable ? 'open' : 'reveal'));
-      node = h('div', { class: 'pv-empty' }, icon('file'), h('div', null, '二进制文件，无法在这里预览'), h('div', { class: 'muted' }, fmtSize(r.size)), b);
+      if (k === 'image' || k === 'svg') {
+        let src = url;
+        if (srv) {
+          src = await srvObjectUrl(url);
+          if (tab.objUrl) { const old = tab.objUrl; setTimeout(() => URL.revokeObjectURL(old), 60000); }
+          tab.objUrl = src;
+        }
+        node = h('div', { class: 'pv-img' }, chatImage(s, null, { desc: { s, url: src, name: basename(tab.path), path: tab.path }, cls: 'pv-imgbtn', alt: basename(tab.path) }));
+      } else if (k === 'html') {
+        if (srv) await srvProbe(url);
+        node = h('iframe', { class: 'pv-frame', src: url, title: tab.path, referrerpolicy: 'no-referrer', sandbox: SANDBOX });
+      } else if (k === 'pdf') {
+        if (srv) await srvProbe(url);
+        // Chrome 的 PDF 查看器不能在沙箱 iframe 里运行；PDF 以 application/pdf + nosniff 返回，不会被当成 HTML
+        node = h('iframe', { class: 'pv-frame pdf', src: url, title: tab.path });
+      } else if (k === 'video' || k === 'audio') {
+        if (srv) await srvProbe(url);
+        node = h(k, { class: 'pv-media', src: url, controls: true, preload: 'metadata' });
+      } else if (k === 'markdown' || k === 'text') {
+        // 按字节解码：UTF-8 → GB18030（预览头标出）→ 像二进制就不当文本（textdecode.js）；服务器文件只取开头 2MB
+        const t = await fetchText(srv ? url + (url.includes('?') ? '&' : '?') + 'ccr_head=' + SRV_TEXT_HEAD : url, { credentials: CREDENTIALS });
+        const enc = t.binary ? null : t.label ? { label: t.label, title: (t.encoding === 'gb18030' ? '不是有效的 UTF-8，按 GB18030（GBK 的超集）解码显示' : '按 ' + t.label + ' 解码显示（文件开头有 BOM）') + (t.transcoded ? '（后端转码）' : '') }
+          : t.lossy ? { label: '编码未识别', lossy: true, title: '既不是有效的 UTF-8 也不是 GB18030，按 UTF-8 显示（坏字节显示为 �）' } : null;
+        if ((enc && enc.label) !== (tab.enc && tab.enc.label)) { tab.enc = enc; if (this.current().tab === tab) this.renderBar(s, tab); }
+        if (t.binary) {
+          node = srv ? noPreviewBox(s, r, '看起来是二进制文件，不按文本显示') : binaryBox(s, tab, r, '看起来是二进制文件，不按文本显示');
+        } else {
+          let text = t.text;
+          let cut = !!t.partial;
+          if (text.length > MAX_TEXT) { text = text.slice(0, MAX_TEXT); cut = true; }
+          node = k === 'markdown' ? markdownView(s, tab, text, cut) : textView(tab, text, cut);
+        }
+      } else {
+        node = srv ? noPreviewBox(s, r, '二进制文件，无法在这里预览') : binaryBox(s, tab, r, '二进制文件，无法在这里预览');
+      }
+    } catch (e) {
+      const msg = '读取失败：' + ((e && e.message) || e);
+      node = srv ? errorBox(msg, tab.path, () => this.reload(tab, true)) : h('div', { class: 'pv-empty' }, msg);
     }
     const keep = box.querySelector('.pv-scroll');
     const top = keep ? keep.scrollTop : 0;
@@ -435,21 +465,36 @@ export class PreviewPanel {
   async poll() {
     if (this.polling || this.root.hidden || document.visibilityState !== 'visible') return;
     const { st, tab } = this.current();
-    if (!st || !tab || tab.kind !== 'file' || !tab.info || !isLocal(st.s)) return;
+    if (!st || !tab || tab.kind !== 'file' || !tab.info) return;
+    const srv = !isLocal(st.s);   // 服务器文件：每 5s 查一次（一次 agent 请求），失败不打扰
+    if (srv && (!isSrv(st.s) || Date.now() - (tab.srvPolled || 0) < SRV_POLL_MS)) return;
+    if (srv) tab.srvPolled = Date.now();
     this.polling = true;
     try {
       const paths = [tab.path, ...(tab.info.kind === 'html' ? relatedFiles(st.s, tab.path) : [])];
-      const res = await statMany(st.s, paths);
+      let res;
+      if (srv) { try { res = await srvStatMany(st.s, paths); } catch (_) { return; } } else res = await statMany(st.s, paths);
       const sig = res.map((r) => (r ? [r.exists, r.mtime, r.size].join('|') : '-')).join(';');
       if (tab.sig != null && sig !== tab.sig && this.current().tab === tab) {
         const main = res[0];
+        const was = tab.info;
         if (main && main.ok) { tab.mtime = main.mtime; tab.size = main.size; tab.info = { ...tab.info, ...main }; }
-        this.reload(tab, false);
+        // 服务器文件变得过大 / 类型变了 / 原来没内容：整个标签重建（重新查一次）
+        this.reload(tab, srv && (!main || !main.ok || main.too_large || was.too_large || main.kind !== was.kind));
         this.renderBar(st.s, tab);
       }
       tab.sig = sig;
     } finally { this.polling = false; }
   }
+}
+
+/** 本机二进制文件：「用默认应用打开」（白名单类型）或「在 Finder 中显示」 */
+function binaryBox(s, tab, r, msg) {
+  const b = r.openable
+    ? h('button', { class: 'btn small', type: 'button' }, icon('eye'), '用默认应用打开')
+    : h('button', { class: 'btn small', type: 'button', title: '这种类型不会被直接打开' }, icon('folder'), '在 Finder 中显示');
+  b.addEventListener('click', () => localOpen(s, tab.path, r.openable ? 'open' : 'reveal'));
+  return h('div', { class: 'pv-empty' }, icon('file'), h('div', null, msg), h('div', { class: 'muted' }, fmtSize(r.size)), b);
 }
 
 function readFlag(key) { try { return localStorage.getItem(key) === '1'; } catch (_) { return false; } }
@@ -508,9 +553,10 @@ function textView(tab, text, cut) {
   if (tab.line) {
     const mark = h('div', { class: 'pv-linemark', dataset: { ln: String(tab.line) } });
     mark.style.top = 'calc(' + (tab.line - 1) + ' * var(--pv-lh) + 8px)';
-    return h('div', { class: 'pv-scroll pv-text' }, note, h('div', { class: 'pv-code' }, mark, nums, pre));
+    return h('div', { class: 'pv-scroll pv-text', dataset: { quotePath: tab.path } }, note, h('div', { class: 'pv-code' }, mark, nums, pre));
   }
-  return h('div', { class: 'pv-scroll pv-text' }, note, h('div', { class: 'pv-code' }, nums, pre));
+  // data-quote-path：选中文字「引用」时带上 文件:行号（static/quote.js）
+  return h('div', { class: 'pv-scroll pv-text', dataset: { quotePath: tab.path } }, note, h('div', { class: 'pv-code' }, nums, pre));
 }
 
 function markdownView(s, tab, text, cut) {
@@ -518,7 +564,7 @@ function markdownView(s, tab, text, cut) {
   const dir = tab.path.slice(0, tab.path.lastIndexOf('/')) || '/';
   const ps = { sid: s.sid, meta: s.meta, absCwd: dir, parent: null, localOverride: s.localOverride, readOnly: true };
   const md = h('div', { class: 'md pv-md' }, renderMarkdown(text, markdownCtx(ps)));
-  return h('div', { class: 'pv-scroll' }, cut ? h('div', { class: 'pv-note muted' }, '文件较大，只显示前 2MB') : null, md);
+  return h('div', { class: 'pv-scroll', dataset: { quotePath: tab.path } }, cut ? h('div', { class: 'pv-note muted' }, '文件较大，只显示前 2MB') : null, md);
 }
 
 function diffView(tab) {
@@ -538,7 +584,7 @@ function diffView(tab) {
     else body = h('div', { class: 'muted' }, '（没有可显示的内容）');
     return h('div', { class: 'pv-diff-sec' }, head, body);
   });
-  return h('div', { class: 'pv-scroll pv-diff' },
+  return h('div', { class: 'pv-scroll pv-diff', dataset: { quotePath: c.path } },
     h('div', { class: 'pv-diff-title' }, icon('diff'), h('span', { class: 'mono' }, c.path),
       h('span', { class: 'tc-add' }, '+' + c.add), h('span', { class: 'tc-del' }, '−' + c.del),
       h('span', { class: 'muted small-text' }, '数据来自 transcript（structuredPatch），不读取文件')),

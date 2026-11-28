@@ -151,6 +151,55 @@ class TestOrder(Base):
         self.assertEqual((m2.get_meta(b)["order"], m2.get_meta(a)["order"]), (0.0, 1.0))
 
 
+class TestInProject(Base):
+    """侧栏归属（SPEC §15.2）：新建时由入口决定、可移入 / 移出项目、随 sessions.json 保存；旧记录没有这个字段 = 在项目里。"""
+
+    def test_create_set_persist_and_migrate(self):
+        m = self.mgr()
+        chat = self.start(m)                                   # 侧栏顶部「新建聊天」/ 老前端：不带 project
+        proj = self.start(m, cwd="/tmp", project=True)         # 项目的「+」/「新建项目」
+        self.assertIs(m.get_meta(chat)["in_project"], False)
+        self.assertIs(m.get_meta(proj)["in_project"], True)
+        for bad in ("true", 1, None):
+            with self.assertRaises(ValueError):
+                m.create(jobid="12345", cwd="~", project=bad)
+        self.assertEqual(len(m.list_sessions()), 2)            # 参数不对：什么都没建
+        self.assertEqual(m.set_in_project(chat, True), {"ok": True, "in_project": True})
+        self.assertIs(m.get_meta(chat)["in_project"], True)
+        self.assertEqual(m.set_in_project(proj, False)["in_project"], False)
+        for bad in ("false", 0, None, [True]):
+            with self.assertRaises(ValueError):
+                m.set_in_project(proj, bad)
+        with self.assertRaises(KeyError):
+            m.set_in_project("s000000000000", True)
+        self.assertIs(m.get_meta(proj)["in_project"], False)
+        m.shutdown()
+        m2 = self.mgr()
+        self.assertEqual((m2.get_meta(chat)["in_project"], m2.get_meta(proj)["in_project"]), (True, False))
+        m2.shutdown()
+        # 升级前写的记录：没有 in_project（或者是坏值）→ 都算在项目里（按 cwd 归组），用户现有的会话一打开就有分组
+        p = pathlib.Path(self.tmp) / "sessions.json"
+        data = json.loads(p.read_text())
+        for r in data["sessions"]:
+            if r["meta"]["sid"] == proj:
+                r["meta"].pop("in_project")
+            else:
+                r["meta"]["in_project"] = "no"
+        p.write_text(json.dumps(data))
+        m3 = self.mgr()
+        self.assertEqual((m3.get_meta(chat)["in_project"], m3.get_meta(proj)["in_project"]), (True, True))
+
+    def test_restart_keeps_membership(self):
+        m = self.mgr()
+        chat = self.start(m, cwd="/tmp")
+        proj = self.start(m, project=True)
+        for sid, want in ((chat, False), (proj, True)):
+            self.assertTrue(wait_until(lambda: m.get_meta(sid)["claude_session_id"], 5))
+            m.restart(sid, jobid="67890")                      # 换作业续接 / 重启 / 换 API：同一个会话，归属不变
+            self.assertTrue(wait_until(lambda: m.get_meta(sid)["state"] == "idle", 5))
+            self.assertEqual((m.get_meta(sid)["jobid"], m.get_meta(sid)["in_project"]), ("67890", want))
+
+
 class RecNotifier:
     def __init__(self):
         self.states = []

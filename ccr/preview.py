@@ -31,6 +31,7 @@ try:
     from ccr import remote as _remote
 except ImportError:  # pragma: no cover
     _remote = None
+from ccr import textenc as _textenc
 
 LOCAL_JOBID = getattr(_remote, "LOCAL_JOBID", "local")
 MAX_FILE = 50 * 1024 * 1024
@@ -167,19 +168,44 @@ def content_type(path: str, head: bytes = b"") -> str:
         return ct
     if ext in TEXT_EXTS:
         return TEXT
-    # 未知扩展名：像文本（无 NUL、能按 UTF-8 解码）就当纯文本，否则二进制下载
-    if b"\x00" not in head:
-        try:
-            head.decode("utf-8")
-            return TEXT
-        except UnicodeDecodeError:
-            # 截断在多字节字符中间也算文本
-            try:
-                head[:-3].decode("utf-8")
-                return TEXT
-            except UnicodeDecodeError:
-                pass
+    # 未知扩展名：像文本（无 NUL、能按 UTF-8 或 GB18030 解码；截断在多字节字符中间也算）就当纯文本，否则二进制下载
+    if _textenc.detect(head, partial=True):
+        return TEXT
     return "application/octet-stream"
+
+
+def response_headers(ctype: str, req_headers) -> list:
+    """/preview 响应头（本机文件与服务器文件 ccr/srvfiles.py 共用）：nosniff、no-referrer、no-store、CORP、按类型的 CSP；
+    只对沙箱页面（Origin: null）以 script/style/font 方式请求的 JS/CSS/字体回 ACAO: null。"""
+    out = [("Content-Type", ctype), ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
+           ("Cache-Control", "no-store"), ("Cross-Origin-Resource-Policy", "cross-origin")]
+    base = ctype.split(";")[0]
+    if base in SANDBOX_HTML_TYPES:
+        out.append(("Content-Security-Policy", HTML_CSP))
+    elif base != "application/pdf":
+        out.append(("Content-Security-Policy", STRICT_CSP))
+    if base == "application/octet-stream":
+        out.append(("Content-Disposition", "attachment"))
+    origin = (req_headers.get("Origin") or "").strip()
+    dest = (req_headers.get("Sec-Fetch-Dest") or "").strip().lower()
+    if origin == "null" and dest in CORS_DESTS and base.startswith(CORS_TYPES):
+        out.append(("Access-Control-Allow-Origin", "null"))
+    out.append(("Vary", "Origin, Sec-Fetch-Dest"))
+    return out
+
+
+def text_body(real: str, data: bytes, utf8: bool = False, partial: bool = False):
+    """按内容定 Content-Type 的 charset（不是 UTF-8 而是 GB18030 的文本 → charset=gb18030）→ (ctype, body, 额外响应头)。
+    utf8=True（?ccr_utf8=1，前端不支持 TextDecoder('gb18030') 时）：GB18030 转成 UTF-8 返回。
+    额外头 X-CCR-Charset 告诉前端原文件的编码（只在不是 UTF-8 时给）。"""
+    ctype, enc = _textenc.with_charset(content_type(real, data[:4096]), data, partial)
+    extra = []
+    if enc:
+        extra.append(("X-CCR-Charset", enc))
+        if utf8 and "charset=" in ctype:
+            data = _textenc.to_utf8(data, enc)
+            ctype = ctype.split(";")[0] + "; charset=utf-8"
+    return ctype, data, extra
 
 
 def _fd_path(fd: int) -> Optional[str]:
@@ -196,12 +222,10 @@ def _fd_path(fd: int) -> Optional[str]:
 
 
 def is_local(meta: Optional[dict], cfg: Optional[dict] = None) -> bool:
-    """本机会话：jobid == LOCAL_JOBID（本机模式），或 fake 模式（fake claude 本来就在本机跑）。"""
-    if not isinstance(meta, dict):
-        return False
-    if meta.get("jobid") == LOCAL_JOBID:
-        return True
-    return bool((cfg or {}).get("fake"))
+    """本机会话：jobid == LOCAL_JOBID（本机模式，含 fake 模式的"本机"运行位置）。
+    fake 模式里 jobid 是作业号的会话按服务器会话处理（文件经 agent 的只读 op 取回，ccr/srvfiles.py，§10.10），
+    与真实的服务器会话走同一条路径。cfg 参数保留（兼容旧调用）。"""
+    return isinstance(meta, dict) and meta.get("jobid") == LOCAL_JOBID
 
 
 class PreviewService:
@@ -425,8 +449,9 @@ class PreviewService:
         return "/preview/%s%s" % (self.cap_for(sid, root), urllib.parse.quote(real, safe="/"))
 
     # ------------------------------------------------------------ 请求
-    def serve(self, cap: str, rest: str, get_meta: Callable[[str], dict], headers) -> tuple:
-        """GET/HEAD /preview/<cap>/<rest> → (status, [(头, 值)…], body)。cap 错误 / 会话不在 / 非本机 / 越界 → 404。"""
+    def serve(self, cap: str, rest: str, get_meta: Callable[[str], dict], headers, query=None) -> tuple:
+        """GET/HEAD /preview/<cap>/<rest> → (status, [(头, 值)…], body)。cap 错误 / 会话不在 / 非本机 / 越界 → 404。
+        query（解析后的查询串）：ccr_utf8=1 → GB18030 文本转成 UTF-8 返回（§10.10）。"""
         hit = self.lookup(cap)
         if hit is None:
             raise PreviewError(404, "预览地址无效或已过期（app 重启后需重新打开）")
@@ -452,22 +477,8 @@ class PreviewService:
         if root_ident is None or root_ident not in _lineage(real):   # 软链接逃逸 / 根目录以外（按身份，不按字符串）
             raise PreviewError(403, "该文件不在此预览地址的授权目录内")
         data = self.read_file(real, st, root_ident)
-        ctype = content_type(real, data[:4096])
-        out = [("Content-Type", ctype), ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
-               ("Cache-Control", "no-store"), ("Cross-Origin-Resource-Policy", "cross-origin")]
-        base = ctype.split(";")[0]
-        if base in SANDBOX_HTML_TYPES:
-            out.append(("Content-Security-Policy", HTML_CSP))
-        elif base != "application/pdf":
-            out.append(("Content-Security-Policy", STRICT_CSP))
-        if base == "application/octet-stream":
-            out.append(("Content-Disposition", "attachment"))
-        origin = (headers.get("Origin") or "").strip()
-        dest = (headers.get("Sec-Fetch-Dest") or "").strip().lower()
-        if origin == "null" and dest in CORS_DESTS and base.startswith(CORS_TYPES):
-            out.append(("Access-Control-Allow-Origin", "null"))
-        out.append(("Vary", "Origin, Sec-Fetch-Dest"))
-        return 200, out, data
+        ctype, data, extra = text_body(real, data, utf8=(query or {}).get("ccr_utf8") == ["1"])
+        return 200, response_headers(ctype, headers) + extra, data
 
     def stat(self, sid: str, meta: dict, paths) -> dict:
         """批量查询（前端据此决定文件 chip 能不能点）：{results:[{path, abs, exists, type, size, mtime, ok, kind,

@@ -2,7 +2,8 @@
 // 预览面板入口、图片引用（ccr_ref）的取回。其它可视化模块（blobimg / lightbox / filelinks / preview / turnfiles）
 // 都从这里拿 api 与回调，渲染核心（render.js / tools.js）只依赖这些模块导出的纯 DOM 函数。
 //
-// 本机会话 = jobid === 'local'（本机模式），或 fake 模式（fake claude 本来就在本机跑）；历史预览（hist:…）不是。
+// 本机会话 = jobid === 'local'（本机模式，含 fake 模式的"本机"）；历史预览（hist:…）不是。
+// 服务器会话（含 fake 模式里 jobid 是作业号的会话）的文件经 agent 只读取回：srvfiles.js（SPEC §10.10）。
 // 本机文件只能经后端 /api/sessions/<sid>/local/*（需 token、仅本机会话）与 /preview/<cap>/…（只读）访问。
 
 import { TOKEN_HEADER, CREDENTIALS } from './api.js';
@@ -35,8 +36,7 @@ export function isLocal(s) {
   const r = rootOf(s);
   if (!r || !r.meta || typeof r.sid !== 'string' || r.sid.startsWith('hist:')) return false;
   if (r.localOverride != null) return !!r.localOverride;   // 回放页用
-  const cfg = (ctx.getConfig && ctx.getConfig()) || {};
-  return r.meta.jobid === LOCAL_JOBID || !!cfg.fake;
+  return r.meta.jobid === LOCAL_JOBID;
 }
 
 /** 会话的绝对 cwd：transcript 条目自带的 cwd（绝对路径）优先，其次 meta.cwd（可能是 ~） */

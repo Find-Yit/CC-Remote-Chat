@@ -240,7 +240,9 @@ class PolicyTests(unittest.TestCase):
     def test_is_local(self):
         self.assertTrue(P.is_local({"jobid": P.LOCAL_JOBID}, {}))
         self.assertFalse(P.is_local({"jobid": "276403"}, {}))
-        self.assertTrue(P.is_local({"jobid": "276403"}, {"fake": True}))
+        # fake 模式里 jobid 是作业号的会话按服务器会话处理（文件经 agent 只读取回，ccr/srvfiles.py）
+        self.assertFalse(P.is_local({"jobid": "276403"}, {"fake": True}))
+        self.assertTrue(P.is_local({"jobid": P.LOCAL_JOBID}, {"fake": True}))
         self.assertFalse(P.is_local(None, {"fake": True}))
 
 

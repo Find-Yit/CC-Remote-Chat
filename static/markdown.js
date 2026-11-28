@@ -5,6 +5,7 @@
 
 import { h, copyText } from './dom.js';
 import { highlightInto } from './highlight.js';
+import { tableBlock } from './mdtable.js';   // 表格下方的「复制为 Markdown / CSV」
 
 const MAX_DEPTH = 10;
 
@@ -227,8 +228,10 @@ function parseTable(lines, i, parent) {
   });
   thead.appendChild(trh);
   const tbody = h('tbody');
+  const rawRows = [];
   while (i < n && !RE_BLANK.test(lines[i]) && lines[i].includes('|')) {
     const cells = splitRow(lines[i]);
+    rawRows.push(cells.slice(0, head.length));
     const tr = h('tr');
     for (let k = 0; k < head.length; k++) {
       const td = h('td', aligns[k] ? { style: { textAlign: aligns[k] } } : null);
@@ -238,7 +241,7 @@ function parseTable(lines, i, parent) {
     tbody.appendChild(tr);
     i++;
   }
-  parent.appendChild(h('div', { class: 'md-table-wrap' }, h('table', { class: 'md-table' }, thead, tbody)));
+  parent.appendChild(tableBlock(h('div', { class: 'md-table-wrap' }, h('table', { class: 'md-table' }, thead, tbody)), { head, rows: rawRows, aligns }));
   return i;
 }
 

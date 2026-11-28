@@ -30,9 +30,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ccr import api_keys as ccr_api_keys
 from ccr import blobs as ccr_blobs
+from ccr import complete as ccr_complete
 from ccr import config as ccr_config
 from ccr import macdialog as ccr_macdialog
 from ccr import preview as ccr_preview
+from ccr import srvfiles as ccr_srvfiles
 from ccr import notify as ccr_notify
 from ccr import usage as ccr_usage
 from ccr.history import HistoryError, HistoryService
@@ -170,8 +172,10 @@ class CCRServer:
     def __init__(self, manager, config_store, history: Optional[HistoryService] = None, *,
                  static_dir: Optional[pathlib.Path] = None, port: int = 8765, port_tries: int = 20,
                  dev: bool = False, fixtures_dir: Optional[pathlib.Path] = FIXTURES_DIR, api_keys=None,
-                 updater=None):
+                 updater=None, keepawake=None):
         self.manager = manager
+        # 防休眠（ccr/keepawake.py，SPEC §12.2）：app.py 传入；None 时 GET /api/keepawake 报告不可用
+        self.keepawake = keepawake
         # dmg 版自动更新（ccr/updater.py，SPEC §14.11）：只有内置模式且配置了更新源时才有；None 时 /api/update* 不存在、
         # bootstrap 没有 update 键、SSE 不推 event: update（与以前逐字相同）
         self.updater = updater
@@ -192,6 +196,9 @@ class CCRServer:
         data_dir = getattr(manager, "data_dir", None) or pathlib.Path(
             getattr(config_store, "path", ccr_config.DEFAULT_DATA_DIR / "config.json")).parent
         self.preview = ccr_preview.PreviewService(config_store.get, data_dir=data_dir)
+        self.srvfiles = ccr_srvfiles.ServerFiles(manager, self.preview)   # 服务器会话的文件预览 / 下载（经 agent 只读）
+        # 输入框 / 命令与 @ 文件补全（ccr/complete.py，只读）
+        self.complete = ccr_complete.CompleteService(config_store.get)
         self.static_dir = pathlib.Path(static_dir or STATIC_DIR).resolve()
         # /fixtures/* 仅在 --dev 时启用（默认 404）
         self.dev = bool(dev)
@@ -671,8 +678,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(200, self._call(self._local_info, sid, {}))
             if len(segs) in (3, 4) and segs[0] == "sessions" and segs[2] == "subagents":
                 return self._send_json(200, self._subagents(self._sid(segs[1]), segs[3] if len(segs) == 4 else None))
+            if len(segs) == 4 and segs[0] == "sessions" and segs[2] == "complete":   # / 命令与 @ 文件补全（只读）
+                return self._send_json(200, self._complete(self._sid(segs[1]), segs[3]))
             if segs == ["notify"]:
                 return self._send_json(200, self._notify_info())
+            if segs == ["keepawake"]:   # 防休眠状态（只读；开关是 config 的 keep_awake）
+                ka = app.keepawake
+                return self._send_json(200, ka.status() if ka is not None else {"available": False, "active": False})
             if segs == ["jobs"]:
                 return self._send_json(200, app.history.list_jobs())
             if segs == ["dirs"]:
@@ -705,6 +717,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(200, self._choose_folder(self._read_json()))
             if segs == ["config"]:
                 body = self._read_json()
+                why = ra.forbidden_config(body) if ra is not None and hasattr(ra, "forbidden_config") else None
+                if why:   # 手机远程口：Mac 本机的设置（如防休眠）只能在 Mac 上改
+                    raise ApiError(403, why, "remote_forbidden")
                 try:
                     cfg = app.config_store.update(body)
                 except ValueError as e:
@@ -714,6 +729,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 except OSError as e:
                     raise ApiError(500, "保存配置失败：%s" % e.strerror) from None
                 app.notify_config_changed()
+                if app.keepawake is not None and "keep_awake" in body:
+                    app.keepawake.poke()   # 关掉防休眠 = 立即放开
                 return self._send_json(200, ccr_config.public_config(cfg))
             if len(segs) in (3, 4) and segs[0] == "sessions":
                 sid = self._sid(segs[1])
@@ -733,9 +750,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     "close": self._act_close,
                     "local/stat": self._act_local_stat,
                     "local/open": self._act_local_open,
+                    "srvfile/stat": lambda sd, b: self._preview_call(lambda: self.app.srvfiles.api_stat(sd, b)),
                     "background": lambda sd, _b: self.app.manager.run_in_background(sd),
                     "send_now": lambda sd, _b: self.app.manager.send_now(sd),
                     "seen": self._act_seen,
+                    "project": self._act_project,   # 侧栏归属：移入 / 移出项目（只改显示，不碰 claude）
                     "unseen": lambda sd, _b: self.app.manager.mark_unseen(sd),
                     # 发图片（SPEC §4.2「图片」）：⌘V 截图 → claude 自己的 Ctrl+V；原生窗口拖入 → 粘贴图片路径；清除 = Ctrl+U
                     "image/paste": lambda sd, _b: self.app.manager.paste_image(sd),
@@ -842,8 +861,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         rest = path[len("/preview/"):]
         cap, _, tail = rest.partition("/")
         mgr = self.app.manager
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         try:
-            status, headers, body = self.app.preview.serve(cap, tail, mgr.get_meta, self.headers)
+            if self.app.srvfiles.owns(cap):   # 服务器会话的文件：经 agent 只读取回（ccr/srvfiles.py，SPEC §10.10）
+                return self.app.srvfiles.serve(self, method, cap, tail, query)
+            status, headers, body = self.app.preview.serve(cap, tail, mgr.get_meta, self.headers, query)
         except ccr_preview.PreviewError as e:
             raise ApiError(e.status, e.message) from None
         self.send_response(status)
@@ -904,6 +926,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return self.app.manager.get_meta(sid)
         except KeyError:
             raise ApiError(404, "会话不存在") from None
+
+    def _complete(self, sid: str, kind: str) -> dict:
+        """GET /api/sessions/<sid>/complete/{commands,files}：自定义命令 / skills / 插件命令，或 cwd 下的文件（只读，SPEC §7）。"""
+        meta = self._call(lambda sd, _b: self.app.manager.get_meta(sd), sid, {})
+        try:
+            return self.app.complete.get(meta, kind)
+        except ccr_complete.CompleteError as e:
+            raise ApiError(e.status, e.message) from None
 
     def _subagents(self, sid: str, agent_id: Optional[str]) -> dict:
         """GET /api/sessions/<sid>/subagents（摘要列表）与 /subagents/<agent_id>（该子代理全部已缓存条目）。"""
@@ -1009,6 +1039,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         kid = _api_key_id(body)
         if kid:   # 不选 = 服务器默认（settings.json），与以前完全一致：不加 --settings
             kwargs["api_key_id"] = kid
+        if _opt_bool(body, "project"):   # 侧栏归属（SPEC §15.2）：放进项目；不带 / false = 在「聊天」里
+            kwargs["project"] = True
         return self._call(lambda _s, _b: self.app.manager.create(**kwargs), "", {})
 
     def _act_message(self, sid: str, body: dict):
@@ -1244,6 +1276,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             raise ApiError(400, "done_at 必须是数字")
         return self.app.manager.mark_seen(sid, v)
+
+    def _act_project(self, sid: str, body: dict):
+        """侧栏归属（SPEC §15.2）：{"in": true} = 移入项目（按 运行位置 + cwd 归组），false = 移出项目（到「聊天」里）。"""
+        v = body.get("in")
+        if not isinstance(v, bool):
+            raise ApiError(400, "in 必须是布尔值")
+        return self.app.manager.set_in_project(sid, v)
 
     def _act_rename(self, sid: str, body: dict):
         title = body.get("title")

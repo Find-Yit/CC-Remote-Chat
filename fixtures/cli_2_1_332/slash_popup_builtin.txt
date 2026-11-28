@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.332
+▝▜██████▀  Haiku 5.5 with low effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/proj
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    /clear                      Start a new session with empty context; loops carry over, and the old one stays in /resume
+    /color                      Set the prompt bar color for this session
+  ❯ /compact                    Free up context by summarizing the conversation so far
+    /config                     Open settings
+    /context                    Show what fills the context
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: ?% | ⚙ ... tok/s | 💰 $0 | 5h: 1.0M tok, $1.00 | 7d: 9.0M tok, $9.00 | 14:24
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -10,6 +10,11 @@ Parts of the frontend are adapted from **T3 Code** (https://github.com/pingdotgg
 | `static/toolgroups.js` | idea of `summarizeToolGroup` |
 | `static/minimap.js` | port of `TimelineMinimap` (`apps/web/src/components/chat/TimelineMinimap.tsx`, `timelineMinimapItems.ts`, `MessagesTimeline.logic.ts`, `timelineMinimapWheel.ts`): structure, fisheye scale, preview card, keyboard, navigation buttons, wheel forwarding |
 | `static/changes.js` | `formatCompactDiffCount` (`DiffStatLabel.tsx`), absolute → workspace-relative paths (`toolCallDiff.ts`), panel structure of `DiffPanel.tsx`, the Write "new file" rule of `ClaudeAdapterV2.ts` |
+| `static/projects.js` | project header row layout and status-dot priority of the sidebar project rows |
+| `static/finder.js` | in-thread find (`threadFind.ts`, `ThreadFindBar.tsx`, `threadFindHighlights.ts`): search over all items, viewport-limited highlights |
+| `static/toolview.js` | tool-call visibility levels (PR #30000, incl. the "conversation only" mode) |
+| `static/quote.js` | reply-with-quote context bar and inset quote cards in sent messages (PRs #33124, #34181) |
+| `static/mdtable.js` | copy a rendered table as Markdown / CSV (PRs #33286, #43435) |
 | `static/style.css` (parts) | layout ideas for tables, code blocks, hover metadata, tool groups |
 
 T3 Code is licensed under the MIT License:
@@ -37,6 +42,8 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+`static/quote.js` also follows the idea of Orca PR #38251 (adding a file / markdown-preview selection, with path and line numbers, to the chat).
 
 Parts of `static/changes.js` follow **Orca**
 (https://github.com/stablyai/orca): merging several edits per turn and per file while keeping their order

@@ -25,7 +25,7 @@
           </div>
           <div id="job-hint" class="field-hint">回车保存；新会话默认使用此作业</div>
         </div>
-        <button id="new-session-btn" class="btn primary block" type="button">新建会话</button>
+        <button id="new-session-btn" class="btn primary block" type="button" title="新建一个不放进项目的会话（显示在侧栏的「聊天」里；要放进项目，点「项目」旁的 + 或项目标题行的 +）">新建聊天</button>
       </div>
       <div class="tabs" role="tablist">
         <button class="tab active" type="button" data-tab="sessions" role="tab">会话</button>
@@ -61,7 +61,7 @@
           <div id="slash-pop" class="slash-pop" hidden role="listbox"></div>
           <div id="hint-bar" class="hint-bar" hidden aria-label="Claude Code 快捷键提示"></div>
           <div id="composer-box" class="composer-box">
-            <textarea id="input" name="message" aria-label="消息" rows="1" placeholder="给 Claude 发消息（Enter 发送 · Shift+Enter 换行 · / 命令）"></textarea>
+            <textarea id="input" name="message" aria-label="消息" rows="1" placeholder="给 Claude 发消息（Enter 发送 · Shift+Enter 换行 · / 命令 · @ 文件）"></textarea>
             <!-- 输入框底栏（SPEC §7）：左 = 模型/effort 胶囊、权限模式、Shift+Tab；右 = 统计（上下文圆环 · 花费 · tok/s）+ 中断/发送。固定一行、不换行 -->
             <div class="composer-bar">
               <div id="composer-ctl" class="composer-ctl"></div>

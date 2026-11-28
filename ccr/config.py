@@ -39,6 +39,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 用它查询近 7 天用量（ccr/usage.py），选这样的 key 启动会话时也写进 key 文件的 ANTHROPIC_BASE_URL；
     # 空 = 不设置（与以前完全一致）。格式与 api_keys.BASE_URL_RE 相同（计算节点 agent 用同一个正则校验）
     "default_base_url": "",
+    # 防休眠（ccr/keepawake.py，SPEC §12.2）：有会话在干活时运行 /usr/bin/caffeinate -i，阻止 Mac 空闲睡眠
+    "keep_awake": True,
 }
 
 PERMISSION_MODES = ["manual", "acceptEdits", "auto", "plan", "bypassPermissions", "dontAsk"]
@@ -132,6 +134,8 @@ def _validate_field(key: str, value: Any) -> Any:
             raise ValueError("取值不合法（可选：%s，或留空）" % "/".join(EFFORT_LEVELS))
         return value.strip()
     if key in ("ssh_multiplex", "fake", "notify_enabled", "notify_on_done", "notify_on_attention"):
+        return _as_bool(key, value)
+    if key == "keep_awake":
         return _as_bool(key, value)
     if key == "notify_sound":
         # 只接受 /System/Library/Sounds 下真实存在的 .aiff 文件名（不含扩展名）

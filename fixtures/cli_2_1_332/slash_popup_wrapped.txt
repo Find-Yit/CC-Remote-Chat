@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.332
+▝▜██████▀  Haiku 5.5 with low effort · API Usage Billing
+ ▝▝   ▝▝   /tmp/proj
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    /init                       Initialize a new CLAUDE.md file with codebase documentation
+    /deep-research              [dynamic workflow] Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.
+  ❯ /long-skill                 A long demo skill description that keeps going so the CLI has to wrap it onto a second line, exactly like the real recording on CLI 2.1.332 with a user skill whose desc
+                                ription is longer than one terminal row (neutralized fixture, wrapped by the CLI at the description column)…
+    /demo-plugin:setup          (demo-plugin) Configure the demo plugin
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: ?% | ⚙ ... tok/s | 💰 $0 | 5h: 1.0M tok, $1.00 | 7d: 9.0M tok, $9.00 | 14:24
+  ⏵⏵ auto mode on (shift+tab to cycle)

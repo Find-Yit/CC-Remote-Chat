@@ -1554,6 +1554,9 @@ def popup_selected(lines, lo):
     while k >= 0 and lines[k].strip():
         m = G_POPUP_RE.match(lines[k])
         if not m:
+            if G_HINT_RE.match(lines[k]):   # 上一项说明的折行（实测 2.1.332：长说明折到说明列）：属于列表，接着往上找
+                k -= 1
+                continue
             break
         if m.group(1):
             return m.group(2)
@@ -1921,17 +1924,203 @@ def op_blob(p):
     return {"media_type": mt if isinstance(mt, str) and len(mt) <= 64 else None, "data": b64}
 
 
+# ------------------------------------------------------------------ 服务器文件预览（只读，规则见 SPEC §2 file_stat / file_read）
+FILE_DENY = ("/dev", "/proc", "/sys", "/private/var/db", "/var/db", "/private/var/root", "/var/root",
+             "/Library/Keychains", "/System/Library/Keychains")
+FILE_BROAD = ("/", "/home", "/Users", "/tmp", "/private", "/private/tmp", "/var", "/private/var", "/Volumes", "/opt",
+              "/usr", "/etc", "/mnt", "/srv", "/data", "/scratch", "/work", "/media", "/root")
+FILE_CHUNK = 4 * 1024 * 1024
+FILE_OPS = frozenset(("file_stat", "file_read"))
+
+
+class FileDenied(Exception):
+    def __init__(self, status, msg):
+        Exception.__init__(self, msg)
+        self.status = status
+
+
+def _ident(p):
+    try:
+        st = os.stat(p)
+        return (st.st_dev, st.st_ino)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _lineage(p):
+    out = []
+    while True:
+        i = _ident(p)
+        if i is not None:
+            out.append(i)
+        q = os.path.dirname(p)
+        if q == p:
+            return out
+        p = q
+
+
+class FileCtx(object):
+    def __init__(self):
+        h = home_dir()
+        self.home = h
+        self.deny = FILE_DENY + (os.path.join(h, "Library"),)
+        self.deny_ids = set(filter(None, map(_ident, self.deny)))
+        self.broad = set(filter(None, map(_ident, FILE_BROAD + (h, os.path.dirname(h)))))
+
+    def abspath(self, p, cwd=None):
+        if not isinstance(p, str) or not p or len(p) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in p):
+            raise FileDenied(400, "路径不合法")
+        if p == "~" or p.startswith("~/"):
+            p = self.home + p[1:]
+        elif not p.startswith("/"):
+            if not isinstance(cwd, str) or not cwd:
+                raise FileDenied(400, "相对路径需要会话目录")
+            p = self.abspath(cwd) + "/" + p
+        segs = [s for s in p.split("/") if s]
+        if "." in segs or ".." in segs:
+            raise FileDenied(403, "路径里不能有 . 或 .. 段")
+        return "/" + "/".join(segs)
+
+    def check(self, p):
+        why = None
+        if any(s.startswith(".") for s in p.split("/")):
+            why = "不预览隐藏文件/目录（以 . 开头的路径段）"
+        else:
+            f = p.casefold()
+            if any(f == r.casefold() or f.startswith(r.casefold() + "/") for r in self.deny) \
+                    or self.deny_ids.intersection(_lineage(p)):
+                why = "不预览系统敏感目录"
+        if why:
+            raise FileDenied(403, why)
+
+    def resolve(self, p, cwd=None):
+        ab = self.abspath(p, cwd)
+        self.check(ab)
+        real = os.path.realpath(ab)
+        self.check(real)
+        try:
+            return ab, real, os.lstat(real)
+        except OSError:
+            raise FileDenied(404, "文件不存在")
+
+    def root(self, real, cwd):
+        line = _lineage(real)
+        try:
+            c = os.path.realpath(self.abspath(cwd)) if cwd else None
+        except FileDenied:
+            c = None
+        ci = _ident(c) if c else None
+        if ci is not None and ci not in self.broad and ci in line:
+            return c
+        parent = os.path.dirname(real)
+        return real if parent == real or _ident(parent) in self.broad else parent
+
+
+def _fd_path(fd):
+    try:
+        return os.readlink("/proc/self/fd/%d" % fd)
+    except OSError:
+        pass
+    try:
+        import fcntl
+        raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+        return os.fsdecode(raw.split(bytes(1))[0]) or None
+    except (AttributeError, ImportError, OSError, ValueError):
+        return None
+
+
+def _sig(st):
+    return [st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino]
+
+
+def op_file_stat(p):
+    paths = p.get("paths")
+    if not isinstance(paths, list) or len(paths) > 200:
+        raise OpError("paths 必须是至多 200 个路径的数组")
+    cwd = p.get("cwd") if isinstance(p.get("cwd"), str) else None
+    ctx = FileCtx()
+    out = []
+    for x in paths:
+        r = {"path": x if isinstance(x, str) else None, "exists": False}
+        out.append(r)
+        try:
+            ab, real, st = ctx.resolve(x, cwd)
+            r["abs"] = ab
+            if stat.S_ISDIR(st.st_mode):
+                r.update(exists=True, real=real, type="dir", mtime=st.st_mtime)
+            elif not stat.S_ISREG(st.st_mode):
+                raise FileDenied(403, "不预览设备/管道等特殊文件")
+            else:
+                r.update(exists=True, real=real, type="file", size=st.st_size, mtime=st.st_mtime, sig=_sig(st),
+                         root=ctx.root(real, cwd), readable=os.access(real, os.R_OK))
+        except FileDenied as e:
+            r["reason"] = str(e)
+    return {"home": ctx.home, "results": out}
+
+
+def op_file_read(p):
+    """策略拒绝 / 不存在 / 过大 → {status, reason}（不当作 agent 错误）"""
+    import base64
+    ctx = FileCtx()
+    try:
+        _ab, real, st = ctx.resolve(p.get("path"))
+        root = ctx.abspath(p.get("root"))
+        ctx.check(root)
+        ri = _ident(root)
+        if ri is None or ri not in _lineage(real) or (ri in ctx.broad and ri != _ident(real)):
+            raise FileDenied(403, "该文件不在此预览地址的授权目录内")
+        if not stat.S_ISREG(st.st_mode):
+            raise FileDenied(404 if stat.S_ISDIR(st.st_mode) else 403, "不是普通文件")
+        mx, off, n = p.get("max_size"), p.get("offset", 0), p.get("length", FILE_CHUNK)
+        if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (mx, off, n)):
+            raise FileDenied(400, "参数不合法")
+        if st.st_size > mx:
+            raise FileDenied(413, "文件过大")
+        try:
+            fd = os.open(real, os.O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        except OSError as e:
+            raise FileDenied(403 if e.errno in (1, 13) else 404, "没有读取权限" if e.errno in (1, 13) else "无法打开文件")
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                raise FileDenied(409, "文件已变化，请重试")
+            now = _fd_path(fd)
+            if now is not None:
+                ctx.check(now)
+                if ri not in _lineage(now):
+                    raise FileDenied(403, "该文件不在此预览地址的授权目录内")
+            res = {"real": real, "size": fst.st_size, "mtime": fst.st_mtime, "sig": _sig(fst)}
+            if p.get("sig") == res["sig"]:
+                res["same"] = True
+                return res
+            os.lseek(fd, off, os.SEEK_SET)
+            left, parts = min(n, FILE_CHUNK), []
+            while left > 0:
+                b = os.read(fd, min(left, 1 << 20))
+                if not b:
+                    break
+                parts.append(b)
+                left -= len(b)
+            res.update(offset=off, data=base64.b64encode(b"".join(parts)).decode("ascii"))
+            return res
+        finally:
+            os.close(fd)
+    except FileDenied as e:
+        return {"status": e.status, "reason": str(e)}
+
+
 OPS = {
     "hello": op_hello, "ping": lambda p: {}, "list": op_list, "start": op_start, "paste": op_paste,
     "keys": op_keys, "capture": op_capture, "watch": op_watch, "kill": op_kill,
-    "stop_keeper": op_stop_keeper, "blob": op_blob,
+    "stop_keeper": op_stop_keeper, "blob": op_blob, "file_stat": op_file_stat, "file_read": op_file_read,
 }
 
 
 # 慢操作（blob：读 NFS 上的大行 + 回传可能数 MB 的 base64）放到独立线程，信号量限制并发；
 # 主循环继续处理 ping/keys/capture…。响应仍经 emit（同一把输出锁，保证每行完整写出）。
-ASYNC_OPS = frozenset(("blob",))
+ASYNC_OPS = frozenset(("blob",)) | FILE_OPS
 _async_sem = threading.BoundedSemaphore(MAX_BLOB_WORKERS)
+_file_sem = threading.BoundedSemaphore(MAX_BLOB_WORKERS)   # 文件预览/下载另用一组，不挤占图片
 _async_lock = threading.Lock()
 _async_pending = [0]
 
@@ -1950,8 +2139,9 @@ def respond(rid, fn, req):
 
 
 def _run_async(rid, fn, req):
+    sem = _file_sem if req.get("op") in FILE_OPS else _async_sem
     try:
-        with _async_sem:
+        with sem:
             respond(rid, fn, req)
     finally:
         with _async_lock:

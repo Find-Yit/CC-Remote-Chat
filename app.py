@@ -440,6 +440,9 @@ def main(argv=None) -> int:
     # 提示音：回合完成 / 需要操作时在本机 afplay（与 CLI 的 Stop hook 同一个声音），设置在 config.json
     manager = SessionManager(store.get, data_dir, notifier=Notifier(store.get))
     history = HistoryService(store.get)
+    # 防休眠（ccr/keepawake.py）：有会话在干活时 caffeinate -i -w <本进程>；fake 模式只记日志、不起真进程
+    from ccr.keepawake import KeepAwake
+    keepawake = KeepAwake(store.get, manager.list_sessions, dry_run=args.fake)
     updater = None
     if args.bundled:   # dmg 版自动更新（SPEC §14.11）：.app 里有 UPDATE.json + BUILD 才启用；从源码运行时不创建
         try:
@@ -451,7 +454,7 @@ def main(argv=None) -> int:
             log.exception("自动更新初始化失败，已关闭")
             updater = None
     try:
-        server = CCRServer(manager, store, history, port=args.port, dev=args.dev,
+        server = CCRServer(manager, store, history, port=args.port, dev=args.dev, keepawake=keepawake,
                            **({"updater": updater} if updater is not None else {}))
     except OSError as e:
         log.error("启动服务器失败：%s", e)
@@ -460,6 +463,7 @@ def main(argv=None) -> int:
         return 1
 
     server.start()
+    keepawake.start()
     remote = None
     if ccr_remote_access is not None:   # 只有 <data>/remote.json 开启时才起第二个监听口；失败不影响本机口
         try:
@@ -496,6 +500,10 @@ def main(argv=None) -> int:
         if remote is not None:
             remote.shutdown()
         server.shutdown()
+        try:
+            keepawake.stop()   # 结束 caffeinate（-w 也会兜底）
+        except Exception:  # noqa
+            log.exception("结束防休眠出错")
         try:
             manager.shutdown()
         except Exception:  # noqa

@@ -4,6 +4,7 @@ node_agent 写 key 文件（0600、O_NOFOLLOW、目录权限、复用、内容�
 测试用的 key 全是假的（sk-test-…）；不连远端、不运行真实 claude。
 """
 import io
+import datetime as _dt
 import json
 import logging
 import os
@@ -887,10 +888,13 @@ class _FakeGateway:
         self.mode = "ok"
         self.required = "2.1.999"
         self.version_guard = False
-        self.daily = [{"date": "2026-11-22", "requests": 8, "cost": 0.0106, "actual_cost": 0.0106},
-                      {"date": "2026-11-21", "requests": 3, "cost": 1.5, "actual_cost": 1.0},
-                      {"date": "2026-11-16", "requests": 1, "cost": 2.0},                 # 缺 actual_cost → 用 cost
-                      {"date": "2026-11-15", "requests": 1, "cost": 100.0, "actual_cost": 100.0}]   # 超出 7 天
+        # 日期相对今天（以前写死 11-15..11-22，过了 7 天窗口后 fetch 类测试就失败）：base = 今天
+        d = lambda k: (_dt.date.today() + _dt.timedelta(days=k)).isoformat()   # noqa: E731
+        self.day = d
+        self.daily = [{"date": d(0), "requests": 8, "cost": 0.0106, "actual_cost": 0.0106},
+                      {"date": d(-1), "requests": 3, "cost": 1.5, "actual_cost": 1.0},
+                      {"date": d(-6), "requests": 1, "cost": 2.0},                 # 缺 actual_cost → 用 cost
+                      {"date": d(-7), "requests": 1, "cost": 100.0, "actual_cost": 100.0}]   # 超出 7 天
         gw = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -945,14 +949,14 @@ class UsageTests(unittest.TestCase):
         self.logs = _CaptureLogs(self)
 
     def test_summarize(self):
-        s = U.summarize({"daily_usage": self.gw.daily, "remaining": 5}, local_today="2026-11-20")
-        self.assertEqual(s["today"], "2026-11-22")          # 网关最大日期比本地日期新 → 以它为今天
+        s = U.summarize({"daily_usage": self.gw.daily, "remaining": 5}, local_today=self.gw.day(-2))
+        self.assertEqual(s["today"], self.gw.day(0))         # 网关最大日期比本地日期新 → 以它为今天
         self.assertAlmostEqual(s["week_usd"], 0.0106 + 1.0 + 2.0)
         self.assertAlmostEqual(s["today_usd"], 0.0106)
         self.assertEqual(s["remaining_usd"], 5.0)
-        s = U.summarize({"daily_usage": self.gw.daily}, local_today="2026-11-23")
-        self.assertEqual(s["today"], "2026-11-23")          # 本地更新 → 今天没有用量
-        self.assertAlmostEqual(s["week_usd"], 0.0106 + 1.0)   # 11-17 .. 11-23
+        s = U.summarize({"daily_usage": self.gw.daily}, local_today=self.gw.day(1))
+        self.assertEqual(s["today"], self.gw.day(1))         # 本地更新 → 今天没有用量
+        self.assertAlmostEqual(s["week_usd"], 0.0106 + 1.0)   # 窗口 = 今天−5 .. 今天+1
         self.assertEqual(s["today_usd"], 0)
         for bad in (None, [], {"isValid": False, "daily_usage": []}, {"remaining": 1}):
             with self.assertRaises(ValueError):

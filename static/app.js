@@ -3,7 +3,7 @@ import { Api, EventStream, takeLoginCode, REMOTE, CREDENTIALS } from './api.js';
 import { h, icon, spinner, fmtRelTime, fmtSize, basename, truncate } from './dom.js';
 import {
   createState, ensureSession, forgetSession, applyEnvelope, applyToSession, releaseHold, applyHistory, applyScreen, mountSession,
-  addLocalNotice, scrollToBottom, refreshTail, currentDialog, setModelList, revealItem,
+  addLocalNotice, scrollToBottom, refreshTail, currentDialog, setModelList, revealItem, flushNow,
 } from './render.js';
 import { toast, confirmDialog, promptDialog, jobsPopover, newSessionDialog, JOBID_RE, isLocalMeta, targetQuery } from './dialogs.js';
 import { openModelModal, openEffortModal, TermPanel, effortLockText, appliedToast } from './tui.js';
@@ -11,7 +11,7 @@ import { SubagentUI } from './subagents.js';
 import { StatsBar } from './stats.js';
 import { apiLabel, apiUsageTitle, restartApiDialog, loadApiKeys, loadUsage, onApiKeysChange, setDefaultBaseUrl } from './apikeys.js';
 import { initViz } from './viz.js';           // 可视化（§10）：图片引用 / 灯箱 / 文件 chip / 右侧预览面板
-import { openLightbox } from './lightbox.js';  // 图片条缩略图点击放大
+import { openLightbox, lightboxOpen } from './lightbox.js';  // 图片条缩略图点击放大
 import { PreviewPanel } from './preview.js';
 import { HintBar, installChords, screenHints } from './hotkeys.js';
 import { settingsDialog, setUpdateStore, setExtraSection } from './settings.js';
@@ -20,12 +20,23 @@ import { ComposerControls } from './composerbar.js';   // 输入框底栏：模�
 import { AutoSize } from './autosize.js';  // 输入框自适应高度（镜像测量，不临时缩小输入框，打字不抖）
 import { PromptNav, promptsFromItems, mergePending, addPending, historyDir, recallInto } from './prompthist.js';   // 输入框 ↑/↓ 历史
 import { sessionStatus, rowClass, isUnread, docTitle, unreadCount } from './sessrow.js';   // 侧栏行状态（新回复 / 待处理）
+import { buildLayout, compareSessions, flatten, locate, projectOf, projectKey, projectName, normPath, inProject, targetOf, CHAT_KEY,
+  moveSession as layoutMoveSession, moveSessionEdge, moveSessionStep, moveProject, moveProjectEdge, moveProjectStep,
+  aggregate, projectHeader, sectionHead, CollapseStore, HomeBook } from './projects.js';   // 侧栏：项目（按运行位置 + cwd 归组）与聊天
 import { PromptMinimap } from './minimap.js';   // 时间线左侧 prompt 小格子（只读覆盖层）
 import { ChangesButton } from './changes.js';   // 右侧「代码改动」栏的会话头开关（数据只来自前端已有的 transcript）
 import { UpdateStore, UpdateBanner, updateAction } from './update.js';   // dmg 版自动更新（只有后端开启时才显示）
 import { OpBanner, OpGuard, busyLabel, jobPromptModel, opRunning } from './opprogress.js';   // 重启 / 续接进度横幅 + 防连点
+import { sysNotify } from './sysnotify.js';   // macOS 系统通知（只在原生窗口里有 handler；浏览器 / 手机里什么都不做）
 import { ImageTray, DropOverlay, transferInfo, dragHasFiles, splitDropPaths, insertPaths, inputImages, inputHasOther,
   imageBlocked, dropHint, trayModel, lightboxList } from './attach.js';   // 本机会话发图片：⌘V = claude 的 Ctrl+V、原生窗口拖入 = 粘贴图片路径
+import { Completer, CompleteCache, atSafeTail } from './complete.js';   // 输入框 / 命令与 @ 文件补全（内置按 CLI 版本 + 后端只读列出）
+import { TodoPin } from './todopin.js';   // 输入框上方的置顶任务清单（只读 transcript 里的 TodoWrite / TaskCreate / TaskUpdate）
+import { DraftStore } from './drafts.js';   // 输入框草稿按会话存 localStorage（退出 app 也不丢；多窗口以最后输入为准）
+import { SessionFind, installFindKeys } from './finder.js';   // 会话内查找（⌘F，搜全部条目，只读）
+import { ToolTiers, keepReading } from './toolview.js';      // 工具调用显示档位（全部 / 隐藏成功的 / 全部隐藏 / 只看对话）
+import { QuoteStore, QuoteBar, QuotePicker, composeMessage, isCommandText } from './quote.js';   // 引用回复（选中文字 → 引用条 → 发送时 > …）
+import { setWidthWrapper } from './chatwidth.js';   // 聊天宽度（设置里切换；首帧由 theme.js 写好）
 
 const $ = (id) => document.getElementById(id);
 const api = new Api({ onAuthLost: (msg) => showAuthLost(msg) });
@@ -48,6 +59,13 @@ let epoch = 0;              // 每次（重新）加载递增；旧加载流程�
 let active = null;          // {type:'session', sid} | {type:'preview', uuid, session, item}
 const drafts = new Map();   // sid -> {text, nav}（nav = 输入框 ↑/↓ 历史的浏览状态，prompthist.js）
 const sentPending = new Map();   // sid -> [{text, n}]：本页发出、transcript 里还没出现的消息（↑/↓ 历史用）
+const draftStore = new DraftStore({
+  storage: (() => { try { return window.localStorage; } catch (_) { return null; } })(),
+  legacy: (() => { try { return window.sessionStorage; } catch (_) { return null; } })(),
+  onTooBig: (sid, n) => toast('草稿太长（' + n + ' 字，超过 10 万字），不会保存到本机：退出 app 后会丢失', 'warn', 8000),
+});
+let lastInputAt = 0;   // 本窗口最后一次在输入框里打字的时刻（performance.now）
+const todoPin = new TodoPin({ storage: (() => { try { return window.localStorage; } catch (_) { return null; } })() });
 let historyItems = null;     // 当前历史面板（historyTarget）的列表；每项带 target
 let historyLoading = false;
 // 历史面板的运行位置：'server' | 'local'（记住上次选择）；两边的列表各自缓存
@@ -73,10 +91,19 @@ let composerCtl = null;            // 输入框底栏左侧控件组（composerb
 let minimap = null;                // 时间线左侧 prompt 小格子（minimap.js）：#chat-host 里只挂一个，跟随当前会话 / 历史预览
 // 会话头「改动」按钮：只建一次，每次重建会话头时挂回去，角标 / 按下状态原地更新
 const chgBtn = new ChangesButton({ onClick: () => { const s = activeSession(); if (s && pvPanel) pvPanel.toggleChanges(s); } });
-// 条目写进 DOM 之后：左侧小格子 + 右侧「改动」栏（增量）
+// 会话内查找 / 工具调用显示档位 / 引用条（finder.js、toolview.js、quote.js）：都是纯前端，只读 transcript、只改我们自己的输入框
+let finder = null;
+const tiers = new ToolTiers({ onChange: () => { const s = activeSession(); if (s && minimap) minimap.onFlush(s); } });
+const quotes = new QuoteStore(() => scheduleUI());
+const quoteBar = new QuoteBar({ onRemove: (id) => { const s = liveSession(); if (s) quotes.remove(s.sid, id); }, onClear: () => { const s = liveSession(); if (s) quotes.clear(s.sid); } });
+const findBtn = h('button', { class: 'btn ghost small find-open-btn', type: 'button', title: '在会话中查找（⌘F）：搜本会话全部消息、工具调用与思考' }, icon('search'), h('span', null, '查找'));
+findBtn.addEventListener('click', () => { if (finder) finder.open(); });
+// 条目写进 DOM 之后：左侧小格子 + 右侧「改动」栏（增量）+ 查找高亮 / 「只看对话」标记
 const minimapFlush = (s) => {
   if (minimap) minimap.onFlush(s);
   if (pvPanel) pvPanel.onSessionUpdate(s);
+  if (finder) finder.onFlush(s);
+  tiers.onFlush(s);
 };
 
 const sp = (s, tail) => api.sessionPath(s.sid, tail);
@@ -148,7 +175,7 @@ async function withForceRetry(fn, title, what, local = false) {
 const state = createState({
   actions,
   // 窗口标题（未读数）在 meta 到达时直接更新：窗口在后台时 rAF 不执行，原生壳的程序坞角标要靠它
-  onMeta: () => { updateDocTitle(); scheduleUI(); },
+  onMeta: (s) => { updateDocTitle(); scheduleUI(); sysNotify.onMeta(s); },
   onSession: () => scheduleUI(),
   onScreen: (s) => onScreen(s),
   onModelList: (s) => { if (modelCtrl && modelCtrl.sid === s.sid && s.modelList) modelCtrl.ctrl.setFull(s.modelList); },
@@ -169,12 +196,21 @@ async function boot() {
   // 输入框底栏：左侧控件组 + 右侧统计（统计元素只在这里挂一次，以后不再移动）
   composerCtl = new ComposerControls($('composer-ctl'));
   minimap = new PromptMinimap($('chat-host'), { reveal: revealItem });
+  finder = new SessionFind($('chat-host'), { reveal: revealItem, flush: flushNow });
+  installFindKeys(finder, { blocked: () => !!document.querySelector('dialog[open]') || lightboxOpen() });
+  $('composer-box').before(quoteBar.el);   // 引用条：输入框上方
+  new QuotePicker({ canQuote: () => !!liveSession() && !$('composer').hidden,
+    onQuote: (q) => { const s = liveSession(); if (!s) return; quotes.add(s.sid, q); $('input').focus({ preventScroll: true }); } });
+  // 聊天宽度（设置里改）：保持阅读位置；宽度变了（含别的标签页改的）小格子按新的留白重新测量
+  setWidthWrapper((apply) => { const s = activeSession(); if (s && s.view) keepReading(s, apply); else apply(); });
+  window.addEventListener('ccr:chatw', () => { if (minimap) minimap.measure(); });
   $('composer-stats').appendChild(statsBar.el);
   saUI = new SubagentUI({ api, toast });
   pvPanel = new PreviewPanel({ host: $('app'), onState: () => updateChgBtn() });
   initViz({ api, getConfig: () => config, toast, panel: pvPanel });
   // CLI 快捷键提示：「转到后台运行」(Ctrl+B Ctrl+B)、「立即发送排队消息」(Ctrl+X Ctrl+S)；按钮与键盘和弦共用同一组动作
   hintBar = new HintBar($('hint-bar'), { onBackground: () => hintAction('background'), onSendNow: () => hintAction('send_now') });
+  $('hint-bar').parentNode.insertBefore(todoPin.el, $('hint-bar'));   // 置顶任务清单：输入框（和快捷键提示条）上方
   installChords({ getHints: chordHints, onBackground: () => hintAction('background'), onSendNow: () => hintAction('send_now') });
   term = new TermPanel($('term-panel'), {
     onKeys: (keys) => { const s = liveSession(); return s ? api.post(sp(s, '/keys'), { keys }) : Promise.resolve(); },
@@ -201,10 +237,23 @@ async function boot() {
     }
   }
   if (!api.token) { showAuthLost(''); return; }
+  initSysNotify();
   // API key 列表/用量（会话头 chip、会话列表标签用）：变化时重画
   onApiKeysChange(() => { headerKey = ''; listKey = ''; scheduleUI(); if (historyItems) renderHistoryList(); });
   loadApiKeys(api).then(() => loadUsage(api)).catch(() => {});
   await loadAll();
+}
+
+// ---------- macOS 系统通知（static/sysnotify.js，SPEC §12.1；只在原生窗口里有 handler） ----------
+function initSysNotify() {
+  sysNotify.init({
+    activeSid: () => (active && active.type === 'session' ? active.sid : null),
+    hasSession: (sid) => state.sessions.has(sid),
+    foreground: () => document.visibilityState === 'visible' && document.hasFocus(),
+    dialog: (s) => currentDialog(s),
+    // 点了通知 = 用户要看这个会话：与点侧栏那一行相同（打开并标为已读）
+    onOpen: (sid) => { const s = state.sessions.get(sid); if (!s) return; activate(sid); markSeen(s); },
+  });
 }
 
 // ---------- dmg 版自动更新（static/update.js；后端没开启时 bootstrap 不带 update，这里什么都不做） ----------
@@ -248,6 +297,8 @@ async function loadAll() {
     const s = ensureSession(state, meta.sid, meta);
     s.hold = true; // 回放完成前暂存 SSE 事件
   }
+  sysNotify.seed(state.sessions.values());   // 系统通知的基线：之后 done_at / attn_at 变大才通知
+  draftStore.gc((Array.isArray(b.sessions) ? b.sessions : []).map((m) => m && m.sid));   // 别处删掉的会话：草稿也删
   updateDocTitle();
 
   stream = new EventStream({
@@ -416,65 +467,59 @@ function setConn(st, text) {
 
 // ====================== 会话辅助 ======================
 
-/** 侧栏顺序：手动排过的按 meta.order（小的在上）；没排过的（新会话）按创建时间、新的在最上，并排在所有排过的前面 */
-function orderKey(s) {
-  const o = s.meta.order;
-  return typeof o === 'number' && Number.isFinite(o) ? o : -(Number(s.meta.created_at) || 0);
-}
+/** 全局顺序：手动排过的按 meta.order（小的在上）；没排过的（新会话）按创建时间、新的在最上，并排在所有排过的前面（projects.js） */
 function sortedSessions() {
-  return [...state.sessions.values()].filter((s) => !s.readOnly)
-    .sort((a, b) => orderKey(a) - orderKey(b) || (Number(b.meta.created_at) || 0) - (Number(a.meta.created_at) || 0)
-      || String(a.sid).localeCompare(String(b.sid)));
+  return [...state.sessions.values()].filter((s) => !s.readOnly).sort(compareSessions);
 }
 
-/** 手动排序：ids = 从上到下的全部会话 id；先在本地生效，再告诉后端（存进 sessions.json） */
+// ====================== 侧栏：项目与聊天（SPEC §15.2，static/projects.js） ======================
+// 项目 = 运行位置 + cwd，只由 meta.in_project 的会话组成；其余在「聊天」区。折叠状态 / 学到的 home 只在本页 localStorage。
+const safeStorage = (() => { try { return window.localStorage; } catch (_) { return null; } })();
+const projCollapse = new CollapseStore(safeStorage);
+const projHomes = new HomeBook(safeStorage);
+// 新建 / 移入项目 / 切换过去的会话：它所在的项目自动展开（cwd 从 ~ 变成 CLI 报告的绝对路径、换了组时再展开一次）
+const revealSids = new Map();   // sid -> 截止时间（ms）
+function revealSoon(sid) { revealSids.set(sid, Date.now() + 60000); }
+
+/** 当前侧栏布局（顺手记下各会话 cwd 的变化，学这台机器的 home） */
+function sidebarLayout(sessions = sortedSessions()) {
+  for (const s of sessions) projHomes.observe(s.sid, targetOf(s.meta), s.meta.cwd);
+  return buildLayout(sessions.map((s) => ({ sid: s.sid, meta: s.meta })), { homes: projHomes.homes });
+}
+
+/** 手动排序：ids = 从上到下的全部会话 id（各项目依次 + 聊天）；先在本地生效，再告诉后端（存进 sessions.json） */
 async function applyOrder(ids) {
+  if (!ids) return;
   ids.forEach((id, i) => { const x = state.sessions.get(id); if (x) x.meta = { ...x.meta, order: i }; });
   renderSessionList();
   try { await api.post('/api/sessions/order', { sids: ids }); } catch (e) { toast('保存排序失败：' + e.message, 'error'); }
 }
-function moveSession(sid, targetSid, after) {
-  if (!sid || sid === targetSid) return;
-  const ids = sortedSessions().map((x) => x.sid).filter((x) => x !== sid);
-  let i = ids.indexOf(targetSid);
-  if (i < 0) return;
-  if (after) i += 1;
-  ids.splice(i, 0, sid);
-  applyOrder(ids);
+/** 会话只在所在的项目（或聊天区）内移动；跨组 = null（不调整） */
+function moveSession(sid, targetSid, after) { applyOrder(layoutMoveSession(sidebarLayout(), sid, targetSid, after)); }
+function moveSessionTo(sid, where) { applyOrder(moveSessionEdge(sidebarLayout(), sid, where)); }
+function moveSessionBy(sid, delta) { applyOrder(moveSessionStep(sidebarLayout(), sid, delta)); }
+function moveProjectTo(key, where) { applyOrder(moveProjectEdge(sidebarLayout(), key, where)); }
+function moveProjectBy(key, delta) { applyOrder(moveProjectStep(sidebarLayout(), key, delta)); }
+
+/** 移入 / 移出项目（只改显示归属；乐观更新，以服务器回推的 meta 为准，失败回滚） */
+async function setInProject(s, on) {
+  const prev = s.meta.in_project;
+  s.meta = { ...s.meta, in_project: on };
+  if (on) revealSoon(s.sid);
+  listKey = '';
+  scheduleUI();
+  try {
+    await api.post(sp(s, '/project'), { in: on });
+  } catch (e) {
+    if (state.sessions.get(s.sid) === s && s.meta.in_project === on) { s.meta = { ...s.meta, in_project: prev }; listKey = ''; scheduleUI(); }
+    toast((on ? '移入项目' : '移出项目') + '失败：' + e.message, 'error');
+  }
 }
-function moveSessionTo(sid, where) {
-  const ids = sortedSessions().map((x) => x.sid).filter((x) => x !== sid);
-  if (where === 'top') ids.unshift(sid); else ids.push(sid);
-  applyOrder(ids);
-}
-function moveSessionBy(sid, delta) {
-  const ids = sortedSessions().map((x) => x.sid);
-  const i = ids.indexOf(sid);
-  const j = i + delta;
-  if (i < 0 || j < 0 || j >= ids.length) return;
-  ids.splice(i, 1);
-  ids.splice(j, 0, sid);
-  applyOrder(ids).then(() => { const el = $('session-list').querySelector('[data-sid="' + sid + '"]'); if (el) el.focus(); });
-}
-function sessionMenu(s, x, y) {
+
+/** 右键菜单 / 长按菜单（手机远程的 mobile.js 把长按转成 contextmenu） */
+function popMenu(label, items, x, y) {
   document.querySelectorAll('.popover.sess-menu').forEach((p) => p.remove());
-  const item = (label, ic, fn) => {
-    const b = h('button', { class: 'menu-item', type: 'button', role: 'menuitem' }, icon(ic), label);
-    b.addEventListener('click', () => { dismiss(); fn(); });
-    return b;
-  };
-  // 新回复：未读 →「标为已读」；有过完成记录、当前已读 →「标为未读」
-  const unread = isUnread(s.meta, s.localSeen);
-  const seenItem = unread ? item('标为已读', 'check', () => markSeen(s))
-    : typeof s.meta.done_at === 'number' ? item('标为未读', 'bell', () => markUnseen(s)) : null;
-  const pop = h('div', { class: 'popover sess-menu', role: 'menu', 'aria-label': '会话操作' },
-    seenItem,
-    item('移到最上', 'up', () => moveSessionTo(s.sid, 'top')),
-    item('移到最下', 'down', () => moveSessionTo(s.sid, 'bottom')),
-    item('删除会话…', 'trash', () => doDelete(s)));
-  document.body.appendChild(pop);
-  pop.style.left = Math.max(8, Math.min(x, window.innerWidth - 180)) + 'px';
-  pop.style.top = Math.max(8, Math.min(y, window.innerHeight - (seenItem ? 176 : 140))) + 'px';
+  const pop = h('div', { class: 'popover sess-menu', role: 'menu', 'aria-label': label });
   const dismiss = (e) => {
     if (e && e.type === 'mousedown' && pop.contains(e.target)) return;
     if (e && e.type === 'keydown' && e.key !== 'Escape') return;
@@ -482,7 +527,58 @@ function sessionMenu(s, x, y) {
     document.removeEventListener('mousedown', dismiss, true);
     document.removeEventListener('keydown', dismiss, true);
   };
+  for (const it of items) {
+    if (!it) continue;
+    const b = h('button', { class: 'menu-item', type: 'button', role: 'menuitem', title: it.title || null }, icon(it.icon), h('span', { class: 'menu-label' }, it.label));
+    b.addEventListener('click', () => { dismiss(); it.fn(); });
+    pop.appendChild(b);
+  }
+  document.body.appendChild(pop);
+  const r = pop.getBoundingClientRect();
+  pop.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
+  pop.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
   setTimeout(() => { document.addEventListener('mousedown', dismiss, true); document.addEventListener('keydown', dismiss, true); }, 0);
+}
+function sessionMenu(s, x, y) {
+  // 新回复：未读 →「标为已读」；有过完成记录、当前已读 →「标为未读」
+  const unread = isUnread(s.meta, s.localSeen);
+  const seenItem = unread ? { label: '标为已读', icon: 'check', fn: () => markSeen(s) }
+    : typeof s.meta.done_at === 'number' ? { label: '标为未读', icon: 'bell', fn: () => markUnseen(s) } : null;
+  const inProj = inProject(s.meta);
+  const pk = projectKey(s.meta, projHomes.homes);
+  const g = projectOf(sidebarLayout(), pk);
+  const name = g ? g.name : projectName(pk.includes(':') ? pk.slice(pk.indexOf(':') + 1) : '', projHomes.homes[targetOf(s.meta)]);
+  popMenu('会话操作', [
+    seenItem,
+    { label: '移到最上', icon: 'up', fn: () => moveSessionTo(s.sid, 'top') },
+    { label: '移到最下', icon: 'down', fn: () => moveSessionTo(s.sid, 'bottom') },
+    inProj ? { label: '移出项目', icon: 'chat', title: '移到侧栏的「聊天」里（只改显示，不影响 claude）', fn: () => setInProject(s, false) }
+      : { label: '移入项目「' + truncate(name, 16) + '」', icon: 'folder', title: '归入' + (targetOf(s.meta) === 'local' ? '本机' : '服务器') + '上 ' + (s.meta.cwd || '') + ' 这个项目（只改显示，不影响 claude）', fn: () => setInProject(s, true) },
+    { label: '删除会话…', icon: 'trash', fn: () => doDelete(s) },
+  ], x, y);
+}
+function projectMenu(g, x, y) {
+  const collapsed = projCollapse.has(g.key);
+  popMenu('项目操作', [
+    { label: '新建会话', icon: 'plus', fn: () => newInProject(g) },
+    { label: collapsed ? '展开' : '折叠', icon: collapsed ? 'chevdown' : 'chevron', fn: () => toggleProject(g.key) },
+    { label: '移到最上', icon: 'up', fn: () => moveProjectTo(g.key, 'top') },
+    { label: '移到最下', icon: 'down', fn: () => moveProjectTo(g.key, 'bottom') },
+  ], x, y);
+}
+function toggleProject(key) {
+  projCollapse.toggle(key);
+  listKey = '';
+  renderSessionList();
+}
+/** 项目标题行的「+」：预填该项目的运行位置、目录（服务器 = 当前作业，没设置时用组里最新会话的作业），放进项目 */
+function newInProject(g) {
+  if (!g.target) { openNewSession({ project: true, heading: '新建项目' }); return; }
+  const local = g.target === 'local';
+  openNewSession({
+    target: g.target, cwd: g.path, jobid: local ? 'local' : (config.jobid || g.jobid || ''), project: true,
+    project_name: g.name, heading: '在项目「' + truncate(g.name, 24) + '」中新建会话',
+  });
 }
 
 function isActive(s) { return !!active && active.type === 'session' && active.sid === s.sid; }
@@ -615,6 +711,7 @@ function activate(sid) {
   if (modelCtrl && modelCtrl.sid !== sid) closeModelModal();
   active = { type: 'session', sid };
   localStorage.setItem('ccr.active', sid);
+  sysNotify.clear(sid);   // 通知中心里这个会话的通知已经没用了
   hideAllViews();
   $('empty-state').hidden = true;
   const isNew = !s.view;
@@ -710,6 +807,8 @@ function renderAll() {
   if (pvPanel) pvPanel.setSession(s);
   updateChgBtn();
   if (minimap) minimap.setSession(s && s.view ? s : null);
+  if (finder) finder.setSession(s && s.view ? s : null);
+  tiers.setSession(s && s.view ? s : null);
 }
 
 /** 会话头「改动」按钮：本会话改动文件数 + 是否正在显示（只读：数据来自前端已有的 transcript，不发请求） */
@@ -720,72 +819,186 @@ function updateChgBtn() {
 }
 
 let listKey = '';
-let dragSid = null;   // 侧栏拖动排序中的会话
-function clearDropMarks() { for (const el of document.querySelectorAll('.sess.drop-before, .sess.drop-after')) el.classList.remove('drop-before', 'drop-after'); }
+// 侧栏拖动：{kind:'sess', sid, sec（所在项目的 key 或 CHAT_KEY）} | {kind:'proj', key}。会话只能在本组内移动；项目整体移动
+let drag = null;
+function clearDropMarks() {
+  for (const el of $('session-list').querySelectorAll('.drop-before, .drop-after, .drop-deny')) el.classList.remove('drop-before', 'drop-after', 'drop-deny');
+}
+function markDrop(el, cls) {
+  if (!el || el.classList.contains(cls)) return;
+  clearDropMarks();
+  el.classList.add(cls);
+}
+/** 不接受这次放下（不 preventDefault → 浏览器显示禁止光标、不会触发 drop）+ 目标组画虚线框与「不能放这里」 */
+function denyDrop(e, block) {
+  e.dataTransfer.dropEffect = 'none';
+  markDrop(block, 'drop-deny');
+}
+
+/** 聊天区会话行里的目录名：文件夹名；home 显示 "~"（知道这台机器的 home 时） */
+function cwdLabel(m) {
+  const hm = projHomes.homes[targetOf(m)];
+  return projectName(normPath(m.cwd, hm), hm) || basename(m.cwd);
+}
+
+/** 侧栏一行会话。inProj = 在项目里（标题行已经写了运行位置与目录，行里就不再重复） */
+function sessionRow(s, st, stText, sec) {
+  const m = s.meta;
+  const inProj = sec !== CHAT_KEY;
+  const del = h('button', { class: 'icon-btn row-act', type: 'button', title: '删除会话' }, icon('trash'));
+  del.addEventListener('click', (e) => { e.stopPropagation(); doDelete(s); });
+  const toBottom = h('button', { class: 'icon-btn row-act row-act-2', type: 'button', title: inProj ? '移到项目最下（暂时不用的会话放到底部）' : '移到最下（暂时不用的会话放到底部）' }, icon('down'));
+  toBottom.addEventListener('click', (e) => { e.stopPropagation(); moveSessionTo(s.sid, 'bottom'); });
+  const row = h('div', { class: rowClass(st, isActive(s)), role: 'listitem', tabindex: '0', draggable: 'true', 'data-sid': s.sid,
+    'data-fk': 's:' + s.sid, 'data-nav': '1',
+    title: (m.cwd || '') + '\n拖动可' + (inProj ? '在项目内' : '在「聊天」里') + '调整顺序；右键：移到最上 / 最下、' + (inProj ? '移出项目' : '移入项目') + '；Alt+↑/↓ 上下移动' },
+    h('span', { class: 'dot st-' + st, title: stText }),
+    h('div', { class: 'sess-main' },
+      h('div', { class: 'sess-title' }, sessionTitle(s)),
+      h('div', { class: 'sess-sub' },
+        isLocalMeta(m) ? (inProj ? null : h('span', { class: 'loc-tag', title: '在本机运行' }, icon('laptop'), '本机'))
+          : m.jobid ? h('span', { class: 'mono' }, 'job ' + m.jobid) : null,
+        m.cwd && !inProj ? h('span', { class: 'mono', title: m.cwd }, cwdLabel(m)) : null,
+        h('span', { class: 'st-label st-' + st }, stText),
+        h('span', { class: 'api-tag' + (m.launch && m.launch.api_key_id ? '' : ' is-default') + (m.api_key_missing ? ' missing' : ''), title: '所用 API：' + apiLabel(m) }, apiLabel(m, { short: true })),
+        runningSubagents(s) ? h('span', { class: 'sa-badge', title: '正在运行的子代理' }, icon('agent'), String(runningSubagents(s))) : null)),
+    toBottom, del);
+  // 点这一行（包括点已选中的那一行）= 看过了：清除「新回复」
+  row.addEventListener('click', () => { markSeen(s); activate(s.sid); });
+  row.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { markSeen(s); activate(s.sid); }
+    else if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); moveSessionBy(s.sid, e.key === 'ArrowUp' ? -1 : 1); }
+  });
+  row.addEventListener('contextmenu', (e) => { e.preventDefault(); sessionMenu(s, e.clientX, e.clientY); });
+  row.addEventListener('dragstart', (e) => {
+    e.stopPropagation();   // 不要让外层的项目当成拖整个项目
+    drag = { kind: 'sess', sid: s.sid, sec };
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', s.sid); } catch (_) { /* 忽略 */ }
+    row.classList.add('dragging');
+  });
+  row.addEventListener('dragend', () => { drag = null; row.classList.remove('dragging'); clearDropMarks(); });
+  row.addEventListener('dragover', (e) => {
+    if (!drag || drag.kind !== 'sess') return;   // 拖项目：交给外层项目块（冒泡）
+    e.stopPropagation();
+    if (drag.sec !== sec) { denyDrop(e, row.closest('.proj, .chat-sec')); return; }   // 跨项目 / 项目↔聊天：不接受
+    if (drag.sid === s.sid) { clearDropMarks(); return; }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const r = row.getBoundingClientRect();
+    markDrop(row, e.clientY > r.top + r.height / 2 ? 'drop-after' : 'drop-before');
+  });
+  row.addEventListener('drop', (e) => {
+    if (!drag || drag.kind !== 'sess') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const after = row.classList.contains('drop-after');
+    const from = drag.sid;
+    clearDropMarks();
+    if (drag.sec === sec) moveSession(from, s.sid, after);
+  });
+  return row;
+}
+
+/** 一个项目：标题行（可拖动整组、点击折叠 / 展开、「+」）+ 组内会话 */
+function projectBlock(g, idx, statuses, rows) {
+  const collapsed = projCollapse.has(g.key);
+  const hasActive = g.sids.some((sid) => active && active.type === 'session' && active.sid === sid);
+  const model = { ...g, n: g.sids.length, agg: aggregate(g.sids.map((sid) => statuses.get(sid))), collapsed, active: hasActive, bodyId: 'proj-body-' + idx };
+  const hd = projectHeader(model, { onToggle: () => toggleProject(g.key), onAdd: () => newInProject(g) });
+  const body = h('div', { class: 'proj-body', id: model.bodyId, role: 'list', hidden: collapsed }, rows);
+  const block = h('div', { class: 'proj', role: 'listitem', 'data-pkey': g.key }, hd, body);
+  const toggle = hd.querySelector('.proj-toggle');
+  toggle.addEventListener('keydown', (e) => {
+    if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); moveProjectBy(g.key, e.key === 'ArrowUp' ? -1 : 1); }
+  });
+  hd.addEventListener('contextmenu', (e) => { e.preventDefault(); projectMenu(g, e.clientX, e.clientY); });
+  hd.addEventListener('dragstart', (e) => {
+    drag = { kind: 'proj', key: g.key };
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', g.key); } catch (_) { /* 忽略 */ }
+    block.classList.add('dragging');
+  });
+  hd.addEventListener('dragend', () => { drag = null; block.classList.remove('dragging'); clearDropMarks(); });
+  block.addEventListener('dragover', (e) => {
+    if (!drag) return;
+    if (drag.kind === 'sess') {   // 拖会话经过标题行：本组 = 放到最上面；别的组 = 不接受
+      if (drag.sec !== g.key) { denyDrop(e, block); return; }
+      const first = body.querySelector('.sess');
+      if (!e.target.closest('.proj-hd') || !first || collapsed) { clearDropMarks(); return; }
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      markDrop(first, 'drop-before');
+      return;
+    }
+    if (drag.key === g.key) { clearDropMarks(); return; }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const r = block.getBoundingClientRect();
+    markDrop(block, e.clientY > r.top + r.height / 2 ? 'drop-after' : 'drop-before');
+  });
+  block.addEventListener('drop', (e) => {
+    if (!drag) return;
+    e.preventDefault();
+    const d = drag;
+    const after = block.classList.contains('drop-after');
+    const first = body.querySelector('.sess.drop-before');
+    clearDropMarks();
+    if (d.kind === 'sess') { if (d.sec === g.key && first && first.dataset.sid) moveSession(d.sid, first.dataset.sid, false); }
+    else if (d.key !== g.key) applyOrder(moveProject(sidebarLayout(), d.key, g.key, after));
+  });
+  return block;
+}
+
 function renderSessionList() {
   const list = $('session-list');
   const sessions = sortedSessions();
-  const key = JSON.stringify(sessions.map((s) => [s.sid, sessionTitle(s), s.meta.jobid, s.meta.cwd, statusOf(s), isActive(s), runningSubagents(s), apiLabel(s.meta, { short: true })]));
+  const layout = sidebarLayout(sessions);
+  // 新建 / 移入项目 / 切换过去的会话：所在项目自动展开（cwd 定成绝对路径、不会再换组后停止）
+  const now = Date.now();
+  for (const [sid, until] of revealSids) {
+    const s = state.sessions.get(sid);
+    const loc = s ? locate(layout, sid) : null;
+    if (!s || now > until) { revealSids.delete(sid); continue; }
+    if (loc && loc.key !== CHAT_KEY) projCollapse.set(loc.key, false);
+    if (typeof s.meta.cwd === 'string' && s.meta.cwd.startsWith('/')) revealSids.delete(sid);
+  }
+  const statuses = new Map(sessions.map((s) => [s.sid, statusOf(s)]));
+  const key = JSON.stringify([layout.projects.map((g) => [g.key, g.name, g.sids, projCollapse.has(g.key)]), layout.chats,
+    sessions.map((s) => [s.sid, sessionTitle(s), s.meta.jobid, s.meta.cwd, statuses.get(s.sid), isActive(s), runningSubagents(s), apiLabel(s.meta, { short: true })])]);
   if (key === listKey) return;
   listKey = key;
-  if (!sessions.length) {
-    list.replaceChildren(h('div', { class: 'side-empty' }, '还没有会话。点击“新建会话”开始。'));
-    return;
+  // 整个列表重建：记下焦点在哪一项（会话行 / 项目标题 / 「+」），重建后放回去
+  const ae = document.activeElement;
+  const fk = ae && list.contains(ae) ? (ae.closest('[data-fk]') || {}).dataset?.fk : null;
+  const byId = new Map(sessions.map((s) => [s.sid, s]));
+  const row = (sid, sec) => { const s = byId.get(sid); const [st, stText] = statuses.get(sid); return sessionRow(s, st, stText, sec); };
+  const out = [sectionHead('项目', {
+    addTitle: '新建项目：选运行位置和文件夹，项目随第一个会话一起出现（项目 = 运行位置 + 工作目录）', addLabel: '新建项目', fk: 'sec:proj',
+    onAdd: () => openNewSession({ project: true, heading: '新建项目' }),
+  })];
+  if (!sessions.length) out.push(h('div', { class: 'side-empty' }, '还没有会话。点上方「新建聊天」开始；或点「项目」旁的 + 选一个文件夹新建项目。'));
+  else if (!layout.projects.length) out.push(h('div', { class: 'side-hint' }, '还没有项目：点 + 选一个文件夹；聊天也可以在右键菜单里移入项目'));
+  layout.projects.forEach((g, i) => out.push(projectBlock(g, i, statuses, g.sids.map((sid) => row(sid, g.key)))));
+  if (layout.chats.length) {
+    const sec = h('div', { class: 'chat-sec', role: 'listitem' },
+      sectionHead('聊天', { count: layout.chats.length, addTitle: '新建聊天（不放进项目）', addLabel: '新建聊天', fk: 'sec:chat', onAdd: () => openNewSession({ heading: '新建聊天' }) }),
+      h('div', { class: 'chat-body', role: 'list' }, layout.chats.map((sid) => row(sid, CHAT_KEY))));
+    sec.addEventListener('dragover', (e) => { if (drag && (drag.kind === 'proj' || drag.sec !== CHAT_KEY)) denyDrop(e, sec); });
+    out.push(sec);
   }
-  list.replaceChildren(...sessions.map((s) => {
-    const m = s.meta;
-    const [st, stText] = statusOf(s);
-    const del = h('button', { class: 'icon-btn row-act', type: 'button', title: '删除会话' }, icon('trash'));
-    del.addEventListener('click', (e) => { e.stopPropagation(); doDelete(s); });
-    const toBottom = h('button', { class: 'icon-btn row-act row-act-2', type: 'button', title: '移到最下（暂时不用的会话放到底部）' }, icon('down'));
-    toBottom.addEventListener('click', (e) => { e.stopPropagation(); moveSessionTo(s.sid, 'bottom'); });
-    const row = h('div', { class: rowClass(st, isActive(s)), role: 'listitem', tabindex: '0', draggable: 'true', 'data-sid': s.sid,
-      title: (m.cwd || '') + '\n拖动可调整顺序；右键：移到最上 / 最下；Alt+↑/↓ 上下移动' },
-      h('span', { class: 'dot st-' + st, title: stText }),
-      h('div', { class: 'sess-main' },
-        h('div', { class: 'sess-title' }, sessionTitle(s)),
-        h('div', { class: 'sess-sub' },
-          isLocalMeta(m) ? h('span', { class: 'loc-tag', title: '在本机运行' }, icon('laptop'), '本机')
-            : m.jobid ? h('span', { class: 'mono' }, 'job ' + m.jobid) : null,
-          m.cwd ? h('span', { class: 'mono' }, basename(m.cwd)) : null,
-          h('span', { class: 'st-label st-' + st }, stText),
-          h('span', { class: 'api-tag' + (m.launch && m.launch.api_key_id ? '' : ' is-default') + (m.api_key_missing ? ' missing' : ''), title: '所用 API：' + apiLabel(m) }, apiLabel(m, { short: true })),
-          runningSubagents(s) ? h('span', { class: 'sa-badge', title: '正在运行的子代理' }, icon('agent'), String(runningSubagents(s))) : null)),
-      toBottom, del);
-    // 点这一行（包括点已选中的那一行）= 看过了：清除「新回复」
-    row.addEventListener('click', () => { markSeen(s); activate(s.sid); });
-    row.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { markSeen(s); activate(s.sid); }
-      else if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); moveSessionBy(s.sid, e.key === 'ArrowUp' ? -1 : 1); }
-    });
-    row.addEventListener('contextmenu', (e) => { e.preventDefault(); sessionMenu(s, e.clientX, e.clientY); });
-    row.addEventListener('dragstart', (e) => {
-      dragSid = s.sid;
-      e.dataTransfer.effectAllowed = 'move';
-      try { e.dataTransfer.setData('text/plain', s.sid); } catch (_) { /* 忽略 */ }
-      row.classList.add('dragging');
-    });
-    row.addEventListener('dragend', () => { dragSid = null; row.classList.remove('dragging'); clearDropMarks(); });
-    row.addEventListener('dragover', (e) => {
-      if (!dragSid || dragSid === s.sid) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      const r = row.getBoundingClientRect();
-      const after = e.clientY > r.top + r.height / 2;
-      if (row.classList.contains(after ? 'drop-after' : 'drop-before')) return;
-      clearDropMarks();
-      row.classList.add(after ? 'drop-after' : 'drop-before');
-    });
-    row.addEventListener('drop', (e) => {
-      if (!dragSid) return;
-      e.preventDefault();
-      const after = row.classList.contains('drop-after');
-      const from = dragSid;
-      clearDropMarks();
-      moveSession(from, s.sid, after);
-    });
-    return row;
-  }));
+  list.replaceChildren(...out);
+  if (fk) {
+    const el = [...list.querySelectorAll('[data-fk]')].find((x) => x.dataset.fk === fk);
+    if (el && el.offsetParent !== null) el.focus({ preventScroll: true });
+  }
+}
+/** 让新建 / 切换过去的会话在侧栏里看得见（所在项目已由 revealSids 展开） */
+function revealRow(sid) {
+  requestAnimationFrame(() => {
+    const el = $('session-list').querySelector('.sess[data-sid="' + CSS.escape(sid) + '"]');
+    if (el && el.offsetParent !== null) el.scrollIntoView({ block: 'nearest' });
+  });
 }
 
 let headerKey = '';
@@ -816,7 +1029,7 @@ function renderHeader() {
             : h('span', { class: 'chip job-badge', title: '服务器上的历史会话' }, icon('server'), '服务器'),
           h('span', { class: 'chip mono', title: it.cwd || '' }, icon('folder'), it.cwd || '未知目录'),
           h('span', { class: 'chip mono' }, String(it.claude_session_id || '')))),
-      h('div', { class: 'hd-actions' }, chgBtn.el, cont));
+      h('div', { class: 'hd-actions' }, findBtn, tiers.el, chgBtn.el, cont));
     updateChgBtn();
     return;
   }
@@ -861,7 +1074,7 @@ function renderHeader() {
     stop.addEventListener('click', () => doInterrupt(s));
     actionsEl.push(stop);
   }
-  actionsEl.push(chgBtn.el);
+  actionsEl.push(findBtn, tiers.el, chgBtn.el);
   const termBtn = h('button', { class: 'btn small' + (termOpen ? ' primary' : ' ghost'), type: 'button', title: '显示/隐藏终端面板（屏幕原文 + 键盘）' }, icon('terminal'), h('span', null, '终端'));
   termBtn.addEventListener('click', () => setTerm(!termOpen));
   actionsEl.push(termBtn);
@@ -923,8 +1136,9 @@ function renderStats() {
 function renderComposerState() {
   const comp = $('composer');
   const s = activeSession();
-  if (!s || active.type !== 'session') { comp.hidden = true; return; }
+  if (!s || active.type !== 'session') { comp.hidden = true; todoPin.update(null); return; }
   comp.hidden = false;
+  todoPin.update(s);
   const m = s.meta;
   const dead = isDead(m);
   const d = currentDialog(s);
@@ -967,7 +1181,7 @@ function renderComposerState() {
   const blocked = dead || !!d;
   // 运行中的提示写进占位文字（底栏留给控件）；比默认占位短，不会因此多折一行
   const ph = d ? '请先处理上方对话框' : dead ? '会话已退出' : busy ? '运行中：新消息会进入 claude 的输入队列'
-    : TOUCH_COMPOSE ? '给 Claude 发消息（/ 命令）' : '给 Claude 发消息（Enter 发送 · Shift+Enter 换行 · / 命令）';
+    : TOUCH_COMPOSE ? '给 Claude 发消息（/ 命令 · @ 文件）' : '给 Claude 发消息（Enter 发送 · Shift+Enter 换行 · / 命令 · @ 文件）';
   // 先改占位文字再测高：空输入框的高度按占位文字量（AutoSize 连同 placeholder 一起量）
   const phChanged = ta.placeholder !== ph;
   if (phChanged) ta.placeholder = ph;
@@ -980,6 +1194,7 @@ function renderComposerState() {
   // claude 输入框里的图片（⌘V / 拖入后出现的 [Image #N]）：输入框顶部的图片条，内容不变不重建
   if (!imageTray.el.isConnected) $('composer-box').prepend(imageTray.el);
   imageTray.update(trayFor(s));
+  quoteBar.update(quotes.list(s.sid), s.absCwd || m.cwd || '');   // 引用条（内容不变不重建）
 }
 
 function setBanner(el, key, build) {
@@ -1225,11 +1440,15 @@ function dropSession(sid) {
   if (modelCtrl && modelCtrl.sid === sid) closeModelModal();
   forgetSession(state, sid);   // 记住已删除：之后迟到的该 sid 事件（exited meta、子代理…）不会把它加回侧栏
   drafts.delete(sid);
+  draftStore.remove(sid);       // 会话删除：本机保存的草稿一起删
+  completeCache.drop(sid);
   sentPending.delete(sid);
+  projHomes.forget(sid);
+  revealSids.delete(sid);
   updateDocTitle();
   if (active && active.type === 'session' && active.sid === sid) {
-    const next = sortedSessions()[0];
-    if (next) activate(next.sid); else showEmpty();
+    const next = flatten(sidebarLayout())[0];   // 侧栏里最上面那个（各项目依次 + 聊天）
+    if (next) activate(next); else showEmpty();
   } else scheduleUI();
 }
 
@@ -1252,7 +1471,9 @@ async function openNewSession(preset) {
   const meta = await newSessionDialog(api, { config, preset, modelHints: modelHints() });
   if (!meta || !meta.sid) return;
   const s = ensureSession(state, meta.sid, meta);
+  if (inProject(s.meta)) revealSoon(s.sid);   // 所在项目自动展开
   activate(s.sid);
+  revealRow(s.sid);
 }
 
 // ====================== 侧栏 ======================
@@ -1289,7 +1510,19 @@ function bindSidebar() {
   });
   ji.addEventListener('input', () => { hint.className = 'field-hint'; hint.textContent = '按回车保存'; });
   $('jobs-btn').addEventListener('click', () => jobsPopover(api, $('jobs-btn'), (j) => { ji.value = j; saveJob(); }));
-  $('new-session-btn').addEventListener('click', () => openNewSession({}));
+  $('new-session-btn').addEventListener('click', () => openNewSession({ heading: '新建聊天' }));   // 不放进项目（SPEC §15.2）
+  // 侧栏：↑/↓ 在看得见的会话行与项目标题之间移动焦点（折叠的项目里的会话自然跳过）；Alt+↑/↓ 仍是调整顺序
+  const sl = $('session-list');
+  sl.addEventListener('keydown', (e) => {
+    if ((e.key !== 'ArrowUp' && e.key !== 'ArrowDown') || e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
+    const cur = e.target.closest && e.target.closest('[data-nav]');
+    if (!cur) return;
+    const all = [...sl.querySelectorAll('[data-nav]')].filter((el) => el.offsetParent !== null);
+    const nx = all[all.indexOf(cur) + (e.key === 'ArrowUp' ? -1 : 1)];
+    if (nx) { e.preventDefault(); nx.focus(); }
+  });
+  // 拖出侧栏：去掉插入线 / 不能放的提示（dragend 也会清）
+  sl.addEventListener('dragleave', (e) => { if (!e.relatedTarget || !sl.contains(e.relatedTarget)) clearDropMarks(); });
   $('settings-btn').addEventListener('click', () => settingsDialog(api, { config, onSaved: (c) => { config = { ...config, ...c }; applyConfigUI(); } }));
 
   for (const tab of document.querySelectorAll('.tab')) {
@@ -1404,7 +1637,11 @@ async function showPreview(it) {
 async function continueHistory(it) {
   const running = sortedSessions().find((s) => s.meta.claude_session_id === it.claude_session_id && !isDead(s.meta));
   if (running) {
-    if (await confirmDialog('会话已在运行', `该 claude 会话已在本地会话“${sessionTitle(running)}”中运行（同一会话只能有一个进程）。切换过去吗？`, { okText: '切换过去' })) activate(running.sid);
+    if (await confirmDialog('会话已在运行', `该 claude 会话已在本地会话“${sessionTitle(running)}”中运行（同一会话只能有一个进程）。切换过去吗？`, { okText: '切换过去' })) {
+      revealSoon(running.sid);
+      activate(running.sid);
+      revealRow(running.sid);
+    }
     return;
   }
   // 沿用该 claude 会话上次用的 API key（session_keys.json 的记录；没有记录才默认"服务器默认"/本机默认）
@@ -1424,52 +1661,77 @@ function closeSidebarOnNarrow() { document.body.classList.remove('side-open'); }
 
 // ====================== 输入框 ======================
 
-// 交互式 claude 的常用命令（静态列表；发送后由 claude 自己处理，/model、/effort 会弹出同一套选择界面）
-const SLASH_COMMANDS = ['model', 'effort', 'clear', 'compact', 'context', 'cost', 'status', 'help', 'init', 'memory', 'review', 'resume', 'exit'];
-
 let composing = false;
 let compositionEndAt = 0;
 let sendWaitImg = false;   // 发送正在等图片操作结束
-let slashIndex = 0;
-let slashMatches = [];
-let restoredDrafts = null;
+
+// / 命令与 @ 文件补全（complete.js）：内置命令按会话的 CLI 版本（slashcmds.js），自定义命令 / skills / 插件命令与 cwd 下的
+// 文件由后端只读列出（GET …/complete/commands|files），按会话 + cwd 缓存；弹层挂在 #slash-pop
+const completeCache = new CompleteCache((sess, kind) => api.get(api.sessionPath(sess.sid, '/complete/' + kind)),
+  { onChange: () => { if (completer) completer.refresh(); } });
+let completer = null;
+function completeSession() {
+  const s = liveSession();
+  if (!s) return null;
+  return { sid: s.sid, cwd: (s.meta && s.meta.cwd) || '', version: s.cliVersion || '', local: isLocalMeta(s.meta) };
+}
+function updateSlash() { if (completer) completer.update(); }
+function closeSlash() { if (completer) completer.close(); }
 
 function currentDraft() {
   const s = activeSession();
   if (!s || active.type !== 'session') return null;
   let d = drafts.get(s.sid);
   if (!d) {
-    if (!restoredDrafts) {
-      try { restoredDrafts = JSON.parse(sessionStorage.getItem('ccr.drafts') || '{}') || {}; } catch (_) { restoredDrafts = {}; }
-      sessionStorage.removeItem('ccr.drafts');
-    }
-    d = { text: String(restoredDrafts[s.sid] || '') };
+    const st = draftStore.load(s.sid);   // localStorage（退出 app / 重启后端 / ⌘R 后恢复）
+    d = { sid: s.sid, text: st ? st.t : '', at: st ? st.at : 0 };
     drafts.set(s.sid, d);
   }
   return d;
 }
 
+/** 输入框内容 → 当前会话的草稿（内容变了才记，400ms 后写进 localStorage） */
 function saveDraft() {
   const d = currentDraft();
-  if (d) d.text = $('input').value;
+  if (d && d.text !== $('input').value) noteDraft(d, $('input').value);
+}
+function noteDraft(d, text) {
+  d.text = text;
+  d.at = Date.now();
+  draftStore.queue(d.sid, text, d.at);
 }
 
-/** 离开页面前（⌘R、原生窗口在后端重启后重新载入等）把各会话的草稿存进 sessionStorage，载入后由 currentDraft() 恢复 */
+/** 离开页面 / 隐藏（⌘R、退出 app、原生窗口在后端重启后重新载入）：没写出去的草稿立即写进 localStorage */
 function persistDrafts() {
-  try {
-    saveDraft();
-    const out = {};
-    if (restoredDrafts) for (const [k, v] of Object.entries(restoredDrafts)) if (v) out[k] = String(v);
-    for (const [sid, d] of drafts) {
-      if (d && d.text) out[sid] = d.text;
-      else delete out[sid];
-    }
-    if (Object.keys(out).length) sessionStorage.setItem('ccr.drafts', JSON.stringify(out));
-    else sessionStorage.removeItem('ccr.drafts');
-  } catch (_) { /* sessionStorage 不可用时放弃 */ }
+  try { saveDraft(); } catch (_) { /* 忽略 */ }
+  draftStore.flush();
 }
 window.addEventListener('pagehide', persistDrafts);
 window.addEventListener('beforeunload', persistDrafts);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') persistDrafts(); });
+
+/** 别的窗口（同一会话）写了更新的草稿：本窗口没有没写出去的输入、也不在打字时才换上（以最后输入为准，不丢字） */
+function adoptDraft(sid, entry) {
+  const d = drafts.get(sid);
+  if (!d) return;   // 本窗口还没打开过它：下次打开时从 localStorage 读
+  const text = entry ? entry.t : '';
+  const at = entry ? entry.at : Date.now();
+  if (draftStore.isPending(sid) || d.text === text || at < d.at) return;
+  const ta = $('input');
+  const isCur = active && active.type === 'session' && active.sid === sid;
+  if (isCur && (composing || (document.activeElement === ta && performance.now() - lastInputAt < 1500))) return;
+  d.text = text;
+  d.at = at;
+  if (d.nav) d.nav.reset();
+  if (isCur) {
+    const pos = Math.min(ta.selectionStart, text.length);
+    ta.value = text;
+    if (document.activeElement === ta) ta.setSelectionRange(pos, pos);
+    autosize();
+    closeSlash();
+  }
+}
+draftStore.onExternal(adoptDraft);
 
 function loadDraft() {
   const d = currentDraft();
@@ -1496,9 +1758,18 @@ function bindComposer() {
   const ta = $('input');
   ta.addEventListener('compositionstart', () => { composing = true; });
   ta.addEventListener('compositionend', () => { composing = false; compositionEndAt = performance.now(); });
-  ta.addEventListener('input', () => { autosize(); updateSlash(); });
+  completer = new Completer({ ta, pop: $('slash-pop'), cache: completeCache, session: completeSession,
+    composing: () => composing, onApply: () => { saveDraft(); autosize(); } });
+  ta.addEventListener('input', () => { lastInputAt = performance.now(); autosize(); saveDraft(); updateSlash(); });
   ta.addEventListener('keydown', onComposerKey);
-  ta.addEventListener('blur', () => setTimeout(closeSlash, 150));
+  ta.addEventListener('compositionend', () => setTimeout(updateSlash, 0));
+  ta.addEventListener('click', updateSlash);   // 光标移到别的词上
+  ta.addEventListener('keyup', (e) => { if (/^(ArrowLeft|ArrowRight|Home|End)$/.test(e.key)) updateSlash(); });
+  ta.addEventListener('blur', () => {
+    setTimeout(closeSlash, 150);
+    const d = currentDraft();   // 离开输入框：别的窗口刚才写了更新的草稿就换上
+    if (d) adoptDraft(d.sid, draftStore.load(d.sid));
+  });
   ta.addEventListener('paste', onComposerPaste);   // ⌘V 里有图片 → claude 自己的 Ctrl+V（只拦图片，文字照常粘贴）
   bindImageDrop();
   $('send-btn').addEventListener('click', send);
@@ -1524,13 +1795,7 @@ function isImeEnter(e) {
 }
 
 function onComposerKey(e) {
-  const pop = $('slash-pop');
-  if (!pop.hidden && slashMatches.length) {
-    if (e.key === 'ArrowDown') { e.preventDefault(); slashIndex = (slashIndex + 1) % slashMatches.length; renderSlash(); return; }
-    if (e.key === 'ArrowUp') { e.preventDefault(); slashIndex = (slashIndex - 1 + slashMatches.length) % slashMatches.length; renderSlash(); return; }
-    if ((e.key === 'Tab' || e.key === 'Enter') && !e.shiftKey && !isImeEnter(e)) { e.preventDefault(); pickSlash(slashMatches[slashIndex]); return; }
-    if (e.key === 'Escape') { e.preventDefault(); closeSlash(); return; }
-  }
+  if (completer && completer.isOpen && !isImeEnter(e) && completer.onKey(e)) return;   // 补全列表打开时 ↑/↓/Tab/Enter/Esc 归它
   const dir = historyDir(e, composing);
   if (dir && recallPrompt(dir)) { e.preventDefault(); return; }
   if (e.key === 'Enter' && !e.shiftKey && !e.altKey) {
@@ -1557,46 +1822,13 @@ function recallPrompt(dir) {
   if (!d.nav) d.nav = new PromptNav();
   const text = recallInto(ta, dir, sizer, d.nav, () => promptList(s));
   if (text == null) return false;
-  d.text = text;
+  noteDraft(d, text);
   autosize();
   closeSlash();
   ta.scrollTop = dir < 0 ? 0 : ta.scrollHeight;   // 内容超过最大高度时让光标所在的一端可见
   return true;
 }
 
-function updateSlash() {
-  const ta = $('input');
-  const v = ta.value.slice(0, ta.selectionStart);
-  const m = v.match(/^\/([^\s/]*)$/);
-  if (!liveSession() || !m) { closeSlash(); return; }
-  const q = m[1].toLowerCase();
-  slashMatches = SLASH_COMMANDS.filter((c) => c.startsWith(q)).concat(SLASH_COMMANDS.filter((c) => !c.startsWith(q) && c.includes(q)));
-  if (!slashMatches.length || (slashMatches.length === 1 && slashMatches[0] === q)) { closeSlash(); return; }
-  slashIndex = Math.min(slashIndex, slashMatches.length - 1);
-  renderSlash();
-}
-
-function renderSlash() {
-  const pop = $('slash-pop');
-  pop.hidden = false;
-  pop.replaceChildren(...slashMatches.map((c, k) => {
-    const b = h('button', { class: 'slash-item' + (k === slashIndex ? ' active' : ''), type: 'button', role: 'option' }, '/' + c);
-    b.addEventListener('mousedown', (e) => { e.preventDefault(); pickSlash(c); });
-    return b;
-  }));
-}
-
-function pickSlash(c) {
-  const ta = $('input');
-  const rest = ta.value.slice(ta.selectionStart).replace(/^\S*/, '');
-  ta.value = '/' + c + (rest.trim() ? ' ' + rest.replace(/^\s+/, '') : '');
-  const pos = c.length + 1;
-  ta.setSelectionRange(pos, pos);
-  closeSlash();
-  autosize();
-}
-
-function closeSlash() { $('slash-pop').hidden = true; slashMatches = []; slashIndex = 0; }
 
 // ====================== 图片（SPEC §4.2「图片」）：claude 输入框里的 [Image #N] ======================
 
@@ -1784,7 +2016,7 @@ function onNativeDrop(paths) {
       const r = insertPaths(ta.value, ta.selectionStart, ta.selectionEnd, sp2.others);
       ta.value = r.value;
       const d = currentDraft();
-      if (d) { d.text = r.value; if (d.nav) d.nav.reset(); }
+      if (d) { noteDraft(d, r.value); if (d.nav) d.nav.reset(); }
       ta.focus();
       ta.setSelectionRange(r.caret, r.caret);
       autosize();
@@ -1819,13 +2051,21 @@ async function send() {
     try { await op.promise; await refreshScreen(s); } catch (e) { /* 失败已提示 */ } finally { sendWaitImg = false; }
     if (liveSession() !== s) return;
   }
-  const text = ta.value;
+  const typed = ta.value;
+  // 引用条：拼成 Markdown 引用放在文字前面（/ 或 ! 开头的命令消息不带，引用保留）；
+  // 正文以 @引用 结尾时补一个空格，免得终端里 claude 的 @ 补全列表吃掉回车（引用在前面，不影响结尾）
+  const qs = quotes.list(s.sid);
+  const comp = composeMessage(qs, atSafeTail(typed), s.absCwd || s.meta.cwd || '');
+  const text = comp.text;
   const imgs = inputImages(screenState(s));
   if (!text.trim() && !imgs.length) return;
   if (isDead(s.meta)) { toast('会话已退出，请先点击“重连”', 'warn'); return; }
   if (currentDialog(s)) { toast('请先处理上方对话框', 'warn'); return; }
+  if (comp.used) quotes.clear(s.sid);
+  else if (qs.length && isCommandText(typed)) toast('命令消息不带引用（引用保留到下一条消息）', 'info');
   ta.value = '';
-  d.text = '';
+  noteDraft(d, '');
+  draftStore.write(d.sid);   // 发出去了：本机保存的草稿立即删掉
   if (d.nav) d.nav.reset();
   autosize();
   closeSlash();
@@ -1843,7 +2083,8 @@ async function send() {
     const k = cur && mine ? cur.indexOf(mine) : -1;
     if (k >= 0) cur.splice(k, 1);
     toast('发送失败：' + e.message, 'error');
-    if (!ta.value) { ta.value = text; d.text = text; autosize(); }
+    if (comp.used && !quotes.list(s.sid).length) quotes.set(s.sid, qs);   // 引用放回引用条
+    if (!ta.value) { ta.value = typed; noteDraft(d, typed); autosize(); }
   }
 }
 

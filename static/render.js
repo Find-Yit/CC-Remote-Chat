@@ -18,6 +18,7 @@ import { collectTurn, renderTurnSummary } from './turnfiles.js';
 import { groupSummary, noteToolAdded } from './toolgroups.js';
 import { exitNoticeText } from './exitnotice.js';
 import { hasAnsi, stripAnsi, ansiPre, isContextCommand, parseContextOutput, contextCard } from './ctxcard.js';
+import { userBody } from './quote.js';   // 用户消息开头的引用（> …）显示成内嵌卡片
 
 const INITIAL_WINDOW = 300;   // 首次挂载时最多渲染的条目数
 const MORE_STEP = 200;
@@ -500,6 +501,7 @@ export function applyTranscript(s, entries, reset, sessionId) {
     }
     const ts = e.timestamp ? Date.parse(e.timestamp) / 1000 : null;
     if (typeof e.cwd === 'string' && e.cwd.startsWith('/') && !s.sidechain) s.absCwd = e.cwd;   // 相对路径按它解析
+    if (typeof e.version === 'string' && /^\d+\.\d+\.\d+/.test(e.version) && !s.sidechain) s.cliVersion = e.version;   // / 补全的内置命令表按它选
     try {
       if (e.type === 'assistant') { onAssistant(s, e, ts); assistantSeen = true; }
       else if (e.type === 'user') { if (onUser(s, e, ts)) assistantSeen = true; }
@@ -1298,7 +1300,7 @@ function renderUser(s, item, el, cls) {
     const imgs = item.imageBlocks.map((b, k) => chatImage(s, b, { alt: '图片', name: '粘贴的图片 ' + (k + 1) }));
     bubble.appendChild(h('div', { class: 'user-imgs' }, imgs));
   }
-  if (item.text) bubble.appendChild(h('div', { class: 'user-text' }, item.text));
+  if (item.text) bubble.appendChild(userBody(item.text));   // 没有开头引用时 = 原来的 .user-text
   if (item.truncated) bubble.appendChild(h('div', { class: 'tool-desc' }, '（内容过长，已截断）'));
   el.replaceChildren(bubble);
   const meta = msgMeta(item.text, item.ts, 'mm-user', false);   // 气泡左侧、底对齐

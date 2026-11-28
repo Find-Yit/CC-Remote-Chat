@@ -22,6 +22,9 @@ import { PromptMinimap, topPercent, MM_TARGET_OFFSET, minimapEntries } from '/st
 import { ChangesButton, trackerOf, NOTE_TEXT, EAGER_LINES } from '/static/changes.js';
 import { OpBanner, OpGuard, opModel, jobPromptModel, fmtSecs, busyLabel } from '/static/opprogress.js';
 import { SubagentUI } from '/static/subagents.js';
+import { AgentStopper, stopBlockReason } from '/static/agentstop.js';   // 第 14j 节
+import { amendIndexes, amendError, cleanAmend, rejectNote } from '/static/amend.js';   // 第 14j 节
+import { confirmDialog as fxConfirm } from '/static/dialogs.js';   // 第 14j 节
 import { apiKeySelect, baseInfo, baseEmptyHint, setDefaultBaseUrl, loadApiKeys } from '/static/apikeys.js';
 import { modal as fxModal, topDialog } from '/static/dialogs.js';
 import { settingsDialog } from '/static/settings.js';
@@ -611,6 +614,8 @@ async function autoTest() {
   await composerChecks();
   log('== 14l. 时间线工具（finder.js 会话内查找 · toolview.js 工具调用显示档位 · quote.js 引用回复 · mdtable.js 表格复制 · chatwidth.js 聊天宽度）');
   await timelineChecks();
+  log('== 14m. 审批时附带说明（权限卡片「附说明…」= 终端的 Tab to amend）与停止子代理（托盘「停止」/「全部停止」）：CLI 2.1.332 真机画面');
+  await tuiactChecks();
 
   log('== 15. 红线 / 控制台');
   check(calls.every((c) => c.gesture), '所有请求都发生在用户点击中（共 ' + calls.length + ' 个）');
@@ -3031,6 +3036,258 @@ async function opChecks() {
   meta = { ...meta, op: null }; render();
   el.remove(); btn.remove();
   check(calls.slice(n0).every((c) => c.gesture) && calls.length - n0 === 2, '进度相关请求都来自点击（共 ' + (calls.length - n0) + ' 个：续接 + 重试，没有其它）');
+}
+// ---------- 审批时附带说明 / 停止子代理（第 14j 节）：画面 = CLI 2.1.332 真机（fixtures/tui_screens_tuiact.ndjson，
+// state = 后端 ccr/tui_parse.py 的解析结果，tests/test_tuiact.py 保证与解析器一致）；请求都是模拟的、只记录 ----------
+let taFrames = null;
+async function taLoad() {
+  if (taFrames) return taFrames;
+  const m = new Map();
+  const text = await fetchText('/fixtures/tui_screens_tuiact.ndjson');
+  for (const l of text.split('\n')) { if (l.trim()) { const d = JSON.parse(l); m.set(d.name, d); } }
+  taFrames = m;
+  return m;
+}
+function taShow(name, mut) {
+  const d = taFrames.get(name);
+  const st = JSON.parse(JSON.stringify(d.state));
+  if (mut) mut(st);
+  curScene = 'tuiact:' + name;
+  applyEnvelope(state, env('screen', { type: 'screen', state: st, text: d.plain + (mut ? '\n ' : '') }));
+}
+/** 计算后的颜色 → {r,g,b,a}（用 1×1 canvas 实际画出来读像素：color-mix() 的计算值是 color(srgb …)，不能按数字解析） */
+let taCanvas = null;
+function taRgba(c) {
+  if (!taCanvas) taCanvas = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+  taCanvas.clearRect(0, 0, 1, 1);
+  taCanvas.fillStyle = '#000';
+  taCanvas.fillStyle = c;
+  taCanvas.fillRect(0, 0, 1, 1);
+  const d = taCanvas.getImageData(0, 0, 1, 1).data;
+  return { r: d[0], g: d[1], b: d[2], a: d[3] / 255 };
+}
+function taFg(el) { return taRgba(getComputedStyle(el).color); }
+/** 元素实际看到的底色：自己往上第一个不透明的背景（半透明的逐层叠上去） */
+function taBg(el) {
+  const layers = [];
+  for (let e = el; e; e = e.parentElement) {
+    const c = taRgba(getComputedStyle(e).backgroundColor);
+    if (c.a > 0) { layers.push(c); if (c.a >= 1) break; }
+  }
+  let base = { r: 255, g: 255, b: 255, a: 1 };
+  if (!layers.length || layers[layers.length - 1].a < 1) base = taRgba(getComputedStyle(document.body).backgroundColor);
+  for (let i = layers.length - 1; i >= 0; i--) base = over(layers[i], base);
+  return base;
+}
+function taSummary(aid, desc, t0) {
+  return { type: 'subagent', agent_id: aid, gen: 1, from: 0, total: 0, entries: [], reset: false, summary: {
+    agent_id: aid, tool_use_id: 'toolu_' + aid, description: desc, agent_type: 'general-purpose', model: 'haiku', background: true,
+    status: 'running', started_at: t0, last_activity: t0, tool_uses: 1, last_action: 'Bash: sleep 20 && echo 1', entries: 0,
+    notifications: 0, has_transcript: true } };
+}
+async function tuiactChecks() {
+  try { await taLoad(); } catch (e) { check(false, '载入 tui_screens_tuiact.ndjson：' + e.message); return; }
+  const n0 = calls.length;
+  let fetches = 0;
+  const origFetch = window.fetch;
+  window.fetch = (...a) => { fetches++; return origFetch(...a); };
+  const prevAmend = actions.amend;
+  const amendCalls = [];
+  actions.amend = async (_s, index, text, expect) => { record('amend', { index, text }); amendCalls.push({ index, text, expect }); };
+  const th = window.ccrTheme;
+  const prevPref = th ? th.pref() : 'system';
+  let saUi = null;
+  try {
+    // ---- A. 权限卡片的「附说明…」
+    taShow('amend_perm_ready'); await raf();
+    const card = () => s.view.dialog.querySelector('.dlg-card');
+    const amBtns = () => [...card().querySelectorAll('.dlg-amend-btn')];
+    check(amBtns().map((b) => b.dataset.amendIndex).join() === '0,3' && amBtns().every((b) => b.closest('.dlg-opt-row').querySelector('.dlg-opt')),
+      'Bash 权限框（真机）：「附说明…」只在「1. Yes」「4. No」旁边（' + amBtns().map((b) => b.dataset.amendIndex).join() + '）');
+    check(card().querySelector('.dlg-amend').hidden && card().querySelectorAll('.dlg-opt').length === 4, '没点之前说明输入框收起，4 个选项按钮照旧');
+    await click(amBtns()[0], '附说明（Yes）');
+    let box = card().querySelector('.dlg-amend');
+    let inp = box.querySelector('.dlg-amend-input');
+    let go = box.querySelector('.dlg-amend-go');
+    check(!box.hidden && document.activeElement === inp && /随「1\. Yes」附带说明/.test(box.textContent) && /批准并附说明/.test(go.textContent)
+      && go.classList.contains('primary') && /照常执行/.test(box.textContent), '点 Yes 旁的「附说明…」：展开输入框并聚焦、按钮「批准并附说明」、说明这样做的效果');
+    check(calls.length === n0, '展开输入框不发任何请求');
+    await click(go, '空说明提交');
+    check(calls.length === n0 && /请先写说明/.test(box.textContent), '空说明不提交，提示「请先写说明」');
+    inp.value = '  先确认目录再执行  ';
+    inp.dispatchEvent(new Event('input'));
+    // 终端里光标移到第 2 项（提示行变成 "Esc to cancel"）→ 卡片重建：输入框与文字保留
+    taShow('amend_perm_ready', (st) => { st.dialog.options.forEach((o, i) => { o.selected = i === 1; }); st.dialog.hints = 'Esc to cancel'; });
+    await raf();
+    box = card().querySelector('.dlg-amend');
+    inp = box.querySelector('.dlg-amend-input');
+    check(!box.hidden && inp.value === '  先确认目录再执行  ' && /随「1\. Yes」/.test(box.textContent), '卡片重建（终端光标移动）后说明输入框与文字保留');
+    await click(box.querySelector('.dlg-amend-go'), '批准并附说明');
+    let last = amendCalls[amendCalls.length - 1];
+    check(!!last && last.index === 0 && last.text === '先确认目录再执行' && !!last.expect && last.expect.kind === 'permission'
+      && last.expect.labels.join('|').startsWith('Yes|Yes, and always allow') && last.expect.labels[3] === 'No' && last.expect.preview[0] === 'touch tuiact-x',
+    'amend(index=0, 说明去掉首尾空白, 卡片的对话框指纹)');
+    // No：Enter 提交、Esc 只收起我们的输入框
+    taShow('amend_perm_ready'); await raf();
+    await click(amBtns()[1], '附说明（No）');
+    box = card().querySelector('.dlg-amend');
+    inp = box.querySelector('.dlg-amend-input');
+    go = box.querySelector('.dlg-amend-go');
+    check(!box.hidden && /随「4\. No」附带说明/.test(box.textContent) && /拒绝并附说明/.test(go.textContent) && go.classList.contains('danger')
+      && /不执行/.test(box.textContent) && /本轮不中断/.test(box.textContent), '点 No 旁的「附说明…」：「拒绝并附说明」（危险色）、说明不执行但本轮不中断');
+    const nA = calls.length;
+    const esc = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+    inp.dispatchEvent(esc);
+    check(box.hidden && calls.length === nA && esc.defaultPrevented, '输入框里按 Esc：只收起输入框，不发请求（不会在终端里按 Esc 拒绝）');
+    await click(amBtns()[1], '附说明（No）再打开');
+    inp = card().querySelector('.dlg-amend-input');
+    inp.value = '别动 /tmp，改在项目目录里建';
+    inp.dispatchEvent(new Event('input'));
+    gesture++;
+    try { inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); await sleep(30); } finally { gesture--; }
+    last = amendCalls[amendCalls.length - 1];
+    check(!!last && last.index === 3 && last.text === '别动 /tmp，改在项目目录里建', '输入框里按 Enter = 提交（index=3）');
+    // 其它画面
+    taShow('amend_yes_typed'); await raf();
+    const note = card().querySelector('.dlg-amend-note');
+    check(!amBtns().length && !!note && /终端里正在给「Yes」写说明：请在回复开头先写「收到说明A」/.test(note.textContent) && /Esc 会拒绝/.test(note.textContent),
+      '终端里已经在输入说明（真机 "Yes, <说明>"）：不提供「附说明…」，卡片提示正在输入的内容与 Tab / Esc 的含义');
+    taShow('amend_no_empty'); await raf();
+    check(!amBtns().length && /终端里正在给「No」写说明（还没输入）/.test(card().textContent), '只有占位文字时提示「还没输入」（不把占位文字当成说明）');
+    taShow('amend_moved_away'); await raf();
+    check(amBtns().map((b) => b.dataset.amendIndex).join() === '3', '第一项留着说明（"1. Yes, BBB"）：只有 No 旁边有「附说明…」');
+    taShow('amend_write_ready'); await raf();
+    check(amBtns().map((b) => b.dataset.amendIndex).join() === '0,2', 'Write 权限框（真机）：Yes / No 旁边有「附说明…」（' + amBtns().map((b) => b.dataset.amendIndex).join() + '）');
+    if (screens.has('stream:ask')) { show('stream:ask'); await raf(); check(!s.view.dialog.querySelector('.dlg-amend-btn'), '提问对话框没有「附说明…」'); }
+    else check(amendIndexes({ kind: 'question', options: [{ index: 0, label: 'Yes' }, { index: 1, label: 'No' }] }).length === 0, '提问对话框没有「附说明…」');
+    check(amendIndexes({ kind: 'permission', options: [{ index: 0, label: 'Yes' }, { index: 1, label: 'No' }] }).join() === '0,1'
+      && amendIndexes({ kind: 'permission', amend: { index: 0 }, options: [{ index: 0, label: 'Yes' }] }).length === 0
+      && cleanAmend(' a\n b\t c ') === 'a b c' && amendError('x'.repeat(2001)) && amendError('and tell Claude what to do next') && !amendError('好'),
+    '纯函数：amendIndexes / cleanAmend（换行变空格）/ amendError');
+    // 浅色 / 深色对比度
+    taShow('amend_perm_ready'); await raf();
+    await click(amBtns()[0], '附说明（对比度）');
+    for (const theme of ['light', 'dark']) {
+      if (th) th.set(theme, { persist: false });
+      await raf();
+      const b = card().querySelector('.dlg-amend');
+      const bg = taBg(b);
+      const head = contrast(taFg(b.querySelector('.dlg-amend-head')), bg);
+      const how = contrast(taFg(b.querySelector('.dlg-amend-how')), bg);
+      const ab = card().querySelector('.dlg-amend-btn');
+      const abc = contrast(taFg(ab), taBg(ab));
+      check(head >= 4.5 && how >= 4.5 && abc >= 4.5, (theme === 'light' ? '浅色' : '深色') + '：说明输入区 / 「附说明…」对比度 ≥ 4.5（标题 ' + head.toFixed(2) + '，说明 ' + how.toFixed(2) + '，按钮 ' + abc.toFixed(2) + '）');
+    }
+    if (th) th.set(prevPref, { persist: false });
+    // ---- B. transcript 里的说明（只读，真机 transcript）
+    pushTranscript(taFrames.get('amend_transcript').entries, true);
+    await raf(); flushNow(s);
+    const yes = qa('.k-user').find((el) => el.querySelector('.amend-tag.yes'));
+    const no = qa('.k-user').find((el) => el.querySelector('.amend-tag.no'));
+    check(!!yes && /批准时附带的说明/.test(yes.textContent) && /执行完后在回复开头写「收到说明C」/.test(yes.textContent) && yes.classList.contains('mid-turn'),
+      'Yes + 说明（工具结果后面的文字块）：用户气泡「批准时附带的说明」，属于当前这一轮');
+    check(!!no && /拒绝时附带的说明/.test(no.textContent) && /先不要执行，直接回复「收到说明B」/.test(no.textContent) && !/doesn't want to proceed/.test(no.textContent),
+      'No + 说明（拒绝文字里的 "the user said:"）：用户气泡「拒绝时附带的说明」，只显示说明本身');
+    check(qa('.k-tool.st-denied').length >= 2 && rejectNote('x. To tell you how to proceed, the user said:\n改一下') === '改一下' && rejectNote('普通错误') === '',
+      '被拒绝的工具卡照旧（' + qa('.k-tool.st-denied').length + ' 个）；rejectNote 纯函数');
+    for (const theme of ['light', 'dark']) {
+      if (th) th.set(theme, { persist: false });
+      await raf();
+      const c1 = contrast(taFg(yes.querySelector('.amend-tag')), taBg(yes.querySelector('.amend-tag')));
+      const c2 = contrast(taFg(no.querySelector('.amend-tag')), taBg(no.querySelector('.amend-tag')));
+      check(c1 >= 3 && c2 >= 3, (theme === 'light' ? '浅色' : '深色') + '：说明气泡标记对比度 ≥ 3（批准 ' + c1.toFixed(2) + '，拒绝 ' + c2.toFixed(2) + '）');
+    }
+    if (th) th.set(prevPref, { persist: false });
+    // ---- C. 子代理托盘的「停止」/「全部停止」
+    const toasts = [];
+    const saApi = {
+      sessionPath: (sid, tail) => '/api/sessions/' + encodeURIComponent(sid) + tail,
+      post: async (path, body) => { record('POST ' + path.replace(/^\/api\/sessions\/[^/]+/, ''), body); return { ok: true }; },
+      get: async () => { throw new Error('回放页不应请求子代理详情'); },
+    };
+    const stopper = new AgentStopper({ api: saApi, toast: (t) => { toasts.push(t); log('（toast）' + t); }, confirm: fxConfirm });
+    saUi = new SubagentUI({ api: saApi, toast: (t) => log('（toast）' + t), stopper });
+    clearInterval(saUi.ticker);
+    const inner = document.querySelector('.composer .composer-inner');
+    inner.insertBefore(saUi.tray, inner.firstChild);
+    const prevOn = state.onSubagent;
+    state.onSubagent = (ss, aid, added, reset) => { if (prevOn) prevOn(ss, aid, added, reset); saUi.onUpdate(ss, aid, added, reset); };
+    try {
+      s.subagents.clear();
+      pushMeta({ ...s.meta, state: 'idle', link: 'ready' });
+      taShow('agents2_running');
+      saUi.setSession(s);
+      const t0 = Date.now() / 1000 - 6;
+      applyEnvelope(state, env('subagent', taSummary('a1bbc7486d4e1cd7e', '甲数数', t0)));
+      applyEnvelope(state, env('subagent', taSummary('a7a55dbf56f084a98', '乙数数', t0 + 0.2)));
+      await raf();
+      const tray = saUi.tray;
+      const stops = () => [...tray.querySelectorAll('.sa-stop')];
+      check(!tray.hidden && tray.querySelectorAll('.sa-row').length === 2 && stops().length === 2 && !!tray.querySelector('.sa-stopall')
+        && /全部停止/.test(tray.querySelector('.sa-stopall').textContent) && !tray.querySelector('.sa-item[role]') && stopBlockReason(s) === '',
+      '托盘：每个运行中的子代理旁边「停止」，标题处「全部停止」（列表项语义在外层行上）');
+      const nB = calls.length;
+      const yi = () => stops().find((b) => /乙数数/.test(b.getAttribute('aria-label') || ''));
+      const jia = () => stops().find((b) => /甲数数/.test(b.getAttribute('aria-label') || ''));
+      await click(yi(), '停止（乙）');
+      check(yi().classList.contains('armed') && /确认停止/.test(yi().textContent) && calls.length === nB && !jia().classList.contains('armed'),
+        '第一次点「停止」：变成「确认停止」，不发请求（只有这一项）');
+      await click(yi(), '确认停止（乙）');
+      await sleep(30);
+      last = calls[calls.length - 1];
+      check(calls.length === nB + 1 && last.op === 'POST /agents/stop' && last.body.agent_id === 'a7a55dbf56f084a98' && last.gesture,
+        '再点「确认停止」：POST agents/stop {agent_id}（' + (last && last.op) + '）');
+      check(!tray.querySelector('.sa-stop.armed, .sa-stop.pending') && toasts.some((t) => /已停止子代理「乙数数」/.test(t)), '完成后按钮复原、提示「已停止子代理「乙数数」」');
+      await click(tray.querySelector('.sa-stopall'), '全部停止');
+      let dlg = topDialog();
+      check(!!dlg && /停止全部后台子代理/.test(dlg.textContent) && /2 个子代理/.test(dlg.textContent) && /Ctrl\+X Ctrl\+K/.test(dlg.textContent) && calls.length === nB + 1,
+        '「全部停止」先弹确认（说明会按两次 Ctrl+X Ctrl+K、无法恢复），还没发请求');
+      await click(dlg.querySelector('.modal-actions .btn.ghost'), '取消');
+      check(!topDialog() && calls.length === nB + 1, '取消：不发请求');
+      await click(tray.querySelector('.sa-stopall'), '全部停止');
+      dlg = topDialog();
+      await click(dlg && dlg.querySelector('.modal-actions .btn.danger'), '确认全部停止');
+      await sleep(30);
+      last = calls[calls.length - 1];
+      check(calls.length === nB + 2 && last.op === 'POST /agents/stop_all' && last.gesture && toasts.some((t) => /已停止全部后台子代理/.test(t)),
+        '确认后：POST agents/stop_all，提示「已停止全部后台子代理」');
+      // 不能停的时候：按钮禁用并说明原因
+      taShow('agents2_esc_back'); saUi.tick(); await raf();
+      check(stops().every((b) => b.disabled && /输入框里有文字/.test(b.title)) && tray.querySelector('.sa-stopall').disabled,
+        '终端输入框里有文字（真机画面 "❯ abc"）：「停止」「全部停止」禁用并说明原因');
+      await click(stops()[0], '禁用的停止');
+      check(calls.length === nB + 2, '禁用时点击不发请求');
+      taShow('amend_perm_ready'); saUi.tick(); await raf();
+      check(stops().every((b) => b.disabled && /对话框/.test(b.title)), '有对话框时禁用');
+      taShow('agents2_row1'); saUi.tick(); await raf();
+      check(stops().every((b) => !b.disabled), '焦点在终端子代理列表上（输入框为空）时可以停');
+      // 浅色 / 深色对比度
+      await click(stops()[0], '停止（对比度）');
+      for (const theme of ['light', 'dark']) {
+        if (th) th.set(theme, { persist: false });
+        await raf();
+        const armed = tray.querySelector('.sa-stop.armed');
+        const plain = stops()[1];
+        const ca = contrast(taFg(armed), taBg(armed));
+        const cp = contrast(taFg(plain), taBg(plain));
+        const cs = contrast(taFg(tray.querySelector('.sa-stopall')), taBg(tray.querySelector('.sa-stopall')));
+        check(ca >= 4.5 && cp >= 4.5 && cs >= 4.5, (theme === 'light' ? '浅色' : '深色') + '：「停止」/「确认停止」/「全部停止」对比度 ≥ 4.5（' + [cp, ca, cs].map((x) => x.toFixed(2)).join(' / ') + '）');
+      }
+      if (th) th.set(prevPref, { persist: false });
+      s.readOnly = true; saUi.setSession(s); await raf();
+      check(tray.hidden || !tray.querySelector('.sa-stop'), '只读会话（历史预览）没有「停止」');
+      s.readOnly = false;
+    } finally {
+      state.onSubagent = prevOn;
+    }
+    check(calls.slice(n0).every((c) => c.gesture) && fetches === 0, '本节所有请求都来自点击（共 ' + (calls.length - n0) + ' 个），没有任何网络请求');
+  } finally {
+    actions.amend = prevAmend;
+    window.fetch = origFetch;
+    if (th) th.set(prevPref, { persist: false });
+    if (saUi) { saUi.setSession(null); saUi.tray.remove(); clearInterval(saUi.ticker); }
+    s.subagents.clear();
+  }
 }
 function refreshTailFx() { refreshTail(s); }
 

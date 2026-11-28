@@ -753,6 +753,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     "srvfile/stat": lambda sd, b: self._preview_call(lambda: self.app.srvfiles.api_stat(sd, b)),
                     "background": lambda sd, _b: self.app.manager.run_in_background(sd),
                     "send_now": lambda sd, _b: self.app.manager.send_now(sd),
+                    # 审批时附带说明（权限框的 Tab to amend）、停止子代理（底部列表 x / Ctrl+X Ctrl+K 两次），§4.2
+                    "amend": self._act_amend,
+                    "agents/stop": lambda sd, b: self.app.manager.stop_subagent(sd, b.get("agent_id")),
+                    "agents/stop_all": lambda sd, _b: self.app.manager.stop_all_subagents(sd),
                     "seen": self._act_seen,
                     "project": self._act_project,   # 侧栏归属：移入 / 移出项目（只改显示，不碰 claude）
                     "unseen": lambda sd, _b: self.app.manager.mark_unseen(sd),
@@ -1110,6 +1114,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 raise ApiError(400, "expect 必须是对话框指纹对象")
             kwargs["expect"] = expect
         return self.app.manager.choose(sid, index, **kwargs)
+
+    def _act_amend(self, sid: str, body: dict):
+        index = _req_int(body, "index")
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError(400, "text 必须是非空字符串")
+        expect = body.get("expect")
+        if expect is not None and not isinstance(expect, dict):
+            raise ApiError(400, "expect 必须是对话框指纹对象")
+        return self.app.manager.amend_choose(sid, index, text, expect)
 
     def _act_cancel_dialog(self, sid: str, body: dict):
         return self.app.manager.cancel_dialog(sid)

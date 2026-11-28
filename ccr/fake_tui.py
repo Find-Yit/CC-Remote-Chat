@@ -27,6 +27,14 @@ fixtures/tui_screens_*.ndjson（真实 Claude Code v2.1.330 的画面）。
          纯文本通知 'Background agent "…" was stopped by the user.'（没有 <task-notification>）
   /agentstop 派一个后台子代理，跑几步后主会话调用 TaskStop 停掉它（仿 CLI 2.1.332：子代理只多一条中断标记、
          meta 不变；killed 通知在回复中途被吸收，只写成 attachment/queued_command 条目，不写 user 条目）
+  /agents2 同时派两个后台子代理（"fake 子代理甲" / "fake 子代理乙"，本轮立即结束，子代理在后台各跑约 20 秒；
+         列表行跑了 4 秒后描述换成"进度摘要"，仿真机）。底部子代理列表可聚焦（仿 CLI 2.1.332）：输入框里 ↓ →
+         [有后台 shell 时先到任务胶囊] → 列表；↑/↓ 选择；x 停止选中的子代理（meta stoppedByUser、<status>killed</status>
+         通知，行变成 "stopped · Ns"，再按 x 清掉）；Esc 回到输入框（不中断回复）
+权限框的「附带说明」（仿 CLI 2.1.332）：第一项 Yes / 最后一项 No 上按 Tab → "Yes, <说明>"（空的时候是占位文字），再按 Tab
+收起（文字保留）、Ctrl+U 清空、离开该项时空说明丢弃；Enter：Yes + 说明 = 照常执行，transcript 的工具结果条目后面多一个
+文字块、屏幕回显 "❯ <说明>"；No + 说明 = 拒绝（工具结果里写 "To tell you how to proceed, the user said:\n<说明>"），本轮
+不中断、接着回复；Esc 仍是取消整个对话框。
 整条输入为以下命令时：/model 模型面板、/effort effort 面板、/clear 新会话、/exit 退出、
   /context 上下文用量（仿 CLI 2.1.331：屏幕上内联画方块网格 + 右列，transcript 写带 ANSI 的 <local-command-stdout>
   与 isMeta 的 Markdown 版；窗口默认 1,000,000，CCR_FAKE_CTX_WINDOW 可改）。
@@ -43,6 +51,7 @@ CCR_FAKE_STATUSLINE=0 不画状态栏（模拟用户没配 statusline，测试�
 CCR_FAKE_BOOT 出第一帧前的等待秒数（模拟启动慢，观察重启/续接进度）。
 """
 import base64
+import collections
 import datetime
 import difflib
 import getpass
@@ -126,6 +135,19 @@ QUEUED_PLACEHOLDER = "Press up to edit queued messages"
 CHORD_WINDOW = 1.5
 KILL_CONFIRM_WINDOW = 3.0    # 真机：Ctrl+X Ctrl+K 两次之间最多 3 秒
 KILL_HINT = "Press ctrl+x ctrl+k again to stop background agents"
+NO_BG_HINT = "No background agents running"
+# 底部子代理列表的焦点（仿 CLI 2.1.332 真机，fixtures/cli_2_1_332/agents*_*.txt）：输入框里按 ↓ → [有后台 shell 时先到任务胶囊
+# "· enter to view tasks"] → 列表（main 选中，"↑/↓ to select"）；↑/↓ 移动；x = 停止选中的子代理（再按 = 从列表里清掉）；
+# Esc = 回到输入框（不中断回复）
+FOCUS_MAIN_HINT = "↑/↓ to select"
+FOCUS_STOP_HINT = "enter to view · x to stop · ctrl+x ctrl+k to stop all agents"
+FOCUS_CLEAR_HINT = "enter to view · x to clear"
+AGENT_SUMMARY_AFTER = 4.0    # 子代理跑了这么多秒后，列表行的描述换成"进度摘要"（真机：AI 生成的摘要，不是 description）
+AGENTS2 = ("fake 子代理甲", "fake 子代理乙")
+AGENTS2_STEP = 2.5           # /agents2 的子代理每一步至少这么多秒（整个约 20 秒，够在界面上点「停止」）
+# 权限框的「附带说明」（仿 CLI 2.1.332 真机，fixtures/cli_2_1_332/amend_*.txt）：第一项 Yes / 最后一项 No 上按 Tab
+AMEND_PLACEHOLDER = {"Yes": "and tell Claude what to do next", "No": "and tell Claude what to do differently"}
+AMEND_SAID = "To tell you how to proceed, the user said:\n"
 # 图片（仿 CLI 2.1.332 真机实测，fixtures/image_paste/）：单独一次粘贴的文字整段是图片路径（或空格分隔、反斜杠转义的多个路径）
 # → 输入框里变成 "[Image #N]"（N 在整个进程里递增）；Ctrl+V = 读剪贴板图片（fake 绝不读真实剪贴板：生成一张示意 PNG；
 # CCR_FAKE_CLIPBOARD=none 时什么都不发生，模拟剪贴板里没有图片）。
@@ -246,7 +268,9 @@ class FakeSubagent(object):
         self.result = None
         self.last_uuid = None
         self.done = False
-        self.stopped = None   # 被停止："user"（Ctrl+X Ctrl+K）/ "claude"（TaskStop）
+        self.stopped = None   # 被停止："user"（Ctrl+X Ctrl+K / 列表里 x）/ "claude"（TaskStop）
+        self.stopped_at = None
+        self.summarize = False   # 列表行跑了一会儿后显示"进度摘要"而不是 description（/agents2，仿真机）
         self.dir = os.path.join(os.path.dirname(app.tpath), app.session_id, "subagents")
         self.jsonl = os.path.join(self.dir, "agent-%s.jsonl" % self.aid)
         self.metap = os.path.join(self.dir, "agent-%s.meta.json" % self.aid)
@@ -362,6 +386,7 @@ class FakeSubagent(object):
         if self.done or self.stopped:
             return
         self.stopped = by
+        self.stopped_at = time.time()
         if by == "user":
             self.meta["stoppedByUser"] = True
             self.write_meta()
@@ -370,7 +395,13 @@ class FakeSubagent(object):
                    {"promptId": str(uuid.uuid4()), "rowSource": "harness"})
 
     def elapsed(self):
-        return max(0, int(time.time() - self.started))
+        return max(0, int((self.stopped_at or time.time()) - self.started))
+
+    def row_text(self):
+        """底部列表行的文字：真机过几秒会换成 AI 生成的进度摘要（不是 description），这里仿一个。"""
+        if self.summarize and not self.stopped and self.elapsed() >= AGENT_SUMMARY_AFTER:
+            return "Working on step %d (fake progress summary)" % max(1, self.tool_uses)
+        return self.desc
 
 
 # ------------------------------------------------------------------ 主程序
@@ -521,6 +552,13 @@ class FakeClaude(object):
         self.cx_at = 0.0          # Ctrl+X 的时间（Ctrl+X Ctrl+S / Ctrl+X Ctrl+K 和弦）
         self.kill_at = 0.0        # 第一次 Ctrl+X Ctrl+K 的时间（再按一次才停止后台子代理）
         self.agents = {}  # 运行中的子代理 agent_id -> FakeSubagent（屏幕底部列表）
+        self.stopped_rows = collections.OrderedDict()   # 被停止、还留在列表里的子代理（x 再按一次清掉）
+        self.bg_subs = {}         # /agents2：不占用本轮、在后台自己跑的子代理 agent_id -> [脚本生成器, 下一步时间]
+        self.footer = None        # 焦点在底部：None（输入框）/ "tasks"（任务胶囊）/ "agents"（子代理列表）
+        self.footer_sel = 0       # 子代理列表里选中第几行（0 = main）
+        self.nobg_at = 0.0        # "No background agents running" 提示的时间
+        self.amend_note = None    # 权限框带说明回答时的说明文字（turn_tool / turn_write 读取）
+        self.last_tick = 0.0
         self.status = None
         self.ctx_tokens = 0
         self.cost = 0.0
@@ -732,9 +770,21 @@ class FakeClaude(object):
                          "cache_read_input_tokens": self.ctx_tokens, "output_tokens": max(1, self.turn_tokens)}}
         return self.write_entry("assistant", msg, {"effort": self.effort}, split=True)
 
-    def write_tool_result(self, tool_id, text, is_error):
+    def write_tool_result(self, tool_id, text, is_error, note=None):
+        """note：用户在权限框上「Yes + 附带说明」（真机 2.1.332：同一条 user 条目里工具结果后面多一个文字块）。"""
         c = [{"type": "tool_result", "content": text, "is_error": is_error, "tool_use_id": tool_id}]
-        return self.write_entry("user", {"role": "user", "content": c}, {"promptId": str(uuid.uuid4())})
+        extra = {"promptId": str(uuid.uuid4())}
+        if note:
+            c.append({"type": "text", "text": note})
+            extra["permissionDecision"] = {"decision": "accept", "source": "user_temporary", "grantScope": "once"}
+        return self.write_entry("user", {"role": "user", "content": c}, extra)
+
+    def write_amend_reject(self, tool_id, note):
+        """「No + 附带说明」（真机 2.1.332）：工具结果 is_error，正文是拒绝说明 + "To tell you how to proceed, the user said:"。"""
+        text = REJECT_TEXT.split(" STOP ")[0] + " " + AMEND_SAID + note
+        c = [{"type": "tool_result", "content": text, "is_error": True, "tool_use_id": tool_id}]
+        return self.write_entry("user", {"role": "user", "content": c},
+                                {"promptId": str(uuid.uuid4()), "toolUseResult": "Error: " + text})
 
     def write_local_command(self, name, stdout):
         e = self._base("system")
@@ -872,6 +922,8 @@ class FakeClaude(object):
                     sep = [" " * max(0, W - len(hint) - 2) + hint]
                 elif self.agents and time.time() - self.kill_at <= KILL_CONFIRM_WINDOW:
                     sep = [" " * max(0, W - len(KILL_HINT) - 2) + KILL_HINT]
+                elif time.time() - self.nobg_at <= KILL_CONFIRM_WINDOW:
+                    sep = [" " * max(0, W - len(NO_BG_HINT) - 2) + NO_BG_HINT]
                 else:
                     sep = [""]
                 inp = []
@@ -884,13 +936,23 @@ class FakeClaude(object):
                 mode = "  " + MODE_TEXT.get(self.mode, self.mode) + (" · %d shell" % shells if shells else "") + \
                     (" · esc to interrupt" if self.turn and not self.input else "")
                 agents = []
-                if self.agents or shells:
+                rows = self.agent_rows()
+                focus = self.footer if (self.footer == "tasks" and shells) or (self.footer == "agents" and rows) else None
+                sel = min(self.footer_sel, len(rows))
+                if focus == "agents":   # 列表的操作提示顶替模式行（真机 2.1.332）
+                    mode = "  " + (FOCUS_MAIN_HINT if sel == 0 else FOCUS_CLEAR_HINT if rows[sel - 1].stopped
+                                   else FOCUS_STOP_HINT)
+                elif focus == "tasks":  # 任务胶囊聚焦："⏵⏵ auto mode on · 2 shells · enter to view tasks"
+                    mode = "  " + MODE_TEXT.get(self.mode, self.mode).replace(" (shift+tab to cycle)", "") + \
+                        " · %d shell%s · enter to view tasks" % (shells, "" if shells == 1 else "s")
+                elif rows or shells:
                     mode += " · ↓ to manage"
-                if self.agents:
-                    agents.append("  ● main")
-                    for sub in list(self.agents.values()):
-                        left = "  ◯ %s  %s" % (sub.agent_type, sub.desc)
-                        right = "%ds" % sub.elapsed()
+                if rows:
+                    agents.append(("❯ " if focus == "agents" and sel == 0 else "  ") + "● main")
+                    for k, sub in enumerate(rows, 1):
+                        mark = "❯ " if focus == "agents" and sel == k else "  "
+                        left = mark + "◯ %s  %s" % (sub.agent_type, sub.row_text())
+                        right = ("stopped · " if sub.stopped else "") + "%ds" % sub.elapsed()
                         agents.append(left + " " * max(2, W - 2 - dwidth(left) - len(right)) + right)
                 bottom = sep + ["─" * W] + inp + ["─" * W] + self.status_lines(W) + [mode] + agents + [""]
             body = []
@@ -909,9 +971,16 @@ class FakeClaude(object):
             avail = max(0, H - len(bottom))
             body = body[-avail:] if len(body) > avail else body + [""] * (avail - len(body))
             lines = (body + bottom)[-H:]
-            if d is None and len(bottom) <= H:
+            if d is None and len(bottom) <= H and not focus:
                 r, c = self.caret_cell(W) if (self.input or not self.queue) else (0, 2)
                 self.caret_pos = (avail + len(sep) + 1 + r, min(c, W - 1))
+            elif d is not None and d.kind == "perm" and getattr(d, "amend_on", False):
+                head = " ❯ %d. " % (d.cursor + 1)
+                for r, line in enumerate(lines):
+                    if line.startswith(head):
+                        txt = d.amends.get(d.cursor) or ""
+                        self.caret_pos = (r, min(dwidth(head + self.amend_base(d) + ", " + txt), W - 1))
+                        break
         lines = (lines + [""] * H)[:H]
         return [clip(x, W) for x in lines]
 
@@ -944,9 +1013,40 @@ class FakeClaude(object):
             out += wrap('Tip: auto mode handles these prompts for you — choose "switch to auto mode" below',
                         W - 1, " ", " ")
         out += [" " + d.subtitle, "╌" * W] + d.preview + ["╌" * W, " " + d.question]
-        out += self.option_lines(W, d.options, d.cursor)
-        out += ["", " Esc to cancel · Tab to amend"]
+        labels = list(d.options)
+        amends = getattr(d, "amends", {})
+        for i in self.amendable(d):
+            base = labels[i]
+            if i == d.cursor and getattr(d, "amend_on", False):
+                labels[i] = base + ", " + (amends.get(i) or AMEND_PLACEHOLDER[base])
+            elif i != d.cursor and amends.get(i):
+                labels[i] = base + ", " + amends[i]
+        out += self.option_lines(W, labels, d.cursor)
+        tab = d.cursor in self.amendable(d) and not getattr(d, "amend_on", False)
+        out += ["", " Esc to cancel · Tab to amend" if tab else " Esc to cancel"]
         return out
+
+    # ---------------------------------------------------------- 权限框的「附带说明」（Tab to amend）
+    @staticmethod
+    def amendable(d):
+        """能附带说明的选项（真机 2.1.332：第一项 Yes 与最后一项 No）。"""
+        out = []
+        if d.options and d.options[0] == "Yes":
+            out.append(0)
+        if len(d.options) > 1 and d.options[-1] == "No":
+            out.append(len(d.options) - 1)
+        return out
+
+    @staticmethod
+    def amend_base(d):
+        return d.options[d.cursor]
+
+    def amend_move(self, d, cursor):
+        """离开一项：空说明丢弃、有文字的保留；回到有文字的项又处于输入状态（真机实测）。"""
+        if not d.amends.get(d.cursor):
+            d.amends.pop(d.cursor, None)
+        d.cursor = cursor
+        d.amend_on = bool(d.amends.get(cursor))
 
     def ask_lines(self, W):
         d = self.dialog
@@ -1050,6 +1150,7 @@ class FakeClaude(object):
         self.turn_send = None
         if isinstance(v, tuple) and v[0] == "dialog":
             self.dialog = v[1]
+            self.footer = None
             self.update_status()
         else:
             self.turn_due = time.time() + float(v or 0)
@@ -1386,6 +1487,113 @@ class FakeClaude(object):
             yield d
         self.finish(paras[0])
 
+    # ---------------------------------------------------------- 底部子代理列表（仿 CLI 2.1.332）
+    def agent_rows(self):
+        """列表里的子代理（main 之后），按启动顺序：运行中的 + 被停止还没清掉的。"""
+        rows = list(self.agents.values()) + [x for a, x in self.stopped_rows.items() if a not in self.agents]
+        return sorted(rows, key=lambda x: x.started)
+
+    def key_footer(self, k):
+        """焦点在底部时的按键；返回 True = 已处理。Esc 只是回到输入框（不中断回复）。"""
+        rows = self.agent_rows()
+        if (self.footer == "tasks" and not self.shells()) or (self.footer == "agents" and not rows):
+            self.footer = None
+            return False
+        if k == "Escape":
+            self.footer = None
+        elif k == "Down":
+            if self.footer == "tasks":
+                if rows:
+                    self.footer, self.footer_sel = "agents", 0
+            else:
+                self.footer_sel = min(len(rows), self.footer_sel + 1)
+        elif k == "Up":
+            if self.footer == "agents":
+                self.footer_sel = max(0, self.footer_sel - 1)
+        elif k in ("C-x", "C-k", "C-c"):
+            return False   # 列表的提示里也写着 ctrl+x ctrl+k to stop all agents
+        return True
+
+    def footer_x(self):
+        rows = self.agent_rows()
+        if self.footer != "agents" or not 1 <= self.footer_sel <= len(rows):
+            return
+        sub = rows[self.footer_sel - 1]
+        if sub.stopped:   # "x to clear"：从列表里清掉，选中回到 main
+            self.stopped_rows.pop(sub.aid, None)
+            self.footer_sel = 0
+            return
+        self.stop_one(sub)
+
+    def stop_one(self, sub):
+        """列表里按 x 停止一个子代理（仿 CLI 2.1.332：meta stoppedByUser、jsonl 中断标记、<status>killed</status> 通知）。"""
+        sub.stop("user")
+        self.agents.pop(sub.aid, None)
+        self.bg_subs.pop(sub.aid, None)
+        self.stopped_rows[sub.aid] = sub
+        self.write_task_notification(sub, "killed", verb="was stopped by user")
+        self.blank()
+        self.add("● ", "  ", 'Agent "%s" was stopped by user' % sub.desc)
+        self.dirty = True
+
+    def tick_background(self):
+        """/agents2 的后台子代理：不占用本轮，按各自的节奏往下跑；完成时写通知。"""
+        now = time.time()
+        for aid, item in list(self.bg_subs.items()):
+            gen, due = item
+            if now < due:
+                continue
+            sub = self.agents.get(aid)
+            if sub is None or sub.stopped:
+                self.bg_subs.pop(aid, None)
+                continue
+            try:
+                v = next(gen)
+            except StopIteration:
+                self.bg_subs.pop(aid, None)
+                sub.finish()
+                self.agents.pop(aid, None)
+                self.write_task_notification(sub, "completed")
+                self.blank()
+                self.add("● ", "  ", 'Agent "%s" finished · %ds' % (sub.desc, sub.elapsed()))
+                self.dirty = True
+                continue
+            item[1] = now + max(float(v or 0), AGENTS2_STEP)
+        if (self.agents or self.stopped_rows) and int(now) != int(self.last_tick):
+            self.dirty = True   # 列表行的走秒
+        self.last_tick = now
+
+    def launch_result(self, sub, tid, desc, prompt):
+        text = AGENT_LAUNCHED % (sub.aid, sub.aid, sub.output_file)
+        c = [{"tool_use_id": tid, "type": "tool_result", "content": [{"type": "text", "text": text}]}]
+        self.write_entry("user", {"role": "user", "content": c}, {
+            "promptId": str(uuid.uuid4()), "sourceToolAssistantUUID": self.last_uuid,
+            "toolUseResult": {"isAsync": True, "status": "async_launched", "agentId": sub.aid,
+                              "description": desc, "resolvedModel": self.model_id(), "prompt": prompt,
+                              "outputFile": sub.output_file, "canReadOutputFile": True, "canContinueAgent": True}})
+
+    def turn_agents2(self, msg):
+        """同时派两个后台子代理，本轮立即结束（真机："2 background agents launched (↓ to manage)"）。"""
+        yield self.think
+        for desc in AGENTS2:
+            prompt = "fake 子代理任务（%s）：列目录、读 README、搜 TODO，不会真的执行。" % desc
+            tid = self.tool_use("Agent", {"description": desc, "prompt": prompt, "subagent_type": "general-purpose",
+                                          "model": "haiku", "run_in_background": True})
+            sub = FakeSubagent(self, desc, prompt, tid)
+            sub.summarize = True
+            self.launch_result(sub, tid, desc, prompt)
+            self.agents[sub.aid] = sub
+            self.bg_subs[sub.aid] = [sub.script(), time.time() + AGENTS2_STEP]
+        self.blank()
+        self.add("● ", "  ", "2 background agents launched (↓ to manage)")
+        self.add("   ├ ", "     ", AGENTS2[0])
+        self.add("   └ ", "     ", AGENTS2[1])
+        yield self.delay
+        paras = ["已派出两个后台子代理（fake），我不等待它们，现在结束本轮。"]
+        for d in self.stream(paras):
+            yield d
+        self.finish(paras[0])
+
     def kill_agents(self):
         """Ctrl+X Ctrl+K 两次：停止全部后台子代理（仿 CLI 2.1.332，见 turn_agent / FakeSubagent.stop）。"""
         subs = [x for x in self.agents.values() if not x.done and not x.stopped]
@@ -1394,6 +1602,8 @@ class FakeClaude(object):
         for sub in subs:
             sub.stop("user")
             self.agents.pop(sub.aid, None)
+            self.bg_subs.pop(sub.aid, None)
+            self.stopped_rows[sub.aid] = sub   # 真机：行变成 "stopped · Ns" 留在列表里
         names = [x.desc for x in subs]
         text = ('Background agent "%s" was stopped by the user.' % names[0] if len(names) == 1 else
                 "%d background agents were stopped by the user: %s." % (len(names), ", ".join('"%s"' % n for n in names)))
@@ -1408,8 +1618,8 @@ class FakeClaude(object):
             "rowSource": "harness", "turnOrigin": "task_notification", "queueSkipAttachments": True})
         self.turn_due = 0.0
 
-    def write_task_notification(self, sub, status):
-        verb = "finished" if status == "completed" else "was stopped"
+    def write_task_notification(self, sub, status, verb=None):
+        verb = verb or ("finished" if status == "completed" else "was stopped")
         result = "<result>%s</result>\n" % sub.result if status == "completed" and sub.result else ""
         content = AGENT_NOTE % (sub.aid, sub.meta["toolUseId"], sub.output_file, status, sub.desc, verb, result,
                                 12000 + sub.tokens, sub.tool_uses, int((time.time() - sub.started) * 1000))
@@ -1439,6 +1649,19 @@ class FakeClaude(object):
                                              question="Do you want to proceed?", options=opts))
             del self.content[mark:]
         opts = self.bash_options()
+        note, self.amend_note = self.amend_note, None
+        if choice is not None and choice == len(opts) - 1 and note:   # No + 说明：拒绝，但本轮不中断、接着回复（真机）
+            self.blank()
+            self.add("  ", "  ", "Did not run 1 call")
+            self.add(RES, "     ", "$ " + PROBE_CMD)
+            self.add(RES, "     ", "Not run · rejected")
+            self.write_amend_reject(tid, note)
+            yield self.delay
+            paras = ["收到你的说明：「%s」。这条命令没有执行（fake）。" % note]
+            for d in self.stream(paras):
+                yield d
+            self.finish(paras[0])
+            return
         if choice is None or choice == len(opts) - 1:  # Esc 或 No
             self.blank()
             self.add("  ", "  ", "Did not run 1 call")
@@ -1448,10 +1671,14 @@ class FakeClaude(object):
             return
         if "switch to auto mode" in opts[choice]:
             self.mode = "auto"
-        self.write_tool_result(tid, "(fake：命令没有真正执行)", False)
+        self.write_tool_result(tid, "(fake：命令没有真正执行)", False, note=note)
         self.blank()
         self.add("  ", "  ", "Ran 1 shell command")
-        paras = ["已执行 %s（fake：没有真正运行，命令没有输出）。" % PROBE_CMD] + self.absorbed_reply(self.absorb_queue())
+        if note:   # Yes + 说明：真机屏幕在工具结果后回显 "❯ <说明>"
+            self.blank()
+            self.add_block("❯ ", "  ", note)
+        paras = ["已执行 %s（fake：没有真正运行，命令没有输出）。" % PROBE_CMD] + (
+            ["收到你附带的说明：「%s」。" % note] if note else []) + self.absorbed_reply(self.absorb_queue())
         yield self.delay
         for d in self.stream(paras):
             yield d
@@ -1483,8 +1710,18 @@ class FakeClaude(object):
                                              subtitle=WRITE_FILE, preview=["  1 hi"],
                                              question="Do you want to create %s?" % WRITE_FILE, options=opts))
             del self.content[mark:]
+        note, self.amend_note = self.amend_note, None
         self.blank()
         self.add("● ", "  ", "Write(%s)" % WRITE_FILE)
+        if choice == 2 and note:   # No + 说明：拒绝，本轮接着回复
+            self.add(RES, "     ", "Rejected write to %s" % WRITE_FILE)
+            self.write_amend_reject(tid, note)
+            yield self.delay
+            paras = ["收到你的说明：「%s」。没有写入 %s（fake）。" % (note, WRITE_FILE)]
+            for d in self.stream(paras):
+                yield d
+            self.finish(paras[0])
+            return
         if choice is None or choice == 2:
             self.add(RES, "     ", "Rejected write to %s" % WRITE_FILE)
             self.add("      ", "      ", "1 hi")
@@ -1493,7 +1730,10 @@ class FakeClaude(object):
         if choice == 1:
             self.mode = "acceptEdits"
         self.add(RES, "     ", "Wrote 1 lines to %s（fake：没有真正写入）" % WRITE_FILE)
-        self.write_tool_result(tid, "File created successfully at: %s (fake)" % path, False)
+        self.write_tool_result(tid, "File created successfully at: %s (fake)" % path, False, note=note)
+        if note:
+            self.blank()
+            self.add_block("❯ ", "  ", note)
         yield self.delay
         paras = ["已写入 %s（fake：没有真正写入文件）。" % WRITE_FILE]
         for d in self.stream(paras):
@@ -1530,6 +1770,7 @@ class FakeClaude(object):
         if self.turn is not None:
             self.queue.append(text)
             return
+        self.stopped_rows.clear()
         if cmd == "/exit":
             self.add_block("❯ ", "  ", "/exit")
             self.add(RES, "     ", "Goodbye!")
@@ -1577,6 +1818,8 @@ class FakeClaude(object):
             gen = self.turn_md(text)
         elif "/agentstop" in text:
             gen = self.turn_agent(text, task_stop=True)
+        elif "/agents2" in text:
+            gen = self.turn_agents2(text)
         elif "/agent" in text:
             gen = self.turn_agent(text)
         elif "/html" in text:
@@ -1763,6 +2006,8 @@ class FakeClaude(object):
                 order.append(self.mode)
             self.mode = order[(order.index(self.mode) + 1) % len(order)]
             return
+        if self.footer is not None and self.key_footer(k):
+            return
         if k in ("Escape", "C-c") and self.turn is not None:
             self.interrupt()
             return
@@ -1780,6 +2025,10 @@ class FakeClaude(object):
                 self.send_now()
             return
         if k == "C-k":
+            if time.time() - self.cx_at <= CHORD_WINDOW and not self.agents:
+                self.cx_at = 0.0
+                self.nobg_at = time.time()   # 真机："No background agents running"
+                return
             if time.time() - self.cx_at <= CHORD_WINDOW and self.agents:
                 self.cx_at = 0.0
                 if time.time() - self.kill_at <= KILL_CONFIRM_WINDOW:
@@ -1794,6 +2043,12 @@ class FakeClaude(object):
             return
         if pop and k == "Tab":
             self.input = pop[self.popup_cursor][0]
+            return
+        if k == "Down" and "\n" not in self.input:   # 真机：↓ 把焦点移到底部（[任务胶囊] → 子代理列表）
+            if self.shells():
+                self.footer = "tasks"
+            elif self.agent_rows():
+                self.footer, self.footer_sel = "agents", 0
             return
         if k == "Escape":
             if pop:
@@ -1846,9 +2101,16 @@ class FakeClaude(object):
             if d.kind == "ask" and d.cursor == 2:
                 d.typed += s.replace("\r", " ").replace("\n", " ")
                 return
+            if d.kind == "perm" and getattr(d, "amend_on", False):
+                d.amends[d.cursor] = d.amends.get(d.cursor, "") + s.replace("\r", " ").replace("\n", " ")
+                return
             for ch in s:
                 if ch in "123456789sync ":
                     self.on_key("Space" if ch == " " else ch)
+            return
+        if self.footer is not None:
+            if s == "x" and not paste:
+                self.footer_x()
             return
         paths = self.drop_paths(s) if paste else None
         if paths:   # 粘贴的整段是图片路径（= 终端里拖入图片）：变成 [Image #N]
@@ -1945,15 +2207,26 @@ class FakeClaude(object):
     def key_perm(self, k):
         d = self.dialog
         n = len(d.options)
+        if not hasattr(d, "amends"):
+            d.amends, d.amend_on = {}, False
+        if d.amend_on and k in ("BSpace", "C-u", "Space") or d.amend_on and len(k) == 1:
+            t = d.amends.get(d.cursor, "")
+            d.amends[d.cursor] = t[:-1] if k == "BSpace" else "" if k == "C-u" else t + (" " if k == "Space" else k)
+            return
         if k == "Up":
-            d.cursor = max(0, d.cursor - 1)
+            self.amend_move(d, max(0, d.cursor - 1))
         elif k == "Down":
-            d.cursor = min(n - 1, d.cursor + 1)
+            self.amend_move(d, min(n - 1, d.cursor + 1))
+        elif k == "Tab":
+            if d.cursor in self.amendable(d):
+                d.amend_on = not d.amend_on   # 收起时文字保留，下次 Tab 又出现
         elif k.isdigit() and 1 <= int(k) <= n:
             self.resolve(int(k) - 1)
         elif k == "Enter":
+            note = d.amends.get(d.cursor, "").strip() if d.amend_on else ""
+            self.amend_note = note or None
             self.resolve(d.cursor)
-        elif k in ("Escape", "C-c"):
+        elif k in ("Escape", "C-c"):   # 真机：输入说明时 Esc 也是取消整个对话框（= 拒绝）
             self.resolve(None)
 
     def key_ask(self, k):
@@ -2091,7 +2364,10 @@ class FakeClaude(object):
                 return buf
             ch = buf[:n].decode("utf-8", "replace")
             buf = buf[n:]
-            if self.dialog is not None and ch == " ":
+            amending = self.dialog is not None and self.dialog.kind == "perm" and getattr(self.dialog, "amend_on", False)
+            if amending:
+                self.on_text(ch)
+            elif self.dialog is not None and ch == " ":
                 self.on_key("Space")
             elif self.dialog is not None and len(ch) == 1 and ch in "123456789syn" and \
                     not (self.dialog.kind == "ask" and self.dialog.cursor == 2):
@@ -2116,6 +2392,7 @@ class FakeClaude(object):
         try:
             while self.exit_code is None:
                 self.step_turn()
+                self.tick_background()
                 if self.dirty or self.turn is not None or self.last_frame is None:
                     self.draw(force=self.last_frame is None)
                     self.dirty = False

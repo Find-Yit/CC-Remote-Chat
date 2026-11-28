@@ -19,6 +19,7 @@ import { groupSummary, noteToolAdded } from './toolgroups.js';
 import { exitNoticeText } from './exitnotice.js';
 import { hasAnsi, stripAnsi, ansiPre, isContextCommand, parseContextOutput, contextCard } from './ctxcard.js';
 import { userBody } from './quote.js';   // 用户消息开头的引用（> …）显示成内嵌卡片
+import { amendControls, amendTag, rejectNote } from './amend.js';   // 权限卡片「附说明…」（Tab to amend）与说明气泡
 
 const INITIAL_WINDOW = 300;   // 首次挂载时最多渲染的条目数
 const MORE_STEP = 200;
@@ -610,10 +611,16 @@ function onUser(s, e, ts) {
   const content = Array.isArray(m.content) ? m.content : [];
   const texts = [];
   const images = [];
+  const rejectNotes = [];
   let ended = false;
   for (const b of content) {
     if (!b || typeof b !== 'object') continue;
-    if (b.type === 'tool_result') { applyToolResult(s, b, e); ended = true; }
+    if (b.type === 'tool_result') {
+      applyToolResult(s, b, e);
+      ended = true;
+      const rn = b.is_error ? rejectNote(b.content) : '';   // 拒绝时附带的说明（Tab to amend）
+      if (rn) rejectNotes.push(rn);
+    }
     else if (b.type === 'text') {
       const t = String(b.text || '');
       if (INTERRUPT_RE.test(t)) {
@@ -628,6 +635,13 @@ function onUser(s, e, ts) {
         else if (raw.trim() && !/^\s*<local-command-caveat>/.test(raw)) texts.push(raw.trim());
       }
     } else if (b.type === 'image') images.push(b);
+  }
+  // 权限框上附带的说明（CLI 2.1.332 Tab to amend）：批准 = 工具结果后面多一个文字块；拒绝 = 拒绝文字末尾的 "the user said:"。
+  // 都属于当前这一轮（Claude 接着回复），显示成带标记的用户气泡、不另起一轮
+  for (const rn of rejectNotes) addItem(s, 'user', { text: rn, ts, midTurn: true, amend: 'no' });
+  if (hasToolResult && texts.length && !images.length) {
+    addItem(s, 'user', { text: texts.join('\n\n'), ts, truncated: !!e.truncated, midTurn: true, amend: e.permissionDecision ? 'yes' : null });
+    return ended;
   }
   if (texts.length || images.length) {
     closeTurn(s);
@@ -979,19 +993,20 @@ function renderDialogSlot(s) {
   if (key !== v.dialogKey) {
     // 同类对话框内容变化（例如光标移到自由输入项后行文字变化）时保留用户已输入的文字，但清除“提交中”
     const prev = s.dialogUi && s.dialogUi.kind === d.kind ? s.dialogUi : null;
-    const ui = { key, kind: d.kind, freeIndex: prev ? prev.freeIndex : null, freeText: prev ? prev.freeText : '' };
+    const ui = { key, kind: d.kind, freeIndex: prev ? prev.freeIndex : null, freeText: prev ? prev.freeText : '',
+      amendIndex: prev ? prev.amendIndex : null, amendText: prev ? prev.amendText : '' };
     ui.pending = false;
     ui.error = '';
     ui.expect = dialogFingerprint(d);   // choose 时带给后端：远端对话框已不是这张卡片 → 409 dialog_changed
     s.dialogUi = ui;
     const active = document.activeElement;
-    const hadFocus = active && v.dialog.contains(active) && active.classList.contains('dlg-free-input');
+    const hadFocus = active && v.dialog.contains(active) && (active.classList.contains('dlg-free-input') || active.classList.contains('dlg-amend-input'));
     const card = buildDialogCard(s, d);
     if (v.dialogKey === null) card.classList.add('enter');   // 新出现的对话框轻微淡入；同一对话框内容变化重建时不再动画
     v.dialog.replaceChildren(card);
     v.dialogKey = key;
     v.dialogCard = card;
-    if (hadFocus) { const inp = card.querySelector('.dlg-free-input'); if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); } }
+    if (hadFocus) { const inp = card.querySelector('.dlg-free-input, .dlg-amend-input'); if (inp && !inp.closest('[hidden]')) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); } }
   }
   // 选中项（光标）只更新样式，不重建
   updateSelection(v.dialogCard, d);
@@ -1011,7 +1026,7 @@ function updatePending(s) {
   const ui = s.dialogUi;
   if (!v.dialogCard || !ui) return;
   const busy = !!ui.pending;
-  for (const b of v.dialogCard.querySelectorAll('button.dlg-act, input.dlg-free-input')) b.disabled = busy;
+  for (const b of v.dialogCard.querySelectorAll('button.dlg-act, input.dlg-free-input, input.dlg-amend-input')) b.disabled = busy;
   const st = v.dialogCard.querySelector('.dlg-status');
   if (st) {
     if (busy) st.replaceChildren(spinner(), '已发送，等待终端响应…');
@@ -1034,7 +1049,7 @@ function dialogAction(s, name, ...args) {
   const fn = s.state.actions && s.state.actions[name];
   if (!fn || !s.dialogUi || s.dialogUi.pending) return;
   const ui = s.dialogUi;
-  if (name === 'choose' || name === 'freeText') args.push(ui.expect);   // 最后一个参数 = 指纹
+  if (name === 'choose' || name === 'freeText' || name === 'amend') args.push(ui.expect);   // 最后一个参数 = 指纹
   ui.pending = true;
   ui.error = '';
   if (s.view) updatePending(s);
@@ -1126,13 +1141,16 @@ function permissionCard(s, d) {
   const preview = Array.isArray(d.preview) ? d.preview.map(String).join('\n').replace(/[ \t]+$/gm, '') : '';
   const last = opts.length - 1;
   const buttons = opts.map((o, k) => optButton(s, o, k === 0 ? 'primary' : (k === last && /^no\b/i.test(String(o.label))) ? 'deny' : ''));
+  const am = amendControls(d, s.dialogUi, (index, text) => dialogAction(s, 'amend', index, text));
   return dlgShell('permission', 'shield', '需要授权',
     h('div', { class: 'dlg-sub' }, h('span', { class: 'tool-name' }, String(d.tool || d.title || '工具'))),
     desc ? h('div', { class: 'card-desc dlg-pre-wrap' }, desc) : null,
     d.tip ? h('div', { class: 'muted small-text dlg-pre-wrap' }, String(d.tip)) : null,
     preview ? h('pre', { class: 'tool-pre cmd dlg-preview' }, preview) : null,
     d.question ? h('div', { class: 'dlg-question' }, String(d.question)) : null,
-    h('div', { class: 'dlg-opts' }, buttons),
+    am.note,
+    am.opts(buttons),
+    am.box,
     h('div', { class: 'card-actions' }, escButton(s), d.hints ? h('span', { class: 'muted small-text' }, String(d.hints)) : null, h('span', { class: 'dlg-status' })));
 }
 
@@ -1290,7 +1308,9 @@ function renderUser(s, item, el, cls) {
   el.className = cls.join(' ');
   if (item.ts) el.title = fmtTime(item.ts);
   const bubble = h('div', { class: 'bubble' });
-  if (item.midTurn) {
+  const atag = amendTag(item);
+  if (atag) bubble.appendChild(atag);
+  else if (item.midTurn) {
     // 回复进行中发出、Claude 在这一轮中途读到的消息（transcript 里只是一条 queued_command 附件）
     bubble.appendChild(h('div', { class: 'user-tag', title: 'Claude 回复进行中发出的消息：Claude Code 在这一轮中途读到了它，回复会接着往下进行' },
       icon('clock'), '回复中发送'));

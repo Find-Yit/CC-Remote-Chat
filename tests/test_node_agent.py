@@ -185,9 +185,11 @@ class ValidationTests(unittest.TestCase):
                 node_agent.validate_args(a)
 
     def test_keys_whitelist(self):
-        # C-v：claude 自己的"粘贴剪贴板图片"，只由 session.paste_image（本机会话、用户 ⌘V 粘贴图片）发送
+        # C-v：claude 自己的"粘贴剪贴板图片"，只由 session.paste_image（本机会话、用户 ⌘V 粘贴图片）发送；
+        # x / C-k：停止子代理（底部列表 x、Ctrl+X Ctrl+K），只能带 guard 以固定序列发送（tests/test_tuiact.py）
         self.assertEqual(node_agent.KEYS, frozenset(
-            "Enter Escape Up Down Left Right Tab BTab BSpace Space C-c C-u C-b C-x C-s C-v 1 2 3 4 5 6 7 8 9 s y n".split()))
+            "Enter Escape Up Down Left Right Tab BTab BSpace Space C-c C-u C-b C-x C-s C-v C-k "
+            "1 2 3 4 5 6 7 8 9 s y n x".split()))
 
     def test_sid(self):
         self.assertEqual(node_agent.check_sid({"sid": SID}), SID)

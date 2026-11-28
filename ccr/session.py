@@ -38,7 +38,7 @@ from . import api_keys as ccr_api_keys
 from . import attach as ccr_attach
 from . import notify as ccr_notify
 from . import opprogress as ccr_op
-from . import remote, stats, subagents, titles, tui_parse
+from . import remote, stats, subagents, titles, tui_parse, tuiact
 
 log = logging.getLogger("ccr.session")
 
@@ -2685,6 +2685,19 @@ class SessionManager:
         s = self._get(sid)
         return self._hint_keys(s, "send_now", ["C-x", "C-s"], "no_send_now_hint",
                                "屏幕上没有「ctrl+x ctrl+s 立即发送」的提示（排队的消息可能已经发出），没有发送按键")
+
+    # ---------------------------------------------------------------- 审批时附带说明 / 停止子代理（ccr/tuiact.py，§4.2）
+    def amend_choose(self, sid, index, text, expect=None) -> dict:
+        """权限框某个选项（第一项 Yes / 最后一项 No）+ 附带说明：Tab → 粘贴说明 → Enter，每步核对（只由用户点击触发）。"""
+        return tuiact.amend(self, self._get(sid), index, text, expect)
+
+    def stop_subagent(self, sid, agent_id) -> dict:
+        """在终端底部的子代理列表里选中这个子代理并按 x（只由用户点击触发）。"""
+        return tuiact.stop_agent(self, self._get(sid), agent_id)
+
+    def stop_all_subagents(self, sid) -> dict:
+        """输入框里 Ctrl+X Ctrl+K 两次 = 停止全部后台子代理（只由用户点击并二次确认后触发）。"""
+        return tuiact.stop_all_agents(self, self._get(sid))
 
     def choose(self, sid, index, text=None, expect=None) -> dict:
         """把当前对话框的光标从选中项逐步移到 index（每步重新解析），再 Enter。只由用户点击触发。

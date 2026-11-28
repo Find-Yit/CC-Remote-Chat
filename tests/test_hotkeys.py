@@ -153,9 +153,12 @@ class TestWhitelistAndGuard(unittest.TestCase):
         self.assertTrue(new <= set(node_agent.KEYS))
         self.assertTrue(new <= set(S.KEYS_WHITELIST))
         self.assertTrue(new <= set(S_srv.KEYS_WHITELIST))
-        # C-v 只给 session.paste_image 用（本机会话 ⌘V 粘贴图片），终端面板的 /keys 白名单里没有
-        self.assertEqual(set(node_agent.KEYS), set(S.KEYS_WHITELIST) | {"C-v"})
-        self.assertNotIn("C-v", S.KEYS_WHITELIST)
+        # C-v 只给 session.paste_image 用（本机会话 ⌘V 粘贴图片）；x / C-k 只给停止子代理用（必须带对应 guard）：
+        # 终端面板的 /keys 白名单里都没有
+        self.assertEqual(set(node_agent.KEYS), set(S.KEYS_WHITELIST) | {"C-v", "x", "C-k"})
+        for k in ("C-v", "x", "C-k"):
+            self.assertNotIn(k, S.KEYS_WHITELIST)
+            self.assertNotIn(k, S_srv.KEYS_WHITELIST)
         self.assertEqual(set(S_srv.KEYS_WHITELIST), set(S.KEYS_WHITELIST))
         self.assertNotIn("C-z", node_agent.KEYS)
 

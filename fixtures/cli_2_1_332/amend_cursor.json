@@ -1,0 +1,5 @@
+{"_note": "CLI 2.1.332 真机（200x50，tmux #{cursor_x} #{cursor_y}）：权限框里按 Tab 进入「附带说明」后硬件光标停在说明文字的插入点上",
+ "amend_perm_ready": [1, 44], "amend_yes_empty": [11, 44], "amend_yes_typed": [40, 44], "amend_no_empty": [10, 47],
+ "amend_no_typed": [43, 47], "amend_moved_away": [1, 45], "amend_opt3_hint": [1, 46], "amend_toggled_off": [1, 44],
+ "amend_toggled_back": [14, 44], "amend_yes_long": [54, 44], "amend_yes_long_cu": [198, 44],
+ "amend_write_opt2": [1, 46], "amend_write_no_empty": [10, 47]}

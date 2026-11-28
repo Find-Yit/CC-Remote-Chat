@@ -69,8 +69,13 @@ MAX_KEY_FILE = 4096
 # C-x C-s：立即发送排队的消息（中断当前生成）。只由用户点击/和弦触发（§0.5）。
 # C-v：claude 自己的"粘贴剪贴板图片"（CLI 在 macOS 上自己读系统剪贴板，输入框出现 [Image #N]）。只在用户于本机会话的
 # 输入框里按 ⌘V 粘贴图片时由 session.paste_image 发送（本程序不读剪贴板；服务器会话不发：远端 claude 读不到这台 Mac 的剪贴板）。
-KEYS = frozenset("Enter Escape Up Down Left Right Tab BTab BSpace Space C-c C-u C-b C-x C-s C-v "
-                 "1 2 3 4 5 6 7 8 9 s y n".split())
+# x / C-k：停止子代理（CLI 2.1.332 底部子代理列表里 x = 停止选中的子代理；输入框里 Ctrl+X Ctrl+K 两次 = 停止全部后台
+# 子代理）。只给 session 的 stop_subagent / stop_all_subagents 用（session / server 的通用按键白名单里没有），
+# 而且必须带对应的 guard（KEY_GUARDS）：x 打进输入框就是一个字，C-k 在输入框里是删到行尾。
+KEYS = frozenset("Enter Escape Up Down Left Right Tab BTab BSpace Space C-c C-u C-b C-x C-s C-v C-k "
+                 "1 2 3 4 5 6 7 8 9 s y n x".split())
+KEY_GUARDS = {"x": "agents_sel", "C-k": "input_empty"}
+KEY_ALONE = {"x": ["x"], "C-k": ["C-x", "C-k"]}   # 这些键只能以这个固定序列单独发送
 SESSION_FIELDS = ("pid", "sessionId", "status", "cwd", "kind", "entrypoint")
 TRANSCRIPT_TYPES = ("user", "assistant", "system", "custom-title", "ai-title", "summary")   # 后三种只用来取会话标题
 # 子代理（<transcript 目录>/<sessionId>/subagents/agent-<id>.jsonl + .meta.json）
@@ -1423,7 +1428,18 @@ G_POPUP_RE = re.compile(r"^\s{2,4}(❯\s)?\s*(/[\w:.\-]+)(?:\s{2,}.*)?$")
 G_HINT_RE = re.compile(r"^\s{10,}\S")
 POPUP_CMD_RE = re.compile(r"/[\w:.\-]{1,64}\Z")
 GUARD_KEYS = ("lines", "input_box", "input_nonempty", "input_images_only", "popup", "tail", "hint",
-              "input_images", "cursor_image", "cursor_space")
+              "input_images", "cursor_image", "cursor_space", "input_empty", "footer_focus", "agents_sel")
+# 底部子代理列表（停止子代理，SPEC §4.2「子代理：停止」）用的 guard，规则与 ccr.tui_parse 的 agents_focus / tasks_focus /
+# agents_panel 一致（tests 对全部真机画面逐帧比对）：
+#   input_empty：输入框在底部且是空的（CLI 的排队占位文字也不算空）；
+#   footer_focus：焦点在输入框下方（子代理列表的操作提示行顶替了模式行，或模式行末尾是任务胶囊的 "· enter to view tasks"）；
+#   agents_sel {pos, count, name}：焦点在子代理列表的某个子代理上、提示行是 "enter to view · x to stop…"（按 x = 停止它），
+#     列表一共 count 行（含 main），选中的是第 pos 行（main = 0），该行的类型名是 name，且不是已停止的行。
+G_FOCUS_HINT_RE = re.compile(r"^(?:↑/↓ to select|enter to view)\b")    # 与 tui_parse._AGENTS_FOCUS_RE 相同
+G_STOP_HINT_RE = re.compile(r"^enter to view · x to stop\b")
+G_TASKS_FOCUS_RE = re.compile(r"·\s*enter to view tasks\s*$")           # 与 tui_parse._TASKS_FOCUS_RE 相同
+G_AGENT_PARSE_RE = re.compile(r"^(?:\s*|(❯)\s+)([●◯○◉◐⏺])\s+(\S.*)$")     # 与 tui_parse._AGENT_ROW_RE 相同
+G_AGENT_STOPPED_RE = re.compile(r"^stopped\s+·\s+\d")
 # guard.input_images_only：输入框里只有图片占位 "[Image #N]"（至少一个，没有别的文字）。与 ccr.tui_parse.IMAGE_TOKEN_RE 一致
 G_IMAGES_ONLY_RE = re.compile(r"\s*(?:\[Image #\d{1,6}\]\s*)+")
 G_IMAGE_RE = re.compile(r"\[Image #(\d{1,6})\]")
@@ -1442,8 +1458,11 @@ GUARD_HINTS = {
     "background": re.compile(
         r"^\s*\(?\s*ctrl\+b(?:\s+ctrl\+b)?(?:\s+\(twice\))?\s+to run in background\s*\)?\s*$", re.I),
     "send_now": re.compile(r"^\s*(?:⎿\s+)?(?:Queued\s+·\s+)?ctrl\+x\s+ctrl\+s\s+to send now\s*$", re.I),
+    # 第一次 Ctrl+X Ctrl+K 之后 CLI 在输入框上方右对齐显示的确认提示（2.1.332 实测）；第二次（3 秒内）才真的停止全部后台子代理
+    "kill_agents": re.compile(r"^\s*Press ctrl\+x ctrl\+k again to stop background agents\s*$"),
 }
 MAX_GUARD_LINES = 20
+MAX_GUARD_AGENTS = 60
 SHA1_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -1644,7 +1663,42 @@ def validate_guard(g):
             raise OpError("guard.tail 不合法")
     if "hint" in g and (not isinstance(g["hint"], str) or g["hint"] not in GUARD_HINTS):
         raise OpError("guard.hint 不合法")
+    for k in ("input_empty", "footer_focus"):
+        if not isinstance(g.get(k, False), bool):
+            raise OpError("guard.%s 必须是布尔值" % k)
+    if "agents_sel" in g:
+        a = g["agents_sel"]
+        if not isinstance(a, dict) or set(a) != {"pos", "count", "name"} or \
+                any(isinstance(a[k], bool) or not isinstance(a[k], int) for k in ("pos", "count")) or \
+                not 1 <= a["pos"] < a["count"] <= MAX_GUARD_AGENTS or not isinstance(a["name"], str) or \
+                not 0 < len(a["name"]) <= 100 or re.search(r"[\x00-\x1f\x7f]", a["name"]):
+            raise OpError("guard.agents_sel 不合法")
     return g
+
+
+def footer_agents(lines, box):
+    """输入框下横线之后的底部区域 → (列表焦点提示行 | None, 任务胶囊是否聚焦, 子代理行 [(选中, 类型名, 已停止)])。
+    子代理行只认焦点提示行之后的（焦点在列表上时提示行顶替了模式行，与 ccr.tui_parse.parse_screen 一致）；
+    没有焦点提示行时返回 []。"""
+    hint = None
+    tasks = False
+    rows = []
+    for l in lines[box[1] + 1:]:
+        t = l.strip()
+        if not t:
+            continue
+        if hint is None:
+            if G_FOCUS_HINT_RE.match(t):
+                hint = t
+            elif G_TASKS_FOCUS_RE.search(t):
+                tasks = True
+            continue
+        m = G_AGENT_PARSE_RE.match(l)
+        if m:
+            parts = re.split(r"\s{2,}", m.group(3).strip())
+            info = parts[-1] if len(parts) > 1 else ""
+            rows.append((bool(m.group(1)), parts[0], bool(G_AGENT_STOPPED_RE.match(info))))
+    return hint, tasks, rows
 
 
 def tail_sha1(lines, n):
@@ -1699,7 +1753,37 @@ def check_guard(text, g, cursor=None):
         pat = GUARD_HINTS[g["hint"]]
         if not any(pat.match(l) for l in lines[:box[0]]):
             return "屏幕上已经没有对应的提示"
+    if g.get("input_empty") or g.get("footer_focus") or "agents_sel" in g:
+        box = find_input_box(lines)
+        if box is None:
+            return "输入框不可见（可能弹出了对话框）"
+        if g.get("input_empty") and "".join(lines[box[0] + 1:box[1]]).lstrip("❯").strip():
+            return "输入框里有文字"
+        hint, tasks, rows = footer_agents(lines, box)
+        if g.get("footer_focus") and hint is None and not tasks:
+            return "焦点不在子代理列表 / 任务胶囊上"
+        if "agents_sel" in g:
+            a = g["agents_sel"]
+            if hint is None or not G_STOP_HINT_RE.match(hint):
+                return "子代理列表的提示行不是「x to stop」"
+            if len(rows) != a["count"]:
+                return "子代理列表的行数已变化"
+            if [i for i, r in enumerate(rows) if r[0]] != [a["pos"]]:
+                return "列表里选中的不是目标子代理"
+            if rows[a["pos"]][1] != a["name"]:
+                return "选中行的类型不是 %s" % a["name"]
+            if rows[a["pos"]][2]:
+                return "选中的子代理已经停止"
     return None
+
+
+def check_key_policy(keys, guard):
+    """x / C-k（停止子代理用）只能以固定序列单独发送，且必须带对应的 guard（KEY_GUARDS）。"""
+    for k in keys:
+        if k in KEY_ALONE and keys != KEY_ALONE[k]:
+            raise OpError("按键 %s 只能以 %s 单独发送" % (k, " ".join(KEY_ALONE[k])))
+        if k in KEY_GUARDS and not (isinstance(guard, dict) and guard.get(KEY_GUARDS[k])):
+            raise OpError("按键 %s 必须带 guard.%s" % (k, KEY_GUARDS[k]))
 
 
 def op_keys(p):
@@ -1713,6 +1797,7 @@ def op_keys(p):
         if not isinstance(k, str) or k not in KEYS:
             raise OpError("不允许的按键：%s" % (str(k)[:20],))
     guard = p.get("guard")
+    check_key_policy(keys, guard)
     if guard is not None:
         validate_guard(guard)
         if needs_cursor(guard):

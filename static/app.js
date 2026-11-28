@@ -8,6 +8,7 @@ import {
 import { toast, confirmDialog, promptDialog, jobsPopover, newSessionDialog, JOBID_RE, isLocalMeta, targetQuery } from './dialogs.js';
 import { openModelModal, openEffortModal, TermPanel, effortLockText, appliedToast } from './tui.js';
 import { SubagentUI } from './subagents.js';
+import { AgentStopper } from './agentstop.js';   // 子代理托盘的「停止」/「全部停止」（终端子代理列表的 x / Ctrl+X Ctrl+K）
 import { StatsBar } from './stats.js';
 import { apiLabel, apiUsageTitle, restartApiDialog, loadApiKeys, loadUsage, onApiKeysChange, setDefaultBaseUrl } from './apikeys.js';
 import { initViz } from './viz.js';           // 可视化（§10）：图片引用 / 灯箱 / 文件 chip / 右侧预览面板
@@ -116,6 +117,11 @@ const actions = {
   keys: (s, keys) => api.post(sp(s, '/keys'), { keys }),
   // AskUserQuestion 的 “Type something.”：后端在同一次操作里选中该项、粘贴文字并回车（choose 带 text）
   freeText: (s, index, text, expect) => guardDialog(s, () => api.post(sp(s, '/choose'), { index, text, expect })),
+  // 权限框「附说明…」（Tab to amend）：后端选中该项、Tab、粘贴说明、核对、回车（每步 guard）；失败时卡片可能已重建，另外 toast
+  amend: (s, index, text, expect) => guardDialog(s, () => api.post(sp(s, '/amend'), { index, text, expect })).catch((e) => {
+    if (!(e && /对话框已变化/.test(e.message || ''))) toast('没有发送说明：' + ((e && e.message) || e), 'warn', 9000);
+    throw e;
+  }),
   restart: (s) => doRestart(s),
   openModelDialog: (s) => openModelFor(s, false),
   applyModel: (s, body) => api.post(sp(s, '/model'), body),
@@ -205,7 +211,7 @@ async function boot() {
   setWidthWrapper((apply) => { const s = activeSession(); if (s && s.view) keepReading(s, apply); else apply(); });
   window.addEventListener('ccr:chatw', () => { if (minimap) minimap.measure(); });
   $('composer-stats').appendChild(statsBar.el);
-  saUI = new SubagentUI({ api, toast });
+  saUI = new SubagentUI({ api, toast, stopper: new AgentStopper({ api, toast, confirm: confirmDialog }) });
   pvPanel = new PreviewPanel({ host: $('app'), onState: () => updateChgBtn() });
   initViz({ api, getConfig: () => config, toast, panel: pvPanel });
   // CLI 快捷键提示：「转到后台运行」(Ctrl+B Ctrl+B)、「立即发送排队消息」(Ctrl+X Ctrl+S)；按钮与键盘和弦共用同一组动作

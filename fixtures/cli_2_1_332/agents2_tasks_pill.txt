@@ -1,0 +1,50 @@
+
+❯ 请用 Agent 工具在同一条回复里同时派两个后台子代理（run_in_background: true，subagent_type: general-purpose，model: haiku），description 分别是「甲数数」和「乙数数」。每个子代理的任务：用 Bash
+  依次执行 5 条命令，每条都是 sleep 20 && echo N（N 依次为 1 到 5），全部完成后回复 done。你派出后立刻结束本轮回复，不要等待它们；之后收到它们完成或被停止的通知时，只回复一个字「好」，不要做别的。
+
+⏺ 2 background agents launched (↓ to manage)
+   ├ 甲数数
+   └ 乙数数
+
+⏺ 已派出两个后台子代理「甲数数」和「乙数数」，均使用 haiku 模型，各自依次执行 5 条 sleep 20 && echo N。我不等待它们，现在结束本轮。
+
+✻ Waiting for 2 background agents to finish
+
+⏺ Agent "甲数数" was stopped by user
+
+⏺ 好
+
+✻ Waiting for 1 background agent to finish
+
+› Message from @general-purpose (ctrl+o to expand)
+
+⏺ 好
+
+⏺ Agent "乙数数" finished · 1m 49s
+
+❯ 再用 Agent 工具在同一条回复里同时派两个后台子代理（run_in_background: true，subagent_type: general-purpose，model: haiku），description 分别是「丙数数」和「丁数数」。每个子代理的任务：用 Bash
+  依次执行 4 条命令，每条都是 sleep 30 && echo N（N 依次为 1 到 4），全部完成后回复 done。派出后立刻结束本轮；之后收到通知时只回复一个字「好」。
+
+⏺ 2 background agents launched (↓ to manage)
+   ├ 丙数数
+   └ 丁数数
+
+⏺ 已派出两个后台子代理「丙数数」和「丁数数」，均使用 haiku 模型，各自依次执行 4 条 sleep 30 && echo N。我不等待，现在结束本轮。
+
+✻ Waiting for 2 background agents to finish
+
+⏺ Agent "丙数数" is waiting on its own background work · 6s
+
+⏺ 好
+
+✢ Flibbertigibbeting… (running Stop hooks… 1/2 · 1s · ↓ 3 tokens)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 5.5 | ⚡ low | 📊 ctx: 2% | ⚙ 5 tok/s | 💰 $0 | 5h: 1.0M tok, $1.00 | 7d: 9.0M tok, $9.00 | 14:26
+  ⏵⏵ auto mode on · 2 background tasks · enter to view tasks
+
+  ⏺ main
+  ◯ general-purpose  waiting on 1 shell · 丙数数 · since 9:20
+  ◯ general-purpose  丁数数                                                                                                                                                        9s · ↓ 16.6k tokens

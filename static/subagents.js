@@ -1,6 +1,7 @@
 // 子代理面板：输入框上方的托盘（正在干活的子代理一目了然）+ 右侧抽屉（某个子代理的完整过程）。
 // 数据来自 render.js 维护的 s.subagents（服务器 kind=subagent 事件：摘要 + 增量条目）；抽屉复用主聊天的渲染器
-// （mountSession/applyTranscript，条目本身带 isSidechain，视图标记 sidechain=true）。只读：这里没有任何发往终端的操作。
+// （mountSession/applyTranscript，条目本身带 isSidechain，视图标记 sidechain=true）。抽屉只读；托盘的「停止」/「全部停止」
+// 由 agentstop.js（构造时传入 stopper）提供，只在用户点击（并确认）时发请求。
 import { h, icon, truncate } from './dom.js';
 import {
   createState, ensureSession, applyTranscript, mountSession, scrollToBottom, flushNow,
@@ -42,9 +43,12 @@ function bodyEntries(entries) {
 }
 
 export class SubagentUI {
-  constructor({ api, toast }) {
+  constructor({ api, toast, stopper }) {
     this.api = api;
     this.toast = toast || (() => {});
+    this.stopper = stopper || null;   // agentstop.js 的 AgentStopper（回放页 / 测试可以不给）
+    this.stopKey = '';
+    if (this.stopper) this.stopper.onChange = () => { this.trayKey = ''; this.renderTray(); };
     this.session = null;       // 当前（活动）会话
     this.trayUi = new Map();   // sid -> {collapsed:null|bool, lastRunning}
     this.drawer = null;        // {s, aid, ps, view, els, loading}
@@ -110,8 +114,10 @@ export class SubagentUI {
       const m = a.summary;
       return [a.id, m.status, m.description, m.agent_type, m.model, m.tool_uses, m.last_action, m.started_at, m.duration_ms];
     })]);
-    if (key === this.trayKey) return;
+    const stopKey = this.stopper ? this.stopper.stateKey(s) : '';
+    if (key === this.trayKey && stopKey === this.stopKey) return;
     this.trayKey = key;
+    this.stopKey = stopKey;
     const head = h('button', { class: 'sa-tray-head', type: 'button', 'aria-expanded': String(!collapsed), title: collapsed ? '展开子代理列表' : '收起子代理列表' },
       icon('agent', 'sa-tray-ic'),
       h('span', { class: 'sa-tray-title' }, '子代理'),
@@ -119,9 +125,13 @@ export class SubagentUI {
       h('span', { class: 'spacer' }),
       icon(collapsed ? 'chevron' : 'chevdown', 'chev'));
     head.addEventListener('click', () => { ui.collapsed = !collapsed; this.trayKey = ''; this.renderTray(); });
-    const nodes = [head];
+    const stop = this.stopper;
+    const nodes = [stop ? stop.wrapHead(s, head, running) : head];
     if (!collapsed) {
-      nodes.push(h('div', { class: 'sa-list', role: 'list' }, running.map((a) => this.trayItem(s, a, a.id === openAid))));
+      nodes.push(h('div', { class: 'sa-list', role: 'list' }, running.map((a) => {
+        const item = this.trayItem(s, a, a.id === openAid);
+        return stop ? stop.wrapItem(s, a, item) : item;
+      })));
     }
     this.tray.replaceChildren(...nodes);
     this.tray.hidden = false;
@@ -148,6 +158,8 @@ export class SubagentUI {
   }
 
   tick() {
+    // 有没有对话框 / 输入框里有没有字会改变「停止」按钮能不能点：变了就重画托盘
+    if (this.stopper && this.session && !this.tray.hidden && this.stopper.stateKey(this.session) !== this.stopKey) this.renderTray();
     const now = Date.now() / 1000;
     for (const el of document.querySelectorAll('[data-sa-since]')) {
       const t = Number(el.dataset.saSince);

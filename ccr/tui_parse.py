@@ -35,6 +35,9 @@ _AGENT_INFO_RE = re.compile(r"^(?:([a-z]+)\s+·\s+)?\d+(?:\.\d+)?[smh]\b")
 # 焦点在子代理列表上时，模式行被换成列表的操作提示（CLI 2.1.332 实测）："↑/↓ to select"（光标在 main 上）、
 # "enter to view · x to stop · ctrl+x ctrl+k to stop all agents"、"enter to view · x to clear"（已停止的行）
 _AGENTS_FOCUS_RE = re.compile(r"^(?:↑/↓ to select|enter to view)\b")
+# 有后台 shell / 任务时，输入框里按 ↓ 先聚焦到模式行上的任务胶囊（CLI 2.1.332 实测）：模式行末尾变成 "· enter to view tasks"
+# （"⏵⏵ auto mode on · 2 shells · enter to view tasks"），再按 ↓ 才进入子代理列表
+_TASKS_FOCUS_RE = re.compile(r"·\s*enter to view tasks\s*$")
 _POPUP_RE = re.compile(r"^\s{2,4}(❯\s)?\s*(/[\w:.\-]+)(?:\s{2,}(.*))?$")
 _POPUP_CONT_RE = re.compile(r"^\s{10,}\S")   # 补全项说明的折行（与 node_agent.G_HINT_RE 同一写法）
 _MORE_RE = re.compile(r"^\s*([↑↓])\s*(\d+)\s+more\s*$")
@@ -613,6 +616,42 @@ def _parse_permission(body: List[str], d: Dict) -> None:
     d["tip"] = tip
     after = body[q_idx + 1:] if q_idx is not None else body
     d["options"] = _parse_numbered_options(after, "label")
+    _parse_amend(d)
+
+
+# 权限框的「附带说明」（CLI 2.1.332 真机，fixtures/cli_2_1_332/amend_*.txt）：只有第一项 "Yes" 与最后一项 "No" 能附带说明；
+# 光标在这两项上时提示行是 "Esc to cancel · Tab to amend"，在别的项上只有 "Esc to cancel"。按 Tab 后该项变成
+# "Yes, <说明>" / "No, <说明>"（还没输入时是灰色占位文字，纯文本里与真文字无法区分），提示行变成 "Esc to cancel"；
+# 再按 Tab 收起（文字保留，下次 Tab 又出现）；Esc = 取消整个对话框（拒绝本次工具调用）；离开该项时空说明丢弃、
+# 有文字的保留（"1. Yes, BBB"），回到该项时又处于输入状态。
+AMEND_PLACEHOLDERS = {"Yes": "and tell Claude what to do next", "No": "and tell Claude what to do differently"}
+AMEND_HINT = "Tab to amend"
+
+
+def _parse_amend(d: Dict) -> None:
+    """d["amendable"] = 能附带说明的选项 index（第一项正好是 "Yes"、最后一项正好是 "No"）；
+    d["amend"] = 正在输入说明的选项 {index, base, text, placeholder} | None（选中项是 "Yes, …" / "No, …" 且提示行
+    没有 "Tab to amend"；text = 用户输入的说明，只有占位文字时为 "" 且 placeholder=True）。"""
+    opts = d.get("options") or []
+    cands = []
+    if opts:
+        if opts[0]["label"] == "Yes":
+            cands.append((0, "Yes"))
+        if len(opts) > 1 and opts[-1]["label"] == "No":
+            cands.append((len(opts) - 1, "No"))
+    d["amendable"] = [i for i, _ in cands]
+    d["amend"] = None
+    hint = AMEND_HINT in (d.get("hints") or "")
+    for i, base in ((0, "Yes"), (len(opts) - 1, "No")):
+        if not opts or (i == 0 and base == "No"):
+            continue
+        o = opts[i]
+        if not o.get("selected") or hint or not o["label"].startswith(base + ", "):
+            continue
+        text = o["label"][len(base) + 2:].strip()
+        ph = text == AMEND_PLACEHOLDERS[base]
+        d["amend"] = {"index": i, "base": base, "text": "" if ph else text, "placeholder": ph}
+        break
 
 
 def _parse_question(body: List[str], d: Dict) -> None:
@@ -1196,6 +1235,7 @@ def parse_screen(text: str) -> Dict:
         else:
             status.append(l.strip())
     res["agents_focus"] = focus
+    res["tasks_focus"] = bool(res["mode_line"] and _TASKS_FOCUS_RE.search(res["mode_line"]))
     if status:
         res["status_line"] = "\n".join(status)
     res["agents_panel"] = agents or None
